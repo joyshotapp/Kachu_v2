@@ -1,0 +1,1059 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kachu 管理後台</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .fade-in { animation: fadeIn 0.2s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    .sidebar-item {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.625rem 1rem;
+      border-radius: 0.5rem;
+      color: rgb(203 213 225);
+      cursor: pointer;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: all 0.2s ease;
+    }
+    .sidebar-item:hover {
+      background: rgb(30 41 59);
+      color: #ffffff;
+    }
+    .sidebar-item.active {
+      background: rgb(5 150 105);
+      color: #ffffff;
+    }
+    .stat-card {
+      background: #ffffff;
+      border-radius: 0.75rem;
+      padding: 1.25rem;
+      border: 1px solid rgb(241 245 249);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.125rem 0.625rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 500;
+    }
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      padding: 0.5rem 1rem;
+      border-radius: 0.5rem;
+      background: rgb(5 150 105);
+      color: #ffffff;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: background-color 0.2s ease;
+    }
+    .btn-primary:hover { background: rgb(4 120 87); }
+    .btn-secondary {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      padding: 0.5rem 0.75rem;
+      border-radius: 0.5rem;
+      border: 1px solid rgb(226 232 240);
+      background: #ffffff;
+      color: rgb(51 65 85);
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: background-color 0.2s ease;
+    }
+    .btn-secondary:hover { background: rgb(248 250 252); }
+    .btn-danger {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      padding: 0.375rem 0.75rem;
+      border-radius: 0.5rem;
+      background: rgb(254 242 242);
+      color: rgb(220 38 38);
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: background-color 0.2s ease;
+    }
+    .btn-danger:hover { background: rgb(254 226 226); }
+    .input {
+      width: 100%;
+      padding: 0.5rem 0.75rem;
+      border: 1px solid rgb(226 232 240);
+      border-radius: 0.5rem;
+      font-size: 0.875rem;
+      outline: none;
+    }
+    .input:focus {
+      border-color: rgb(16 185 129);
+      box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.25);
+    }
+    .select {
+      padding: 0.5rem 0.75rem;
+      border: 1px solid rgb(226 232 240);
+      border-radius: 0.5rem;
+      font-size: 0.875rem;
+      background: #ffffff;
+      outline: none;
+    }
+    .select:focus {
+      border-color: rgb(16 185 129);
+      box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.25);
+    }
+    .table-row {
+      border-bottom: 1px solid rgb(241 245 249);
+      cursor: pointer;
+      transition: background-color 0.2s ease;
+    }
+    .table-row:hover { background: rgb(248 250 252); }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased" x-data="app()" x-init="init()" x-cloak>
+
+<!-- ═══════════════════════ LAYOUT ═══════════════════════ -->
+<div class="flex h-screen overflow-hidden">
+
+  <!-- ── Sidebar ── -->
+  <aside class="w-60 bg-slate-900 flex flex-col flex-shrink-0">
+    <!-- Logo -->
+    <div class="px-5 py-5 border-b border-slate-800">
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-white font-bold text-sm">K</div>
+        <div>
+          <div class="text-white font-semibold text-sm">Kachu</div>
+          <div class="text-slate-400 text-xs">管理後台</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Nav -->
+    <nav class="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+      <button @click="navigate('overview')" :class="{'active': page==='overview'}" class="sidebar-item w-full text-left">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
+        總覽
+      </button>
+      <button @click="navigate('runs')" :class="{'active': page==='runs'}" class="sidebar-item w-full text-left">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+        工作流執行紀錄
+      </button>
+      <button @click="navigate('approvals')" :class="{'active': page==='approvals'}" class="sidebar-item w-full text-left">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        待審批任務
+        <span x-show="stats.pending_approvals > 0" class="ml-auto bg-amber-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center" x-text="stats.pending_approvals"></span>
+      </button>
+      <button @click="navigate('knowledge')" :class="{'active': page==='knowledge'}" class="sidebar-item w-full text-left">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/></svg>
+        知識庫管理
+        <span class="ml-auto text-xs text-slate-400" x-text="stats.knowledge_entries"></span>
+      </button>
+      <button @click="navigate('connectors')" :class="{'active': page==='connectors'}" class="sidebar-item w-full text-left">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>
+        連接器狀態
+      </button>
+      <button @click="navigate('pushes')" :class="{'active': page==='pushes'}" class="sidebar-item w-full text-left">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
+        LINE 推播紀錄
+      </button>
+    </nav>
+
+    <!-- Bottom: AgentOS link -->
+    <div class="px-3 py-4 border-t border-slate-800">
+      <a href="http://localhost:8000/docs" target="_blank" class="sidebar-item flex text-xs opacity-70 hover:opacity-100">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+        AgentOS API
+      </a>
+      <a href="/docs" target="_blank" class="sidebar-item flex text-xs opacity-70 hover:opacity-100">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+        Kachu API Docs
+      </a>
+    </div>
+  </aside>
+
+  <!-- ── Main content ── -->
+  <div class="flex-1 flex flex-col overflow-hidden">
+
+    <!-- Top bar -->
+    <header class="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between flex-shrink-0">
+      <h1 class="text-base font-semibold text-slate-800" x-text="pageTitle()"></h1>
+      <div class="flex items-center gap-3">
+        <!-- Tenant ID -->
+        <div class="flex items-center gap-2">
+          <label class="text-xs text-slate-500 font-medium">Tenant ID</label>
+          <input x-model="tenantId" @change="reloadCurrentPage()" @keyup.enter="reloadCurrentPage()"
+            placeholder="自動偵測" class="input w-52 text-xs" />
+        </div>
+        <!-- Refresh -->
+        <button @click="reloadCurrentPage()" class="btn-secondary">
+          <svg class="w-4 h-4" :class="{'animate-spin': loading}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          重新整理
+        </button>
+        <!-- Last refresh -->
+        <span class="text-xs text-slate-400" x-text="lastRefresh ? '更新於 ' + lastRefresh : ''"></span>
+      </div>
+    </header>
+
+    <!-- Page content -->
+    <main class="flex-1 overflow-y-auto p-6">
+
+      <!-- Loading skeleton -->
+      <div x-show="loading" class="flex items-center justify-center py-20">
+        <div class="flex items-center gap-3 text-slate-400">
+          <svg class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+          載入中...
+        </div>
+      </div>
+
+      <!-- ════════════ OVERVIEW ════════════ -->
+      <div x-show="!loading && page==='overview'" class="fade-in space-y-6">
+
+        <!-- Stat cards -->
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <div class="stat-card">
+            <div class="flex items-center justify-between mb-3">
+              <span class="text-xs font-medium text-slate-500 uppercase tracking-wide">總執行次數</span>
+              <div class="w-8 h-8 bg-blue-50 rounded-lg flex items-center justify-center">
+                <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2"/></svg>
+              </div>
+            </div>
+            <div class="text-2xl font-bold text-slate-800" x-text="stats.total_runs ?? 0"></div>
+            <div class="text-xs text-slate-400 mt-1">
+              <span class="text-blue-500 font-medium" x-text="(stats.active_runs ?? 0) + ' 個執行中'"></span>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="flex items-center justify-between mb-3">
+              <span class="text-xs font-medium text-slate-500 uppercase tracking-wide">待確認任務</span>
+              <div class="w-8 h-8 bg-amber-50 rounded-lg flex items-center justify-center">
+                <svg class="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+              </div>
+            </div>
+            <div class="text-2xl font-bold text-slate-800" x-text="stats.pending_approvals ?? 0"></div>
+            <div class="text-xs text-slate-400 mt-1">等待老闆確認</div>
+          </div>
+          <div class="stat-card">
+            <div class="flex items-center justify-between mb-3">
+              <span class="text-xs font-medium text-slate-500 uppercase tracking-wide">知識庫條目</span>
+              <div class="w-8 h-8 bg-emerald-50 rounded-lg flex items-center justify-center">
+                <svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/></svg>
+              </div>
+            </div>
+            <div class="text-2xl font-bold text-slate-800" x-text="stats.knowledge_entries ?? 0"></div>
+            <div class="text-xs text-slate-400 mt-1">有效知識條目</div>
+          </div>
+          <div class="stat-card">
+            <div class="flex items-center justify-between mb-3">
+              <span class="text-xs font-medium text-slate-500 uppercase tracking-wide">今日 LINE 推播</span>
+              <div class="w-8 h-8 bg-purple-50 rounded-lg flex items-center justify-center">
+                <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
+              </div>
+            </div>
+            <div class="text-2xl font-bold text-slate-800" x-text="stats.today_pushes ?? 0"></div>
+            <div class="text-xs text-slate-400 mt-1">每日上限 3 則</div>
+          </div>
+        </div>
+
+        <!-- Chart + Recent runs -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <!-- Donut chart -->
+          <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100">
+            <h3 class="text-sm font-semibold text-slate-700 mb-4">工作流類型分佈</h3>
+            <div class="relative h-40">
+              <canvas id="workflowChart"></canvas>
+            </div>
+            <div class="mt-3 space-y-1" x-show="Object.keys(stats.runs_by_type || {}).length > 0">
+              <template x-for="[type, count] in Object.entries(stats.runs_by_type || {})" :key="type">
+                <div class="flex items-center justify-between text-xs">
+                  <span class="flex items-center gap-1.5">
+                    <span x-text="workflowEmoji(type)"></span>
+                    <span class="text-slate-600" x-text="workflowLabel(type)"></span>
+                  </span>
+                  <span class="font-medium text-slate-800" x-text="count"></span>
+                </div>
+              </template>
+            </div>
+            <div x-show="Object.keys(stats.runs_by_type || {}).length === 0" class="text-xs text-slate-400 text-center mt-4">尚無執行紀錄</div>
+          </div>
+
+          <!-- Recent runs -->
+          <div class="lg:col-span-2 bg-white rounded-xl p-5 shadow-sm border border-slate-100">
+            <div class="flex items-center justify-between mb-4">
+              <h3 class="text-sm font-semibold text-slate-700">最近執行紀錄</h3>
+              <button @click="navigate('runs')" class="text-xs text-emerald-600 hover:text-emerald-700 font-medium">查看全部 →</button>
+            </div>
+            <div x-show="overviewRuns.length === 0" class="text-xs text-slate-400 text-center py-8">尚無工作流執行紀錄</div>
+            <div class="space-y-2">
+              <template x-for="run in overviewRuns" :key="run.id">
+                <div @click="openRunDetail(run)" class="flex items-center justify-between p-2.5 rounded-lg hover:bg-slate-50 cursor-pointer transition-colors">
+                  <div class="flex items-center gap-2.5 min-w-0">
+                    <span class="text-base" x-text="workflowEmoji(run.workflow_type)"></span>
+                    <div class="min-w-0">
+                      <div class="text-sm font-medium text-slate-700 truncate" x-text="workflowLabel(run.workflow_type)"></div>
+                      <div class="text-xs text-slate-400" x-text="relativeTime(run.created_at)"></div>
+                    </div>
+                  </div>
+                  <span :class="statusBadgeClass(run.status)" class="badge ml-2 flex-shrink-0" x-text="statusLabel(run.status)"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pending approvals alert -->
+        <div x-show="pendingApprovals.length > 0" class="bg-amber-50 border border-amber-200 rounded-xl p-4">
+          <div class="flex items-center gap-2 mb-3">
+            <svg class="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            <span class="text-sm font-semibold text-amber-800">待老闆確認的任務</span>
+          </div>
+          <div class="space-y-2">
+            <template x-for="ap in pendingApprovals.slice(0,3)" :key="ap.id">
+              <div class="flex items-center justify-between bg-white rounded-lg px-3 py-2.5 border border-amber-100">
+                <div>
+                  <span class="text-sm font-medium text-slate-700" x-text="workflowEmoji(ap.workflow_type) + ' ' + workflowLabel(ap.workflow_type)"></span>
+                  <span class="text-xs text-slate-400 ml-2" x-text="relativeTime(ap.created_at)"></span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <span x-show="ap.expires_at" class="text-xs text-amber-600" x-text="'到期：' + relativeTime(ap.expires_at)"></span>
+                  <span :class="statusBadgeClass(ap.status)" class="badge" x-text="statusLabel(ap.status)"></span>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ WORKFLOW RUNS ════════════ -->
+      <div x-show="!loading && page==='runs'" class="fade-in space-y-4">
+
+        <!-- Filters -->
+        <div class="flex items-center gap-3 flex-wrap">
+          <select x-model="runsFilter.workflow_type" @change="loadRuns()" class="select text-sm">
+            <option value="">所有工作流</option>
+            <option value="photo_content">📸 照片發文</option>
+            <option value="review_reply">⭐ 評論回覆</option>
+            <option value="line_faq">💬 FAQ 自動回覆</option>
+            <option value="google_post">🗺️ Google 商家動態</option>
+            <option value="ga4_report">📊 GA4 週報</option>
+            <option value="knowledge_update">📚 知識庫更新</option>
+          </select>
+          <select x-model="runsFilter.status" @change="loadRuns()" class="select text-sm">
+            <option value="">所有狀態</option>
+            <option value="running">執行中</option>
+            <option value="completed">已完成</option>
+            <option value="failed">失敗</option>
+          </select>
+          <span class="text-sm text-slate-500 ml-auto" x-text="runs.length + ' 筆紀錄'"></span>
+        </div>
+
+        <!-- Table -->
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="bg-slate-50 text-left">
+                <th class="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide">工作流</th>
+                <th class="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide">狀態</th>
+                <th class="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide">觸發來源</th>
+                <th class="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide">AgentOS Run ID</th>
+                <th class="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide">建立時間</th>
+                <th class="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide"></th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-if="runs.length === 0">
+                <tr><td colspan="6" class="px-4 py-12 text-center text-slate-400 text-sm">尚無工作流執行紀錄</td></tr>
+              </template>
+              <template x-for="run in runs" :key="run.id">
+                <tr class="table-row" @click="openRunDetail(run)">
+                  <td class="px-4 py-3">
+                    <div class="flex items-center gap-2">
+                      <span x-text="workflowEmoji(run.workflow_type)"></span>
+                      <span class="font-medium text-slate-700" x-text="workflowLabel(run.workflow_type)"></span>
+                    </div>
+                  </td>
+                  <td class="px-4 py-3">
+                    <span :class="statusBadgeClass(run.status)" class="badge" x-text="statusLabel(run.status)"></span>
+                  </td>
+                  <td class="px-4 py-3 text-slate-500 text-xs" x-text="triggerLabel(run.trigger_source)"></td>
+                  <td class="px-4 py-3 text-slate-400 text-xs font-mono" x-text="run.agentos_run_id ? run.agentos_run_id.slice(0,16)+'…' : '—'"></td>
+                  <td class="px-4 py-3 text-slate-400 text-xs" x-text="formatDate(run.created_at)"></td>
+                  <td class="px-4 py-3 text-right">
+                    <svg class="w-4 h-4 text-slate-300 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Run Detail Modal -->
+        <div x-show="selectedRun" x-transition class="fixed inset-0 bg-black/40 z-50 flex items-start justify-end" @click.self="selectedRun = null">
+          <div class="w-full max-w-lg bg-white h-full overflow-y-auto shadow-2xl">
+            <div class="sticky top-0 bg-white border-b border-slate-200 px-5 py-4 flex items-center justify-between">
+              <div>
+                <div class="font-semibold text-slate-800" x-text="workflowEmoji(selectedRun?.workflow_type) + ' ' + workflowLabel(selectedRun?.workflow_type)"></div>
+                <div class="text-xs text-slate-400 font-mono mt-0.5" x-text="selectedRun?.agentos_run_id || '—'"></div>
+              </div>
+              <div class="flex items-center gap-2">
+                <span :class="statusBadgeClass(selectedRun?.status)" class="badge" x-text="statusLabel(selectedRun?.status)"></span>
+                <button @click="selectedRun = null" class="text-slate-400 hover:text-slate-600">
+                  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="p-5 space-y-4" x-show="selectedRun">
+              <!-- Meta info -->
+              <div class="grid grid-cols-2 gap-3 text-sm">
+                <div class="bg-slate-50 rounded-lg p-3">
+                  <div class="text-xs text-slate-400 mb-1">觸發來源</div>
+                  <div class="font-medium text-slate-700" x-text="triggerLabel(selectedRun?.trigger_source)"></div>
+                </div>
+                <div class="bg-slate-50 rounded-lg p-3">
+                  <div class="text-xs text-slate-400 mb-1">建立時間</div>
+                  <div class="font-medium text-slate-700" x-text="formatDate(selectedRun?.created_at)"></div>
+                </div>
+                <div class="bg-slate-50 rounded-lg p-3" x-show="selectedRun?.completed_at">
+                  <div class="text-xs text-slate-400 mb-1">完成時間</div>
+                  <div class="font-medium text-slate-700" x-text="formatDate(selectedRun?.completed_at)"></div>
+                </div>
+                <div class="bg-slate-50 rounded-lg p-3">
+                  <div class="text-xs text-slate-400 mb-1">Tenant ID</div>
+                  <div class="font-medium text-slate-700 truncate text-xs font-mono" x-text="selectedRun?.tenant_id"></div>
+                </div>
+              </div>
+              <!-- Error message -->
+              <div x-show="selectedRun?.error_message" class="bg-red-50 border border-red-200 rounded-lg p-3">
+                <div class="text-xs font-semibold text-red-700 mb-1">錯誤訊息</div>
+                <div class="text-xs text-red-600 font-mono" x-text="selectedRun?.error_message"></div>
+              </div>
+              <!-- Trigger payload -->
+              <div>
+                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">觸發資料</div>
+                <pre class="bg-slate-900 text-emerald-400 text-xs rounded-lg p-3 overflow-x-auto whitespace-pre-wrap" x-text="JSON.stringify(selectedRun?.trigger_payload, null, 2)"></pre>
+              </div>
+              <!-- AgentOS link -->
+              <div x-show="selectedRun?.agentos_run_id">
+                <a :href="'http://localhost:8000/docs#/default/get_run_runs__run_id__get'" target="_blank" class="btn-secondary text-xs">
+                  在 AgentOS 查看執行詳情 →
+                </a>
+              </div>
+              <div>
+                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">審計時間軸</div>
+                <div x-show="runAuditEvents.length === 0" class="text-xs text-slate-400 bg-slate-50 rounded-lg p-3">此 run 目前沒有可顯示的審計事件</div>
+                <div class="space-y-2" x-show="runAuditEvents.length > 0">
+                  <template x-for="event in runAuditEvents" :key="event.id">
+                    <div class="border border-slate-100 rounded-lg p-3 bg-slate-50/60">
+                      <div class="flex items-center justify-between gap-2 mb-1.5">
+                        <span :class="auditEventBadgeClass(event.event_type)" class="badge" x-text="auditEventLabel(event.event_type)"></span>
+                        <span class="text-xs text-slate-400" x-text="formatDate(event.created_at)"></span>
+                      </div>
+                      <div class="text-xs text-slate-500" x-show="event.actor_id">Actor: <span class="font-mono" x-text="event.actor_id"></span></div>
+                      <div class="text-xs text-slate-500" x-show="event.source">Source: <span class="font-mono" x-text="event.source"></span></div>
+                      <pre class="mt-2 bg-slate-900 text-emerald-400 text-xs rounded-lg p-2 overflow-x-auto whitespace-pre-wrap" x-text="JSON.stringify(event.payload, null, 2)"></pre>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ APPROVALS ════════════ -->
+      <div x-show="!loading && page==='approvals'" class="fade-in space-y-4">
+
+        <div class="flex items-center gap-3">
+          <select x-model="approvalsFilter.status" @change="loadApprovals()" class="select text-sm">
+            <option value="">所有狀態</option>
+            <option value="pending">等待中</option>
+            <option value="decided">已決定</option>
+          </select>
+          <span class="text-sm text-slate-500 ml-auto" x-text="approvals.length + ' 筆'"></span>
+        </div>
+
+        <div x-show="approvals.length === 0" class="bg-white rounded-xl p-12 text-center shadow-sm border border-slate-100">
+          <div class="text-4xl mb-3">✅</div>
+          <div class="text-slate-500 text-sm">目前沒有待審批任務</div>
+        </div>
+
+        <div class="space-y-3">
+          <template x-for="ap in approvals" :key="ap.id">
+            <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100">
+              <div class="flex items-start justify-between mb-3">
+                <div>
+                  <div class="font-semibold text-slate-800" x-text="workflowEmoji(ap.workflow_type) + ' ' + workflowLabel(ap.workflow_type)"></div>
+                  <div class="text-xs text-slate-400 font-mono mt-0.5" x-text="ap.agentos_run_id"></div>
+                </div>
+                <div class="flex items-center gap-2 flex-shrink-0">
+                  <span :class="statusBadgeClass(ap.status)" class="badge" x-text="statusLabel(ap.status)"></span>
+                  <span x-show="ap.priority === 'urgent'" class="badge bg-red-100 text-red-700">緊急</span>
+                </div>
+              </div>
+              <div class="grid grid-cols-3 gap-3 text-xs mb-3">
+                <div>
+                  <div class="text-slate-400 mb-0.5">建立時間</div>
+                  <div class="text-slate-600" x-text="formatDate(ap.created_at)"></div>
+                </div>
+                <div x-show="ap.expires_at">
+                  <div class="text-slate-400 mb-0.5">到期時間</div>
+                  <div class="text-amber-600 font-medium" x-text="relativeTime(ap.expires_at)"></div>
+                </div>
+                <div x-show="ap.decided_at">
+                  <div class="text-slate-400 mb-0.5">決定時間</div>
+                  <div class="text-slate-600" x-text="formatDate(ap.decided_at)"></div>
+                </div>
+              </div>
+              <!-- Draft content preview -->
+              <div x-show="ap.draft_content && Object.keys(ap.draft_content).length > 0">
+                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">草稿預覽</div>
+                <div class="bg-slate-50 rounded-lg p-3 text-xs text-slate-600">
+                  <template x-for="[key, val] in Object.entries(ap.draft_content || {})" :key="key">
+                    <div x-show="typeof val === 'string' && val.length > 0" class="mb-1.5">
+                      <span class="font-medium text-slate-400 mr-1" x-text="key + ':'"></span>
+                      <span x-text="typeof val === 'string' ? val.slice(0,120) + (val.length > 120 ? '…' : '') : ''"></span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+              <div x-show="ap.decision" class="mt-2 text-xs text-slate-500">
+                決定：<span class="font-medium" :class="ap.decision === 'approved' ? 'text-emerald-600' : 'text-red-500'" x-text="decisionLabel(ap.decision)"></span>
+                <span x-show="ap.actor_line_id" x-text="'（' + ap.actor_line_id + '）'"></span>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- ════════════ KNOWLEDGE BASE ════════════ -->
+      <div x-show="!loading && page==='knowledge'" class="fade-in space-y-4">
+
+        <!-- Actions bar -->
+        <div class="flex items-center gap-3 flex-wrap">
+          <!-- Category filter -->
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="cat in knowledgeCategories" :key="cat.value">
+              <button @click="knowledgeFilter = cat.value; loadKnowledge()"
+                :class="knowledgeFilter === cat.value ? 'bg-emerald-600 text-white' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'"
+                class="px-3 py-1.5 rounded-full text-xs font-medium transition-colors" x-text="cat.label"></button>
+            </template>
+          </div>
+          <div class="ml-auto flex items-center gap-2">
+            <span class="text-sm text-slate-500" x-text="knowledgeEntries.length + ' 條'"></span>
+            <button @click="openKnowledgeModal()" class="btn-primary">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+              新增條目
+            </button>
+          </div>
+        </div>
+
+        <!-- Entries grid -->
+        <div x-show="knowledgeEntries.length === 0" class="bg-white rounded-xl p-12 text-center shadow-sm border border-slate-100">
+          <div class="text-4xl mb-3">📚</div>
+          <div class="text-slate-500 text-sm">此分類尚無知識條目</div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+          <template x-for="entry in knowledgeEntries" :key="entry.id">
+            <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100 hover:border-slate-200 transition-colors">
+              <div class="flex items-start justify-between mb-2">
+                <span :class="categoryBadgeClass(entry.category)" class="badge" x-text="categoryLabel(entry.category)"></span>
+                <div class="flex items-center gap-1.5">
+                  <button @click="editKnowledgeEntry(entry)" class="p-1 text-slate-400 hover:text-slate-600 rounded">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+                  </button>
+                  <button @click="deleteKnowledgeEntry(entry.id)" class="p-1 text-slate-400 hover:text-red-500 rounded">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                  </button>
+                </div>
+              </div>
+              <p class="text-sm text-slate-700 leading-relaxed line-clamp-3" x-text="entry.content"></p>
+              <div class="flex items-center gap-3 mt-2.5 text-xs text-slate-400">
+                <span x-text="sourceLabel(entry.source_type)"></span>
+                <span x-text="relativeTime(entry.created_at)"></span>
+                <span x-show="entry.status !== 'active'" :class="entry.status === 'superseded' ? 'text-slate-400 line-through' : 'text-amber-500'" x-text="entry.status"></span>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- Knowledge Modal -->
+        <div x-show="knowledgeModal.open" x-transition class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" @click.self="knowledgeModal.open = false">
+          <div class="bg-white rounded-2xl w-full max-w-md shadow-2xl">
+            <div class="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h2 class="font-semibold text-slate-800" x-text="knowledgeModal.mode === 'create' ? '新增知識條目' : '編輯知識條目'"></h2>
+              <button @click="knowledgeModal.open = false" class="text-slate-400 hover:text-slate-600">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+              </button>
+            </div>
+            <div class="p-5 space-y-4">
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">類別</label>
+                <select x-model="knowledgeModal.category" class="select w-full">
+                  <template x-for="cat in knowledgeCategories.filter(c => c.value !== '')" :key="cat.value">
+                    <option :value="cat.value" x-text="cat.label"></option>
+                  </template>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">內容</label>
+                <textarea x-model="knowledgeModal.content" rows="4" class="input resize-none" placeholder="輸入知識條目內容..."></textarea>
+              </div>
+              <div x-show="knowledgeModal.mode === 'create'">
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">Tenant ID</label>
+                <input x-model="knowledgeModal.tenant_id" class="input" placeholder="留空使用當前 Tenant" />
+              </div>
+            </div>
+            <div class="px-5 py-4 border-t border-slate-100 flex justify-end gap-2">
+              <button @click="knowledgeModal.open = false" class="btn-secondary">取消</button>
+              <button @click="saveKnowledgeEntry()" class="btn-primary" :disabled="!knowledgeModal.content">
+                <span x-text="knowledgeModal.mode === 'create' ? '新增' : '儲存'"></span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ CONNECTORS ════════════ -->
+      <div x-show="!loading && page==='connectors'" class="fade-in space-y-4">
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <template x-for="conn in connectors" :key="conn.platform">
+            <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100">
+              <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center gap-3">
+                  <div class="w-10 h-10 rounded-xl flex items-center justify-center text-xl"
+                    :class="platformBgClass(conn.platform)" x-text="platformEmoji(conn.platform)"></div>
+                  <div>
+                    <div class="font-semibold text-slate-800" x-text="platformLabel(conn.platform)"></div>
+                    <div class="text-xs text-slate-400" x-text="conn.account_label || platformDesc(conn.platform)"></div>
+                  </div>
+                </div>
+                <div class="flex items-center gap-2">
+                  <div class="w-2.5 h-2.5 rounded-full" :class="conn.has_token ? 'bg-emerald-500' : 'bg-slate-300'"></div>
+                  <span class="text-sm font-medium" :class="conn.has_token ? 'text-emerald-600' : 'text-slate-400'" x-text="conn.has_token ? '已連接' : '未連接'"></span>
+                </div>
+              </div>
+              <div class="space-y-2 text-xs text-slate-500">
+                <div x-show="conn.last_refreshed_at" class="flex items-center gap-2">
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                  <span x-text="'上次更新：' + relativeTime(conn.last_refreshed_at)"></span>
+                </div>
+                <div x-show="!conn.has_token" class="text-amber-600">
+                  ⚠️ <span x-text="conn.hint || platformConnectHint(conn.platform)"></span>
+                </div>
+              </div>
+              <div class="mt-4 flex gap-2" x-show="conn.platform === 'google_business' || conn.platform === 'ga4'">
+                <a href="/auth/google/connect" class="btn-primary text-xs" x-show="!conn.has_token">連接 Google</a>
+                <a href="/auth/google/status" target="_blank" class="btn-secondary text-xs" x-show="conn.has_token">查看授權狀態</a>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- ════════════ PUSH LOG ════════════ -->
+      <div x-show="!loading && page==='pushes'" class="fade-in space-y-4">
+
+        <!-- Rate limit gauge -->
+        <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-slate-700">今日推播額度</h3>
+            <span class="text-sm font-medium" :class="pushData.today_count >= pushData.daily_limit ? 'text-red-500' : 'text-emerald-600'"
+              x-text="pushData.today_count + ' / ' + pushData.daily_limit"></span>
+          </div>
+          <div class="w-full bg-slate-100 rounded-full h-2.5 mb-2">
+            <div class="h-2.5 rounded-full transition-all duration-500"
+              :style="'width: ' + Math.min((pushData.today_count / pushData.daily_limit) * 100, 100) + '%'"
+              :class="pushData.today_count >= pushData.daily_limit ? 'bg-red-500' : 'bg-emerald-500'"></div>
+          </div>
+          <div class="text-xs text-slate-400">
+            <span x-show="pushData.can_push" class="text-emerald-600">✅ 可以繼續推播</span>
+            <span x-show="!pushData.can_push" class="text-red-500">🚫 今日額度已用完，明日 00:00 UTC 重置</span>
+          </div>
+        </div>
+
+        <!-- Push timeline -->
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+          <div class="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-slate-700">推播歷史紀錄</h3>
+            <span class="text-xs text-slate-400" x-text="pushData.pushes?.length + ' 筆'"></span>
+          </div>
+          <div x-show="!pushData.pushes || pushData.pushes.length === 0" class="py-12 text-center text-slate-400 text-sm">尚無推播紀錄</div>
+          <div class="divide-y divide-slate-100">
+            <template x-for="push in (pushData.pushes || [])" :key="push.id">
+              <div class="px-4 py-3 flex items-center gap-3">
+                <div class="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0"
+                  :class="pushTypeBgClass(push.message_type)" x-text="pushTypeEmoji(push.message_type)"></div>
+                <div class="flex-1 min-w-0">
+                  <div class="text-sm font-medium text-slate-700" x-text="pushTypeLabel(push.message_type)"></div>
+                  <div class="text-xs text-slate-400 font-mono truncate" x-text="push.recipient_line_id"></div>
+                </div>
+                <div class="text-xs text-slate-400 flex-shrink-0" x-text="formatDate(push.pushed_at)"></div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+</div>
+
+<!-- ═══════════════════════ JAVASCRIPT ═══════════════════════ -->
+<script>
+function app() {
+  return {
+    page: 'overview',
+    tenantId: '',
+    loading: false,
+    lastRefresh: '',
+
+    // Data stores
+    stats: {},
+    overviewRuns: [],
+    pendingApprovals: [],
+    runs: [],
+    approvals: [],
+    knowledgeEntries: [],
+    connectors: [],
+    pushData: {},
+    runAuditEvents: [],
+    selectedRun: null,
+
+    // Filters
+    runsFilter: { workflow_type: '', status: '' },
+    approvalsFilter: { status: '' },
+    knowledgeFilter: '',
+
+    // Knowledge modal
+    knowledgeModal: {
+      open: false,
+      mode: 'create',
+      id: null,
+      category: 'core_value',
+      content: '',
+      tenant_id: '',
+    },
+
+    knowledgeCategories: [
+      { value: '', label: '全部' },
+      { value: 'core_value', label: '💎 核心價值' },
+      { value: 'pain_point', label: '😩 痛點' },
+      { value: 'goal', label: '🎯 目標' },
+      { value: 'product', label: '🛍️ 產品服務' },
+      { value: 'style', label: '🎨 品牌風格' },
+      { value: 'contact', label: '📞 聯絡方式' },
+      { value: 'basic_info', label: '🏪 基本資訊' },
+      { value: 'preference', label: '⚙️ 偏好設定' },
+    ],
+
+    async init() {
+      await this.loadOverview()
+    },
+
+    pageTitle() {
+      const titles = {
+        overview: '系統總覽',
+        runs: '工作流執行紀錄',
+        approvals: '待審批任務',
+        knowledge: '知識庫管理',
+        connectors: '連接器狀態',
+        pushes: 'LINE 推播紀錄',
+      }
+      return titles[this.page] || 'Kachu 管理後台'
+    },
+
+    async navigate(p) {
+      this.page = p
+      this.selectedRun = null
+      if (p === 'overview') await this.loadOverview()
+      else if (p === 'runs') await this.loadRuns()
+      else if (p === 'approvals') await this.loadApprovals()
+      else if (p === 'knowledge') await this.loadKnowledge()
+      else if (p === 'connectors') await this.loadConnectors()
+      else if (p === 'pushes') await this.loadPushes()
+    },
+
+    async reloadCurrentPage() {
+      await this.navigate(this.page)
+    },
+
+    async fetch(url) {
+      const params = new URLSearchParams()
+      if (this.tenantId) params.set('tenant_id', this.tenantId)
+      const fullUrl = url + (url.includes('?') ? '&' : '?') + params.toString()
+      const res = await fetch(fullUrl)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return res.json()
+    },
+
+    async loadOverview() {
+      this.loading = true
+      try {
+        const [statsData, runsData, approvalsData] = await Promise.all([
+          this.fetch('/dashboard/api/stats'),
+          this.fetch('/dashboard/api/runs?limit=8'),
+          this.fetch('/dashboard/api/approvals?status=pending'),
+        ])
+        this.stats = statsData
+        this.overviewRuns = runsData.runs || []
+        this.pendingApprovals = approvalsData.approvals || []
+        this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
+        this.$nextTick(() => this.renderWorkflowChart())
+      } catch (e) {
+        console.error('loadOverview error', e)
+      } finally {
+        this.loading = false
+      }
+    },
+
+    async loadRuns() {
+      this.loading = true
+      try {
+        const params = new URLSearchParams()
+        if (this.tenantId) params.set('tenant_id', this.tenantId)
+        if (this.runsFilter.workflow_type) params.set('workflow_type', this.runsFilter.workflow_type)
+        if (this.runsFilter.status) params.set('status', this.runsFilter.status)
+        params.set('limit', '100')
+        const data = await fetch('/dashboard/api/runs?' + params).then(r => r.json())
+        this.runs = data.runs || []
+        this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
+      } catch (e) { console.error(e) } finally { this.loading = false }
+    },
+
+    async loadApprovals() {
+      this.loading = true
+      try {
+        const params = new URLSearchParams()
+        if (this.tenantId) params.set('tenant_id', this.tenantId)
+        if (this.approvalsFilter.status) params.set('status', this.approvalsFilter.status)
+        const data = await fetch('/dashboard/api/approvals?' + params).then(r => r.json())
+        this.approvals = data.approvals || []
+        this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
+      } catch (e) { console.error(e) } finally { this.loading = false }
+    },
+
+    async loadKnowledge() {
+      this.loading = true
+      try {
+        const params = new URLSearchParams()
+        if (this.tenantId) params.set('tenant_id', this.tenantId)
+        if (this.knowledgeFilter) params.set('category', this.knowledgeFilter)
+        const data = await fetch('/dashboard/api/knowledge?' + params).then(r => r.json())
+        this.knowledgeEntries = data.entries || []
+        this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
+      } catch (e) { console.error(e) } finally { this.loading = false }
+    },
+
+    async loadConnectors() {
+      this.loading = true
+      try {
+        const data = await this.fetch('/dashboard/api/connectors')
+        this.connectors = data.connectors || []
+        this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
+      } catch (e) { console.error(e) } finally { this.loading = false }
+    },
+
+    async loadPushes() {
+      this.loading = true
+      try {
+        const data = await this.fetch('/dashboard/api/pushes?limit=50')
+        this.pushData = data
+        this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
+      } catch (e) { console.error(e) } finally { this.loading = false }
+    },
+
+    async openRunDetail(run) {
+      this.selectedRun = run
+      this.runAuditEvents = []
+      try {
+        const data = await this.fetch('/dashboard/api/audit?run_id=' + encodeURIComponent(run.agentos_run_id) + '&limit=50')
+        this.runAuditEvents = data.events || []
+      } catch (e) { console.error(e) }
+      if (this.page !== 'runs') { this.page = 'runs' }
+    },
+
+    // ── Knowledge CRUD ──────────────────────────────────────────────────────
+    openKnowledgeModal() {
+      this.knowledgeModal = { open: true, mode: 'create', id: null, category: 'core_value', content: '', tenant_id: this.tenantId }
+    },
+    editKnowledgeEntry(entry) {
+      this.knowledgeModal = { open: true, mode: 'edit', id: entry.id, category: entry.category, content: entry.content, tenant_id: entry.tenant_id }
+    },
+    async saveKnowledgeEntry() {
+      const m = this.knowledgeModal
+      if (!m.content.trim()) return
+      try {
+        if (m.mode === 'create') {
+          const tid = (m.tenant_id || this.tenantId || '').trim()
+          if (!tid) {
+            alert('請先輸入 Tenant ID 才能新增知識條目')
+            return
+          }
+          await fetch('/dashboard/api/knowledge', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tenant_id: tid, category: (m.category || '').trim(), content: m.content.trim(), source_type: 'manual' }),
+          })
+        } else {
+          await fetch(`/dashboard/api/knowledge/${m.id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: m.content.trim(), category: (m.category || '').trim() }),
+          })
+        }
+        m.open = false
+        await this.loadKnowledge()
+      } catch (e) { console.error(e) }
+    },
+    async deleteKnowledgeEntry(id) {
+      if (!confirm('確定要刪除這條知識條目嗎？')) return
+      try {
+        await fetch(`/dashboard/api/knowledge/${id}`, { method: 'DELETE' })
+        await this.loadKnowledge()
+      } catch (e) { console.error(e) }
+    },
+
+    // ── Chart ───────────────────────────────────────────────────────────────
+    _chart: null,
+    renderWorkflowChart() {
+      const ctx = document.getElementById('workflowChart')
+      if (!ctx) return
+      const byType = this.stats.runs_by_type || {}
+      const labels = Object.keys(byType).map(t => this.workflowLabel(t))
+      const data = Object.values(byType)
+      const colors = ['#10b981','#3b82f6','#f59e0b','#8b5cf6','#ef4444','#06b6d4']
+      if (this._chart) { this._chart.destroy() }
+      if (data.length === 0) return
+      this._chart = new Chart(ctx, {
+        type: 'doughnut',
+        data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 0 }] },
+        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, cutout: '65%' },
+      })
+    },
+
+    // ── Label / styling helpers ─────────────────────────────────────────────
+    workflowLabel(t) {
+      const m = { photo_content:'照片發文', review_reply:'評論回覆', line_faq:'FAQ 自動回覆', google_post:'Google 商家動態', ga4_report:'GA4 週報', knowledge_update:'知識庫更新' }
+      return m[t] || t || '—'
+    },
+    workflowEmoji(t) {
+      const m = { photo_content:'📸', review_reply:'⭐', line_faq:'💬', google_post:'🗺️', ga4_report:'📊', knowledge_update:'📚' }
+      return m[t] || '⚙️'
+    },
+    statusLabel(s) {
+      const m = { running:'執行中', completed:'已完成', failed:'失敗', pending:'等待中', decided:'已決定' }
+      return m[s] || s || '—'
+    },
+    statusBadgeClass(s) {
+      const m = { running:'bg-blue-100 text-blue-700', completed:'bg-emerald-100 text-emerald-700', failed:'bg-red-100 text-red-700', pending:'bg-amber-100 text-amber-700', decided:'bg-slate-100 text-slate-600' }
+      return m[s] || 'bg-slate-100 text-slate-600'
+    },
+    decisionLabel(d) {
+      const m = { approved:'已確認', rejected:'已拒絕', modified:'已修改' }
+      return m[d] || d
+    },
+    triggerLabel(s) {
+      const m = { line:'LINE 訊息', google_webhook:'Google Webhook', schedule:'排程', boss_request:'老闆主動', line_cta:'LINE 按鈕', manual:'手動觸發' }
+      return m[s] || s || '—'
+    },
+    categoryLabel(c) {
+      const m = { core_value:'💎 核心價值', pain_point:'😩 痛點', goal:'🎯 目標', product:'🛍️ 產品服務', style:'🎨 品牌風格', contact:'📞 聯絡方式', basic_info:'🏪 基本資訊', preference:'⚙️ 偏好設定', episode:'📖 執行記憶' }
+      return m[c] || c
+    },
+    categoryBadgeClass(c) {
+      const m = { core_value:'bg-blue-100 text-blue-700', pain_point:'bg-red-100 text-red-700', goal:'bg-purple-100 text-purple-700', product:'bg-emerald-100 text-emerald-700', style:'bg-pink-100 text-pink-700', contact:'bg-slate-100 text-slate-600', basic_info:'bg-orange-100 text-orange-700', preference:'bg-indigo-100 text-indigo-700', episode:'bg-teal-100 text-teal-700' }
+      return m[c] || 'bg-slate-100 text-slate-600'
+    },
+    sourceLabel(s) {
+      const m = { conversation:'對話', document:'文件上傳', photo:'照片', review:'評論', platform_data:'平台數據', edit:'老闆修改', workflow:'工作流', manual:'手動新增' }
+      return '來源：' + (m[s] || s)
+    },
+    platformLabel(p) {
+      const m = { google_business:'Google 商家資料', ga4:'Google Analytics 4', meta:'Meta (IG/FB)', line:'LINE Official Account' }
+      return m[p] || p
+    },
+    platformDesc(p) {
+      const m = { google_business:'評論回覆 / 商家動態', ga4:'流量數據分析', meta:'IG/FB 貼文發布', line:'老闆互動入口' }
+      return m[p] || ''
+    },
+    platformEmoji(p) {
+      const m = { google_business:'🗺️', ga4:'📊', meta:'📱', line:'💚' }
+      return m[p] || '🔗'
+    },
+    platformBgClass(p) {
+      const m = { google_business:'bg-blue-50', ga4:'bg-orange-50', meta:'bg-purple-50', line:'bg-green-50' }
+      return m[p] || 'bg-slate-50'
+    },
+    platformConnectHint(p) {
+      const m = { google_business:'請先設定 Google Service Account 或 OAuth', ga4:'請先設定 GA4 Property ID', meta:'尚未整合（Phase 3）', line:'請設定 LINE Channel Access Token' }
+      return m[p] || '尚未連接'
+    },
+    pushTypeLabel(t) {
+      const m = { approval:'📋 草稿確認推播', report:'📊 GA4 週報推播', escalation:'⚠️ 顧客升級通知', general:'💬 一般訊息' }
+      return m[t] || t
+    },
+    pushTypeEmoji(t) {
+      const m = { approval:'📋', report:'📊', escalation:'⚠️', general:'💬' }
+      return m[t] || '🔔'
+    },
+    pushTypeBgClass(t) {
+      const m = { approval:'bg-blue-50', report:'bg-purple-50', escalation:'bg-amber-50', general:'bg-slate-50' }
+      return m[t] || 'bg-slate-50'
+    },
+    auditEventLabel(t) {
+      const m = {
+        approval_requested:'建立審批任務', approval_decided:'審批已決定', approval_edited:'編輯後送審',
+        edit_session_started:'開始編輯會話', push_sent:'LINE 推播成功', push_failed:'LINE 推播失敗',
+        push_suppressed:'LINE 推播被抑制', push_skipped:'LINE 推播略過', publish_attempted:'開始外部發布',
+        publish_succeeded:'外部發布完成', publish_failed:'外部發布失敗', publish_skipped:'外部發布略過'
+      }
+      return m[t] || t
+    },
+    auditEventBadgeClass(t) {
+      const m = {
+        approval_requested:'bg-amber-100 text-amber-700', approval_decided:'bg-emerald-100 text-emerald-700', approval_edited:'bg-indigo-100 text-indigo-700',
+        edit_session_started:'bg-slate-100 text-slate-700', push_sent:'bg-blue-100 text-blue-700', push_failed:'bg-red-100 text-red-700',
+        push_suppressed:'bg-orange-100 text-orange-700', push_skipped:'bg-slate-100 text-slate-600', publish_attempted:'bg-purple-100 text-purple-700',
+        publish_succeeded:'bg-emerald-100 text-emerald-700', publish_failed:'bg-red-100 text-red-700', publish_skipped:'bg-slate-100 text-slate-600'
+      }
+      return m[t] || 'bg-slate-100 text-slate-700'
+    },
+
+    // ── Date helpers ────────────────────────────────────────────────────────
+    formatDate(iso) {
+      if (!iso) return '—'
+      try {
+        return new Date(iso).toLocaleString('zh-TW', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' })
+      } catch { return iso }
+    },
+    relativeTime(iso) {
+      if (!iso) return '—'
+      try {
+        const diff = Date.now() - new Date(iso).getTime()
+        if (diff < 0) {
+          const abs = -diff
+          if (abs < 3600000) return Math.round(abs/60000) + ' 分鐘後'
+          if (abs < 86400000) return Math.round(abs/3600000) + ' 小時後'
+          return Math.round(abs/86400000) + ' 天後'
+        }
+        if (diff < 60000) return '剛才'
+        if (diff < 3600000) return Math.round(diff/60000) + ' 分鐘前'
+        if (diff < 86400000) return Math.round(diff/3600000) + ' 小時前'
+        return Math.round(diff/86400000) + ' 天前'
+      } catch { return iso }
+    },
+  }
+}
+</script>
+</body>
+</html>

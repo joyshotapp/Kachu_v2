@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: kachu
+      POSTGRES_PASSWORD: kachu
+      POSTGRES_DB: kachu
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kachu"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  agentOS:
+    build:
+      context: ../AgentOS
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://kachu:kachu@postgres:5432/agent_platform
+      KACHU_BASE_URL: http://kachu:8001
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  kachu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    env_file: .env          # LINE secrets, GOOGLE_AI_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON, etc.
+    environment:
+      DATABASE_URL: postgresql+psycopg://kachu:kachu@postgres:5432/kachu
+      AGENTOS_BASE_URL: http://agentOS:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      agentOS:
+        condition: service_healthy
+    volumes:
+      - ./credentials:/app/credentials:ro   # optional: GCP service-account JSON file
+
+volumes:
+  postgres_data:

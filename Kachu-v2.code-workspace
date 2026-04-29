@@ -1,0 +1,19 @@
+{
+  "folders": [
+    {
+      "name": "Kachu v2（主專案）",
+      "path": "C:\\Users\\User\\Desktop\\Kachu-v2"
+    },
+    {
+      "name": "AgentOS（執行平台）",
+      "path": "C:\\Users\\User\\Desktop\\AgentOS"
+    },
+    {
+      "name": "Kachu v1（參考）",
+      "path": "C:\\Users\\User\\Desktop\\Kachu"
+    }
+  ],
+  "settings": {
+    "github.copilot.chat.scopeSelection": true
+  }
+}

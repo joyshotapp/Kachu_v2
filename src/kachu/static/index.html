@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kachu — 你的 AI 數位幕僚</title>
+  <meta name="description" content="Kachu 是住在 LINE 裡的 AI 助理，幫你的店自動寫貼文、回評論、整理顧客問題。不用下載 App，不用學新工具。" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700;900&display=swap');
+    html { scroll-behavior: smooth; font-family: 'Noto Sans TC', sans-serif; }
+    .gradient-text {
+      background: linear-gradient(135deg, #10b981, #059669);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero-bg {
+      background: radial-gradient(ellipse 80% 60% at 50% -10%, rgba(16,185,129,0.12) 0%, transparent 60%);
+    }
+    .card-hover {
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    .card-hover:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 20px 40px rgba(0,0,0,0.08);
+    }
+    .fade-up {
+      opacity: 0;
+      transform: translateY(24px);
+      transition: opacity 0.6s ease, transform 0.6s ease;
+    }
+    .fade-up.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .line-btn {
+      background: #00B900;
+      transition: background 0.2s ease, transform 0.1s ease;
+    }
+    .line-btn:hover {
+      background: #009900;
+      transform: translateY(-1px);
+    }
+    .pill {
+      display: inline-block;
+      background: rgba(16,185,129,0.1);
+      color: #059669;
+      font-weight: 600;
+      font-size: 0.75rem;
+      letter-spacing: 0.08em;
+      padding: 0.25rem 0.75rem;
+      border-radius: 999px;
+      border: 1px solid rgba(16,185,129,0.25);
+    }
+  </style>
+</head>
+<body class="bg-white text-slate-800 antialiased">
+
+<!-- ═══════════ NAV ═══════════ -->
+<nav class="fixed top-0 left-0 right-0 z-50 bg-white/80 backdrop-blur-sm border-b border-slate-100">
+  <div class="max-w-5xl mx-auto px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2">
+      <div class="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-white font-bold text-sm">K</div>
+      <span class="font-bold text-slate-900 text-lg tracking-tight">Kachu</span>
+    </div>
+    <a href="#contact" class="line-btn text-white text-sm font-semibold px-4 py-2 rounded-lg">
+      加 LINE 免費試用
+    </a>
+  </div>
+</nav>
+
+<!-- ═══════════ HERO ═══════════ -->
+<section class="hero-bg pt-28 pb-20 px-6">
+  <div class="max-w-3xl mx-auto text-center">
+    <div class="pill mb-5">Beta 免費試用中</div>
+    <h1 class="text-5xl md:text-6xl font-black text-slate-900 leading-tight mb-6">
+      你的 AI 數位幕僚<br />
+      <span class="gradient-text">就住在 LINE 裡</span>
+    </h1>
+    <p class="text-xl text-slate-500 leading-relaxed max-w-xl mx-auto mb-10">
+      Kachu 幫你的店自動寫社群貼文、回覆 Google 評論、整理顧客常見問題。<br class="hidden md:block"/>
+      <strong class="text-slate-700">不用下載 App，不用學新工具，用 LINE 就好。</strong>
+    </p>
+    <div class="flex flex-col sm:flex-row gap-3 justify-center">
+      <a href="#contact" class="line-btn text-white font-semibold px-8 py-4 rounded-xl text-base">
+        📲 加 LINE 申請試用（免費）
+      </a>
+      <a href="#how" class="border border-slate-200 text-slate-700 font-semibold px-8 py-4 rounded-xl text-base hover:bg-slate-50 transition-colors">
+        怎麼運作？ →
+      </a>
+    </div>
+    <p class="text-xs text-slate-400 mt-4">Beta 期間完全免費・不需信用卡</p>
+  </div>
+</section>
+
+<!-- ═══════════ PROBLEM ═══════════ -->
+<section class="py-16 px-6 bg-slate-50">
+  <div class="max-w-4xl mx-auto">
+    <h2 class="text-center text-3xl font-bold text-slate-900 mb-3">每天都在做這些事嗎？</h2>
+    <p class="text-center text-slate-500 mb-10">忙著顧生意，卻也要顧社群，時間根本不夠用。</p>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="bg-white rounded-2xl p-6 border border-slate-200">
+        <div class="text-3xl mb-3">😩</div>
+        <h3 class="font-bold text-slate-800 mb-2">想發貼文，不知道怎麼寫</h3>
+        <p class="text-sm text-slate-500">IG、Facebook、Google 商家，每個都要想文案，一張照片擺在那裡不知道怎麼開口。</p>
+      </div>
+      <div class="bg-white rounded-2xl p-6 border border-slate-200">
+        <div class="text-3xl mb-3">🤦</div>
+        <h3 class="font-bold text-slate-800 mb-2">評論沒人回，形象扣分</h3>
+        <p class="text-sm text-slate-500">Google 上面有顧客留言，回覆要得體又花時間，沒空處理就這樣放著。</p>
+      </div>
+      <div class="bg-white rounded-2xl p-6 border border-slate-200">
+        <div class="text-3xl mb-3">📉</div>
+        <h3 class="font-bold text-slate-800 mb-2">業績數字看不懂在哪</h3>
+        <p class="text-sm text-slate-500">GA4 開了又關，不知道怎麼解讀，更不知道哪個月比較好、為什麼。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ HOW IT WORKS ═══════════ -->
+<section id="how" class="py-20 px-6">
+  <div class="max-w-4xl mx-auto">
+    <div class="text-center mb-14">
+      <h2 class="text-3xl font-bold text-slate-900 mb-3">三步驟開始，五分鐘設定好</h2>
+      <p class="text-slate-500">之後就交給 Kachu，你只需要點按鈕確認。</p>
+    </div>
+    <div class="relative">
+      <!-- connecting line -->
+      <div class="hidden md:block absolute top-10 left-[calc(16.67%+1rem)] right-[calc(16.67%+1rem)] h-0.5 bg-emerald-100"></div>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+        <div class="text-center fade-up">
+          <div class="w-20 h-20 bg-emerald-50 border-2 border-emerald-200 rounded-full flex items-center justify-center text-3xl mx-auto mb-4 relative z-10">📲</div>
+          <div class="font-bold text-slate-900 mb-2">加 Kachu 為 LINE 好友</div>
+          <p class="text-sm text-slate-500">掃一個 QR code，就像加普通 LINE 好友一樣。</p>
+        </div>
+        <div class="text-center fade-up" style="transition-delay: 0.15s">
+          <div class="w-20 h-20 bg-emerald-50 border-2 border-emerald-200 rounded-full flex items-center justify-center text-3xl mx-auto mb-4 relative z-10">💬</div>
+          <div class="font-bold text-slate-900 mb-2">告訴它你的生意</div>
+          <p class="text-sm text-slate-500">在 LINE 裡回答幾個問題，不用五分鐘，Kachu 就了解你的店了。</p>
+        </div>
+        <div class="text-center fade-up" style="transition-delay: 0.3s">
+          <div class="w-20 h-20 bg-emerald-50 border-2 border-emerald-200 rounded-full flex items-center justify-center text-3xl mx-auto mb-4 relative z-10">✅</div>
+          <div class="font-bold text-slate-900 mb-2">確認，就自動發布</div>
+          <p class="text-sm text-slate-500">Kachu 傳草稿給你，你點「確認」它就去發，點「修改」它重寫。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ FEATURES ═══════════ -->
+<section id="features" class="py-20 px-6 bg-slate-50">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-14">
+      <h2 class="text-3xl font-bold text-slate-900 mb-3">Kachu 幫你做的事</h2>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+      <!-- Feature 1 -->
+      <div class="bg-white rounded-2xl p-7 border border-slate-100 card-hover fade-up">
+        <div class="flex items-start gap-4">
+          <div class="w-12 h-12 bg-blue-50 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">📸</div>
+          <div>
+            <h3 class="font-bold text-slate-900 mb-1">照片 → 貼文草稿，10 秒內</h3>
+            <p class="text-sm text-slate-500 leading-relaxed">傳一張今天的新品照片，Kachu 自動寫好 IG/Facebook 文案，你確認就發。還可以指定節日主題或口吻。</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Feature 2 -->
+      <div class="bg-white rounded-2xl p-7 border border-slate-100 card-hover fade-up" style="transition-delay: 0.1s">
+        <div class="flex items-start gap-4">
+          <div class="w-12 h-12 bg-amber-50 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">⭐</div>
+          <div>
+            <h3 class="font-bold text-slate-900 mb-1">Google 評論，有人幫你回</h3>
+            <p class="text-sm text-slate-500 leading-relaxed">Kachu 讀取新評論、自動擬好回覆文字，你看一眼確認，不需要自己想該說什麼。</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Feature 3 -->
+      <div class="bg-white rounded-2xl p-7 border border-slate-100 card-hover fade-up" style="transition-delay: 0.15s">
+        <div class="flex items-start gap-4">
+          <div class="w-12 h-12 bg-emerald-50 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">📊</div>
+          <div>
+            <h3 class="font-bold text-slate-900 mb-1">業績報告，說人話給你聽</h3>
+            <p class="text-sm text-slate-500 leading-relaxed">跟 Kachu 說「這週流量怎麼樣」，它從 Google Analytics 幫你整理重點，不用自己看圖。</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Feature 4 -->
+      <div class="bg-white rounded-2xl p-7 border border-slate-100 card-hover fade-up" style="transition-delay: 0.25s">
+        <div class="flex items-start gap-4">
+          <div class="w-12 h-12 bg-purple-50 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">🧠</div>
+          <div>
+            <h3 class="font-bold text-slate-900 mb-1">記住你的店，越用越懂你</h3>
+            <p class="text-sm text-slate-500 leading-relaxed">你告訴它的菜單、特色、口吻，它都記住了。之後生成的內容越來越貼近你的風格。</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ FOR WHO ═══════════ -->
+<section class="py-16 px-6">
+  <div class="max-w-4xl mx-auto text-center">
+    <h2 class="text-3xl font-bold text-slate-900 mb-3">適合哪些店家？</h2>
+    <p class="text-slate-500 mb-10">只要你有 LINE，就能用。</p>
+    <div class="flex flex-wrap justify-center gap-3">
+      <span class="bg-slate-100 text-slate-700 px-5 py-2.5 rounded-full font-medium text-sm">🍜 餐廳 / 小吃</span>
+      <span class="bg-slate-100 text-slate-700 px-5 py-2.5 rounded-full font-medium text-sm">☕ 咖啡廳 / 早午餐</span>
+      <span class="bg-slate-100 text-slate-700 px-5 py-2.5 rounded-full font-medium text-sm">💆 美甲 / 美睫 / 美容</span>
+      <span class="bg-slate-100 text-slate-700 px-5 py-2.5 rounded-full font-medium text-sm">🏥 診所 / 中醫 / 牙科</span>
+      <span class="bg-slate-100 text-slate-700 px-5 py-2.5 rounded-full font-medium text-sm">🛒 網路賣家</span>
+      <span class="bg-slate-100 text-slate-700 px-5 py-2.5 rounded-full font-medium text-sm">🏋️ 健身房 / 工作室</span>
+      <span class="bg-slate-100 text-slate-700 px-5 py-2.5 rounded-full font-medium text-sm">🐾 寵物店 / 寵物美容</span>
+      <span class="bg-slate-100 text-slate-700 px-5 py-2.5 rounded-full font-medium text-sm">👗 服飾 / 精品</span>
+      <span class="bg-slate-100 text-slate-700 px-5 py-2.5 rounded-full font-medium text-sm">⚖️ 事務所 / 顧問</span>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ SOCIAL PROOF / BETA NOTE ═══════════ -->
+<section class="py-16 px-6 bg-emerald-50">
+  <div class="max-w-3xl mx-auto text-center">
+    <div class="text-4xl mb-4">🚀</div>
+    <h2 class="text-2xl font-bold text-slate-900 mb-3">現在是 Beta 免費試用階段</h2>
+    <p class="text-slate-600 leading-relaxed mb-6">
+      Kachu 正在找前幾位合作的店家一起打磨產品。<br />
+      Beta 期間<strong class="text-emerald-700">完全免費</strong>，我們會陪你從頭到尾設定好，有問題隨時幫你解決。
+    </p>
+    <div class="flex flex-wrap justify-center gap-6 text-sm text-slate-600">
+      <div class="flex items-center gap-2"><span class="text-emerald-500 font-bold">✓</span>不用自己摸索</div>
+      <div class="flex items-center gap-2"><span class="text-emerald-500 font-bold">✓</span>設定好才開始收費</div>
+      <div class="flex items-center gap-2"><span class="text-emerald-500 font-bold">✓</span>不滿意可以隨時停</div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ CTA ═══════════ -->
+<section id="contact" class="py-24 px-6">
+  <div class="max-w-xl mx-auto text-center">
+    <h2 class="text-4xl font-black text-slate-900 mb-4">想試試看？</h2>
+    <p class="text-slate-500 mb-8 text-lg">留下你的 LINE 或電話，我們來聯絡你，五分鐘解釋清楚。</p>
+
+    <div class="bg-white border border-slate-200 rounded-2xl p-10 shadow-sm flex flex-col items-center gap-5">
+      <div class="w-16 h-16 rounded-2xl flex items-center justify-center text-4xl" style="background:#00B900">
+        <svg viewBox="0 0 24 24" class="w-9 h-9" fill="white"><path d="M12 2C6.477 2 2 6.037 2 11.01c0 3.47 2.052 6.51 5.104 8.232l-.663 2.483a.5.5 0 0 0 .712.565l2.9-1.55A11.2 11.2 0 0 0 12 20.02c5.523 0 10-4.037 10-9.01S17.523 2 12 2z"/></svg>
+      </div>
+      <div class="text-center">
+        <p class="text-slate-500 text-sm mb-1">加我們的 LINE 官方帳號</p>
+        <p class="text-2xl font-black text-slate-900 tracking-tight">@067ggwva</p>
+      </div>
+      <a href="https://line.me/R/ti/p/@067ggwva"
+         class="line-btn text-white font-bold px-10 py-4 rounded-xl text-base w-full text-center">
+        📲 立即加入 LINE
+      </a>
+      <p class="text-xs text-slate-400">加入後直接說「我想試用」，我們會馬上回覆你</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ FOOTER ═══════════ -->
+<footer class="border-t border-slate-100 py-8 px-6 text-center">
+  <div class="flex items-center justify-center gap-2 mb-2">
+    <div class="w-6 h-6 bg-emerald-500 rounded-md flex items-center justify-center text-white font-bold text-xs">K</div>
+    <span class="font-bold text-slate-700">Kachu</span>
+  </div>
+  <p class="text-xs text-slate-400">© 2026 Kachu · AI 數位幕僚 · <a href="/dashboard" class="hover:text-slate-600">管理後台</a></p>
+</footer>
+
+<script>
+  // Intersection Observer for fade-up animations
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.classList.add('visible');
+        observer.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.15 });
+  document.querySelectorAll('.fade-up').forEach(el => observer.observe(el));
+</script>
+
+</body>
+</html>
