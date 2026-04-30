@@ -11,6 +11,10 @@ from kachu.main import create_app
 from kachu.models import ApprovalAction
 
 
+def _dashboard_headers() -> dict[str, str]:
+    return {"Authorization": "Bearer dashboard-token"}
+
+
 @pytest.fixture
 def client() -> TestClient:
     app = create_app(
@@ -18,6 +22,7 @@ def client() -> TestClient:
             LINE_CHANNEL_ACCESS_TOKEN="",
             LINE_CHANNEL_SECRET="",
             LINE_BOSS_USER_ID="U_boss_phase6",
+            ADMIN_SERVICE_TOKEN="dashboard-token",
             AGENTOS_BASE_URL="http://agentos-mock",
             KACHU_BASE_URL="http://localhost:8001",
             DATABASE_URL="sqlite://",
@@ -50,7 +55,10 @@ def test_dashboard_audit_returns_notify_and_publish_events(client: TestClient) -
     )
     assert publish.status_code == 200
 
-    audit = client.get(f"/dashboard/api/audit?tenant_id=tenant-audit&run_id={run_id}")
+    audit = client.get(
+        f"/dashboard/api/audit?tenant_id=tenant-audit&run_id={run_id}",
+        headers=_dashboard_headers(),
+    )
     assert audit.status_code == 200
     event_types = [event["event_type"] for event in audit.json()["events"]]
     assert "approval_requested" in event_types
@@ -72,7 +80,8 @@ def test_dashboard_audit_supports_event_type_filter(client: TestClient) -> None:
     )
 
     response = client.get(
-        f"/dashboard/api/audit?tenant_id=tenant-audit&run_id={run_id}&event_type=approval_requested"
+        f"/dashboard/api/audit?tenant_id=tenant-audit&run_id={run_id}&event_type=approval_requested",
+        headers=_dashboard_headers(),
     )
     assert response.status_code == 200
     payload = response.json()
@@ -87,6 +96,7 @@ async def test_approval_bridge_records_approval_decision_audit() -> None:
             LINE_CHANNEL_ACCESS_TOKEN="",
             LINE_CHANNEL_SECRET="",
             LINE_BOSS_USER_ID="U_boss_phase6",
+            ADMIN_SERVICE_TOKEN="dashboard-token",
             AGENTOS_BASE_URL="http://agentos-mock",
             KACHU_BASE_URL="http://localhost:8001",
             DATABASE_URL="sqlite://",

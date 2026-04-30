@@ -42,6 +42,7 @@ def test_create_app_rejects_production_schema_autocreate_without_opt_in() -> Non
                 TOKEN_ENCRYPTION_KEY="encrypt",
                 LINE_CHANNEL_ACCESS_TOKEN="token",
                 LINE_CHANNEL_SECRET="secret",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
                 OPENAI_API_KEY="openai-key",
             )
         )
@@ -57,6 +58,7 @@ def test_create_app_requires_meta_secret_when_feature_enabled() -> None:
                 TOKEN_ENCRYPTION_KEY="encrypt",
                 LINE_CHANNEL_ACCESS_TOKEN="token",
                 LINE_CHANNEL_SECRET="line-secret",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
                 OPENAI_API_KEY="openai-key",
                 FEATURE_META=True,
                 META_APP_ID="meta-app-id",
@@ -76,6 +78,7 @@ def test_create_app_rejects_memory_oauth_state_store_in_production() -> None:
                 TOKEN_ENCRYPTION_KEY="encrypt",
                 LINE_CHANNEL_ACCESS_TOKEN="token",
                 LINE_CHANNEL_SECRET="line-secret",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
                 OPENAI_API_KEY="openai-key",
                 ALLOW_SCHEMA_CREATE_IN_PRODUCTION=True,
                 OAUTH_STATE_STORE_BACKEND="memory",

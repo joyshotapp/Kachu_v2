@@ -165,6 +165,10 @@
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
         LINE 推播紀錄
       </button>
+      <button @click="navigate('automation')" :class="{'active': page==='automation'}" class="sidebar-item w-full text-left">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317a1 1 0 011.35-.936l1.226.49a1 1 0 001.098-.217l.94-.94a1 1 0 011.414 0l1.414 1.414a1 1 0 010 1.414l-.94.94a1 1 0 00-.217 1.098l.49 1.226a1 1 0 01-.936 1.35h-1.33a1 1 0 00-.95.684l-.406 1.217a1 1 0 01-1.898 0l-.406-1.217a1 1 0 00-.95-.684h-1.33a1 1 0 01-.936-1.35l.49-1.226a1 1 0 00-.217-1.098l-.94-.94a1 1 0 010-1.414L7.76 2.654a1 1 0 011.414 0l.94.94a1 1 0 001.098.217l1.226-.49z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15a3 3 0 100-6 3 3 0 000 6z"/></svg>
+        自動化設定
+      </button>
     </nav>
 
     <!-- Bottom: AgentOS link -->
@@ -704,6 +708,150 @@
         </div>
       </div>
 
+      <!-- ════════════ AUTOMATION SETTINGS ════════════ -->
+      <div x-show="!loading && page==='automation'" class="fade-in space-y-4">
+        <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100">
+          <div class="flex items-center justify-between gap-4 flex-wrap">
+            <div>
+              <h3 class="text-sm font-semibold text-slate-700">排程與頻率設定</h3>
+              <p class="text-xs text-slate-400 mt-1">每小時由 scheduler 依 tenant 時區與這裡的設定判斷是否到點執行。</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-slate-400" x-text="automationSaveMessage"></span>
+              <button @click="saveAutomationSettings()" class="btn-primary">儲存設定</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+            <div>
+              <div class="text-sm font-semibold text-slate-700">基本時區</div>
+              <div class="text-xs text-slate-400 mt-1">影響所有排程的本地時間判斷。</div>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-600 mb-1.5">Timezone</label>
+              <input x-model="automationSettings.timezone" class="input" placeholder="Asia/Taipei" />
+            </div>
+          </div>
+
+          <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+            <div class="flex items-center justify-between">
+              <div>
+                <div class="text-sm font-semibold text-slate-700">GA 週報</div>
+                <div class="text-xs text-slate-400 mt-1">支援關閉、每日或每週固定時間寄送。</div>
+              </div>
+              <label class="inline-flex items-center gap-2 text-sm text-slate-600">
+                <input type="checkbox" x-model="automationSettings.ga_report_enabled" class="rounded border-slate-300 text-emerald-600" />
+                啟用
+              </label>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">頻率</label>
+                <select x-model="automationSettings.ga_report_frequency" class="select w-full">
+                  <option value="off">關閉</option>
+                  <option value="daily">每日</option>
+                  <option value="weekly">每週</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">星期</label>
+                <select x-model="automationSettings.ga_report_weekday" class="select w-full" :disabled="automationSettings.ga_report_frequency !== 'weekly'">
+                  <option value="mon">週一</option>
+                  <option value="tue">週二</option>
+                  <option value="wed">週三</option>
+                  <option value="thu">週四</option>
+                  <option value="fri">週五</option>
+                  <option value="sat">週六</option>
+                  <option value="sun">週日</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">小時</label>
+                <input x-model.number="automationSettings.ga_report_hour" type="number" min="0" max="23" class="input" />
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+            <div class="flex items-center justify-between">
+              <div>
+                <div class="text-sm font-semibold text-slate-700">Google 商家動態</div>
+                <div class="text-xs text-slate-400 mt-1">設定每週或每日自動起草 Google 動態。</div>
+              </div>
+              <label class="inline-flex items-center gap-2 text-sm text-slate-600">
+                <input type="checkbox" x-model="automationSettings.google_post_enabled" class="rounded border-slate-300 text-emerald-600" />
+                啟用
+              </label>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">頻率</label>
+                <select x-model="automationSettings.google_post_frequency" class="select w-full">
+                  <option value="off">關閉</option>
+                  <option value="daily">每日</option>
+                  <option value="weekly">每週</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">星期</label>
+                <select x-model="automationSettings.google_post_weekday" class="select w-full" :disabled="automationSettings.google_post_frequency !== 'weekly'">
+                  <option value="mon">週一</option>
+                  <option value="tue">週二</option>
+                  <option value="wed">週三</option>
+                  <option value="thu">週四</option>
+                  <option value="fri">週五</option>
+                  <option value="sat">週六</option>
+                  <option value="sun">週日</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">小時</label>
+                <input x-model.number="automationSettings.google_post_hour" type="number" min="0" max="23" class="input" />
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+            <div class="flex items-center justify-between">
+              <div>
+                <div class="text-sm font-semibold text-slate-700">主動提醒與月曆</div>
+                <div class="text-xs text-slate-400 mt-1">控制每日 proactive nudge 與每月內容月曆生成。</div>
+              </div>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div class="rounded-lg border border-slate-100 p-3 space-y-3">
+                <label class="inline-flex items-center gap-2 text-sm text-slate-600">
+                  <input type="checkbox" x-model="automationSettings.proactive_enabled" class="rounded border-slate-300 text-emerald-600" />
+                  啟用主動提醒
+                </label>
+                <div>
+                  <label class="block text-xs font-medium text-slate-600 mb-1.5">提醒小時</label>
+                  <input x-model.number="automationSettings.proactive_hour" type="number" min="0" max="23" class="input" />
+                </div>
+              </div>
+              <div class="rounded-lg border border-slate-100 p-3 space-y-3">
+                <label class="inline-flex items-center gap-2 text-sm text-slate-600">
+                  <input type="checkbox" x-model="automationSettings.content_calendar_enabled" class="rounded border-slate-300 text-emerald-600" />
+                  啟用內容月曆
+                </label>
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <label class="block text-xs font-medium text-slate-600 mb-1.5">每月日期</label>
+                    <input x-model.number="automationSettings.content_calendar_day" type="number" min="1" max="28" class="input" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-slate-600 mb-1.5">小時</label>
+                    <input x-model.number="automationSettings.content_calendar_hour" type="number" min="0" max="23" class="input" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
     </main>
   </div>
 </div>
@@ -726,6 +874,23 @@ function app() {
     knowledgeEntries: [],
     connectors: [],
     pushData: {},
+    automationSettings: {
+      timezone: 'Asia/Taipei',
+      ga_report_enabled: true,
+      ga_report_frequency: 'weekly',
+      ga_report_weekday: 'mon',
+      ga_report_hour: 8,
+      google_post_enabled: true,
+      google_post_frequency: 'weekly',
+      google_post_weekday: 'thu',
+      google_post_hour: 10,
+      proactive_enabled: true,
+      proactive_hour: 7,
+      content_calendar_enabled: true,
+      content_calendar_day: 1,
+      content_calendar_hour: 9,
+    },
+    automationSaveMessage: '',
     runAuditEvents: [],
     selectedRun: null,
 
@@ -768,6 +933,7 @@ function app() {
         knowledge: '知識庫管理',
         connectors: '連接器狀態',
         pushes: 'LINE 推播紀錄',
+        automation: '自動化設定',
       }
       return titles[this.page] || 'Kachu 管理後台'
     },
@@ -781,6 +947,7 @@ function app() {
       else if (p === 'knowledge') await this.loadKnowledge()
       else if (p === 'connectors') await this.loadConnectors()
       else if (p === 'pushes') await this.loadPushes()
+      else if (p === 'automation') await this.loadAutomationSettings()
     },
 
     async reloadCurrentPage() {
@@ -870,6 +1037,38 @@ function app() {
         this.pushData = data
         this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
       } catch (e) { console.error(e) } finally { this.loading = false }
+    },
+
+    async loadAutomationSettings() {
+      this.loading = true
+      try {
+        const data = await this.fetch('/dashboard/api/automation-settings')
+        this.automationSettings = { ...this.automationSettings, ...data }
+        this.automationSaveMessage = data.updated_at ? '目前已載入最新設定' : ''
+        this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
+      } catch (e) {
+        console.error(e)
+        this.automationSaveMessage = '無法載入設定'
+      } finally { this.loading = false }
+    },
+
+    async saveAutomationSettings() {
+      try {
+        const payload = { ...this.automationSettings, tenant_id: this.tenantId || undefined }
+        const res = await fetch('/dashboard/api/automation-settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data = await res.json()
+        this.automationSettings = { ...this.automationSettings, ...data }
+        this.automationSaveMessage = '設定已儲存'
+        this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
+      } catch (e) {
+        console.error(e)
+        this.automationSaveMessage = '儲存失敗'
+      }
     },
 
     async openRunDetail(run) {

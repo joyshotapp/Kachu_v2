@@ -387,4 +387,22 @@ class IntentRouter:
             )
         except (httpx.HTTPError, ValidationError, SQLAlchemyError) as exc:
             logger.error("Dispatch failed for workflow %s: %s", workflow_type, exc)
+            self._repo.create_deferred_dispatch(
+                tenant_id=tenant_id,
+                workflow_type=workflow_type,
+                task_request=task_request.model_dump(exclude_none=True),
+                trigger_source=trigger_source,
+                trigger_payload=trigger_payload,
+                error=str(exc),
+            )
+            self._repo.save_audit_event(
+                tenant_id=tenant_id,
+                workflow_type=workflow_type,
+                event_type="dispatch_deferred",
+                source="intent_router",
+                payload={
+                    "trigger_source": trigger_source,
+                    "error": str(exc),
+                },
+            )
 

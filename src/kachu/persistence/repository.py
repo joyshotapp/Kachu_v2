@@ -11,12 +11,14 @@ from .tables import (
     AuditEventTable,
     ConnectorAccountTable,
     ConversationTable,
+    DeferredDispatchTable,
     EditSessionTable,
     KnowledgeEntryTable,
     OnboardingStateTable,
     PushLogTable,
     SharedContextTable,
     TenantApprovalProfileTable,
+    TenantAutomationSettingsTable,
     TenantTable,
     WorkflowRunTable,
     # Backward-compat aliases
@@ -67,6 +69,10 @@ class KachuRepository:
                 select(TenantTable).where(TenantTable.is_active == True)  # noqa: E712
             ).all()
             return [t.id for t in results]
+
+    def get_tenant(self, tenant_id: str) -> TenantTable | None:
+        with Session(self._engine) as session:
+            return session.get(TenantTable, tenant_id)
 
     # ── WorkflowRun (v1-aligned; backward-compat aliases kept below) ──────────
 
@@ -226,6 +232,23 @@ class KachuRepository:
             session.commit()
             session.refresh(conv)
             return conv
+
+    def list_recent_conversations(
+        self,
+        tenant_id: str,
+        *,
+        role: str | None = None,
+        conversation_type: str | None = None,
+        limit: int = 20,
+    ) -> list[ConversationTable]:
+        with Session(self._engine) as session:
+            stmt = select(ConversationTable).where(ConversationTable.tenant_id == tenant_id)
+            if role:
+                stmt = stmt.where(ConversationTable.role == role)
+            if conversation_type:
+                stmt = stmt.where(ConversationTable.conversation_type == conversation_type)
+            stmt = stmt.order_by(ConversationTable.timestamp.desc()).limit(limit)
+            return list(session.exec(stmt).all())
 
     # ── OnboardingState ───────────────────────────────────────────────────────
 
@@ -733,6 +756,42 @@ class KachuRepository:
             stmt = stmt.limit(limit)
             return list(session.exec(stmt).all())
 
+    def has_recent_audit_event(
+        self,
+        *,
+        tenant_id: str,
+        workflow_type: str,
+        event_type: str,
+        source: str,
+        since: datetime,
+        payload_subset: dict | None = None,
+        limit: int = 50,
+    ) -> bool:
+        with Session(self._engine) as session:
+            stmt = (
+                select(AuditEventTable)
+                .where(AuditEventTable.tenant_id == tenant_id)
+                .where(AuditEventTable.workflow_type == workflow_type)
+                .where(AuditEventTable.event_type == event_type)
+                .where(AuditEventTable.source == source)
+                .where(AuditEventTable.created_at >= since)
+                .order_by(AuditEventTable.created_at.desc())
+                .limit(limit)
+            )
+            events = list(session.exec(stmt).all())
+
+        if not payload_subset:
+            return bool(events)
+
+        for event in events:
+            try:
+                payload = json.loads(event.payload or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if all(payload.get(key) == value for key, value in payload_subset.items()):
+                return True
+        return False
+
     def get_knowledge_entry(self, entry_id: str) -> KnowledgeEntryTable | None:
         with Session(self._engine) as session:
             return session.get(KnowledgeEntryTable, entry_id)
@@ -883,6 +942,32 @@ class KachuRepository:
             session.refresh(profile)
             return profile
 
+    # ── Automation Settings ──────────────────────────────────────────────────
+
+    def get_or_create_automation_settings(self, tenant_id: str) -> TenantAutomationSettingsTable:
+        with Session(self._engine) as session:
+            settings = session.get(TenantAutomationSettingsTable, tenant_id)
+            if settings is None:
+                settings = TenantAutomationSettingsTable(tenant_id=tenant_id)
+                session.add(settings)
+                session.commit()
+                session.refresh(settings)
+            return settings
+
+    def update_automation_settings(self, tenant_id: str, **updates) -> TenantAutomationSettingsTable:
+        with Session(self._engine) as session:
+            settings = session.get(TenantAutomationSettingsTable, tenant_id)
+            if settings is None:
+                settings = TenantAutomationSettingsTable(tenant_id=tenant_id)
+            for key, value in updates.items():
+                if hasattr(settings, key):
+                    setattr(settings, key, value)
+            settings.updated_at = datetime.now(timezone.utc)
+            session.add(settings)
+            session.commit()
+            session.refresh(settings)
+            return settings
+
     # ── Phase 5: Shared Context ───────────────────────────────────────────────
 
     def save_shared_context(
@@ -958,6 +1043,67 @@ class KachuRepository:
             )
             row = session.exec(stmt).first()
             return row.created_at if row else None
+
+    # ── Deferred AgentOS Dispatches ─────────────────────────────────────────
+
+    def create_deferred_dispatch(
+        self,
+        *,
+        tenant_id: str,
+        workflow_type: str,
+        task_request: dict,
+        trigger_source: str,
+        trigger_payload: dict,
+        error: str,
+    ) -> DeferredDispatchTable:
+        record = DeferredDispatchTable(
+            tenant_id=tenant_id,
+            workflow_type=workflow_type,
+            task_request_json=json.dumps(task_request, ensure_ascii=False),
+            trigger_source=trigger_source,
+            trigger_payload=json.dumps(trigger_payload, ensure_ascii=False),
+            last_error=error,
+        )
+        with Session(self._engine) as session:
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            return record
+
+    def list_due_deferred_dispatches(self, limit: int = 20) -> list[DeferredDispatchTable]:
+        now = datetime.now(timezone.utc)
+        with Session(self._engine) as session:
+            stmt = (
+                select(DeferredDispatchTable)
+                .where(DeferredDispatchTable.status == "pending")
+                .where(DeferredDispatchTable.next_retry_at <= now)
+                .order_by(DeferredDispatchTable.created_at.asc())
+                .limit(limit)
+            )
+            return list(session.exec(stmt).all())
+
+    def mark_deferred_dispatch_dispatched(self, dispatch_id: str) -> None:
+        with Session(self._engine) as session:
+            record = session.get(DeferredDispatchTable, dispatch_id)
+            if record:
+                record.status = "dispatched"
+                record.updated_at = datetime.now(timezone.utc)
+                session.add(record)
+                session.commit()
+
+    def mark_deferred_dispatch_retry(self, dispatch_id: str, error: str) -> None:
+        from datetime import timedelta
+
+        with Session(self._engine) as session:
+            record = session.get(DeferredDispatchTable, dispatch_id)
+            if record:
+                record.attempts += 1
+                record.last_error = error
+                delay_minutes = min(5 * (2 ** max(record.attempts - 1, 0)), 60)
+                record.next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
+                record.updated_at = datetime.now(timezone.utc)
+                session.add(record)
+                session.commit()
 
     def get_pending_negative_reviews(self, tenant_id: str) -> int:
         """Count pending approval tasks of type review_reply older than 1 hour."""

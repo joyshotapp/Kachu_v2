@@ -1,9 +1,9 @@
 """
 Phase 5: ProactiveMonitorAgent
 
-Runs daily (registered in KachuScheduler). Scans each active tenant for
-situations that warrant an unprompted nudge to the boss — without
-generating unnecessary noise.
+Runs on the scheduler's configured cadence. Scans each active tenant for
+situations that warrant an unprompted nudge to the boss while suppressing
+duplicates for the same tenant, nudge type, and schedule bucket.
 
 Detection rules:
   1. No content published in the last 7 days
@@ -11,8 +11,8 @@ Detection rules:
   3. Knowledge base last updated > 60 days ago
   4. (Future) GA4 traffic drop > 20% — requires SharedContext ga4_recommendations
 
-Each condition triggers an AgentOS task (domain: kachu_proactive_nudge)
-with idempotency key so the same nudge is never sent twice per window.
+Each condition results in a direct LINE push when allowed by rate limits and
+when the same nudge has not already been sent in the same bucket.
 """
 from __future__ import annotations
 
@@ -83,6 +83,18 @@ class ProactiveMonitorAgent:
 
         logger.info("ProactiveMonitor: scanned %d tenants, triggered %d nudges", len(tenant_ids), triggered)
 
+    async def scan_tenant_and_nudge(self, tenant_id: str, bucket: str) -> bool:
+        """Run proactive checks for one tenant when its configured cadence is due."""
+        try:
+            nudge_type = self._detect_nudge(tenant_id)
+            if not nudge_type:
+                return False
+            await self._trigger_nudge(tenant_id, nudge_type, bucket)
+            return True
+        except SQLAlchemyError as exc:
+            logger.error("ProactiveMonitor scan failed for tenant=%s: %s", tenant_id, exc)
+            return False
+
     def _detect_nudge(self, tenant_id: str) -> str | None:
         """Return the first applicable nudge type for this tenant, or None."""
         now = datetime.now(timezone.utc)
@@ -109,6 +121,27 @@ class ProactiveMonitorAgent:
             logger.info("ProactiveMonitor: LINE not configured, skipping tenant=%s type=%s", tenant_id, nudge_type)
             return
 
+        dedupe_payload = {
+            "message_type": "general",
+            "nudge_type": nudge_type,
+            "bucket": today,
+        }
+        if self._repo.has_recent_audit_event(
+            tenant_id=tenant_id,
+            workflow_type="proactive_monitor",
+            event_type="push_sent",
+            source="proactive_monitor",
+            since=datetime.now(timezone.utc) - timedelta(days=7),
+            payload_subset=dedupe_payload,
+        ):
+            logger.info(
+                "ProactiveMonitor: duplicate nudge skipped tenant=%s type=%s bucket=%s",
+                tenant_id,
+                nudge_type,
+                today,
+            )
+            return
+
         max_push = getattr(self._settings, "MAX_PUSH_PER_DAY", 3)
         if not self._repo.can_push(tenant_id, max_per_day=max_push):
             logger.info("ProactiveMonitor: push limited tenant=%s type=%s", tenant_id, nudge_type)
@@ -131,7 +164,7 @@ class ProactiveMonitorAgent:
                 workflow_type="proactive_monitor",
                 event_type="push_sent",
                 source="proactive_monitor",
-                payload={"message_type": "general", "nudge_type": nudge_type},
+                payload=dedupe_payload,
             )
             logger.info("ProactiveMonitor: nudge pushed tenant=%s type=%s day=%s", tenant_id, nudge_type, today)
         except httpx.HTTPError as exc:

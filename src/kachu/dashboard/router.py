@@ -2,16 +2,41 @@ from __future__ import annotations
 
 import json
 import pathlib
+import secrets
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.responses import Response
 from pydantic import BaseModel
 
 from ..persistence import KachuRepository
 
-dashboard_router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+def _require_dashboard_access(
+    request: Request,
+    authorization: str = Header(default=""),
+) -> None:
+    settings = getattr(request.app.state, "settings", None)
+    expected_token = (getattr(settings, "ADMIN_SERVICE_TOKEN", "") or "").strip()
+    app_env = getattr(settings, "APP_ENV", "development")
+
+    if not expected_token:
+        if app_env == "test":
+            return
+        raise HTTPException(status_code=503, detail="Dashboard auth not configured")
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(token.strip(), expected_token):
+        raise HTTPException(status_code=401, detail="Invalid dashboard authorization")
+
+
+dashboard_router = APIRouter(
+    prefix="/dashboard",
+    tags=["dashboard"],
+    dependencies=[Depends(_require_dashboard_access)],
+)
 
 _STATIC_DIR = pathlib.Path(__file__).parent.parent / "static"
 
@@ -145,6 +170,64 @@ def _safe_json(val: str | None) -> Any:
         return {"raw": val}
 
 
+def _normalize_timezone(value: str | None, *, default: str = "Asia/Taipei", strict: bool = False) -> str:
+    timezone_name = (value or "").strip() or default
+    try:
+        ZoneInfo(timezone_name)
+    except Exception:
+        if strict:
+            raise HTTPException(status_code=400, detail="Invalid timezone")
+        return default
+    return timezone_name
+
+
+def _normalize_frequency(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    return normalized if normalized in {"daily", "weekly", "off"} else "weekly"
+
+
+def _normalize_weekday(value: str, default: str) -> str:
+    normalized = (value or default).strip().lower()[:3]
+    return normalized if normalized in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"} else default
+
+
+def _normalize_hour(value: int, default: int) -> int:
+    try:
+        hour = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(hour, 0), 23)
+
+
+def _normalize_day(value: int, default: int) -> int:
+    try:
+        day = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(day, 1), 28)
+
+
+def _automation_settings_to_dict(row: Any, tenant: Any) -> dict[str, Any]:
+    return {
+        "tenant_id": row.tenant_id,
+        "timezone": _normalize_timezone(getattr(tenant, "timezone", "Asia/Taipei") or "Asia/Taipei"),
+        "ga_report_enabled": row.ga_report_enabled,
+        "ga_report_frequency": row.ga_report_frequency,
+        "ga_report_weekday": row.ga_report_weekday,
+        "ga_report_hour": row.ga_report_hour,
+        "google_post_enabled": row.google_post_enabled,
+        "google_post_frequency": row.google_post_frequency,
+        "google_post_weekday": row.google_post_weekday,
+        "google_post_hour": row.google_post_hour,
+        "proactive_enabled": row.proactive_enabled,
+        "proactive_hour": row.proactive_hour,
+        "content_calendar_enabled": row.content_calendar_enabled,
+        "content_calendar_day": row.content_calendar_day,
+        "content_calendar_hour": row.content_calendar_hour,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
 # ── API: Stats ────────────────────────────────────────────────────────────────
 
 
@@ -205,6 +288,24 @@ class KnowledgeCreateRequest(BaseModel):
 class KnowledgeUpdateRequest(BaseModel):
     content: str
     category: str | None = None
+
+
+class AutomationSettingsUpdateRequest(BaseModel):
+    tenant_id: str | None = None
+    timezone: str = "Asia/Taipei"
+    ga_report_enabled: bool = True
+    ga_report_frequency: str = "weekly"
+    ga_report_weekday: str = "mon"
+    ga_report_hour: int = 8
+    google_post_enabled: bool = True
+    google_post_frequency: str = "weekly"
+    google_post_weekday: str = "thu"
+    google_post_hour: int = 10
+    proactive_enabled: bool = True
+    proactive_hour: int = 7
+    content_calendar_enabled: bool = True
+    content_calendar_day: int = 1
+    content_calendar_hour: int = 9
 
 
 @dashboard_router.get("/api/knowledge")
@@ -268,6 +369,50 @@ def api_knowledge_delete(entry_id: str, request: Request) -> Response:
     if not repo.delete_knowledge_entry(entry_id):
         raise HTTPException(status_code=404, detail="Entry not found")
     return Response(status_code=204)
+
+
+# ── API: Automation Settings ────────────────────────────────────────────────
+
+
+@dashboard_router.get("/api/automation-settings")
+def api_automation_settings(request: Request, tenant_id: str | None = None) -> dict:
+    repo = _repo(request)
+    tid = _tid(request, tenant_id)
+    if not tid:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    tenant = repo.get_or_create_tenant(tid)
+    row = repo.get_or_create_automation_settings(tid)
+    return _automation_settings_to_dict(row, tenant)
+
+
+@dashboard_router.put("/api/automation-settings")
+def api_update_automation_settings(body: AutomationSettingsUpdateRequest, request: Request) -> dict:
+    repo = _repo(request)
+    tid = (body.tenant_id or "").strip() or _tid(request, None)
+    if not tid:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+
+    tenant = repo.get_or_create_tenant(tid)
+    tenant.timezone = _normalize_timezone(body.timezone or tenant.timezone or "Asia/Taipei", strict=True)
+    repo.save_tenant(tenant)
+
+    row = repo.update_automation_settings(
+        tid,
+        ga_report_enabled=body.ga_report_enabled,
+        ga_report_frequency=_normalize_frequency(body.ga_report_frequency),
+        ga_report_weekday=_normalize_weekday(body.ga_report_weekday, "mon"),
+        ga_report_hour=_normalize_hour(body.ga_report_hour, 8),
+        google_post_enabled=body.google_post_enabled,
+        google_post_frequency=_normalize_frequency(body.google_post_frequency),
+        google_post_weekday=_normalize_weekday(body.google_post_weekday, "thu"),
+        google_post_hour=_normalize_hour(body.google_post_hour, 10),
+        proactive_enabled=body.proactive_enabled,
+        proactive_hour=_normalize_hour(body.proactive_hour, 7),
+        content_calendar_enabled=body.content_calendar_enabled,
+        content_calendar_day=_normalize_day(body.content_calendar_day, 1),
+        content_calendar_hour=_normalize_hour(body.content_calendar_hour, 9),
+    )
+    return _automation_settings_to_dict(row, tenant)
 
 
 # ── API: Connectors ───────────────────────────────────────────────────────────

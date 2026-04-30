@@ -12,6 +12,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 from pydantic import ValidationError
 from ..agentOS_client import AgentOSClient
 from ..approval_bridge import ApprovalBridge
+from ..business_consultant import BusinessConsultant
 from ..config import Settings
 from ..intent_router import IntentRouter
 from ..memory import MemoryManager
@@ -198,6 +199,10 @@ async def line_webhook(
 
     memory_manager: MemoryManager = request.app.state.memory_manager
 
+    context_brief_manager = request.app.state.context_brief_manager
+
+    business_consultant: BusinessConsultant = request.app.state.business_consultant
+
 
 
     for event in events:
@@ -219,6 +224,10 @@ async def line_webhook(
             onboarding_flow=onboarding_flow,
 
             memory_manager=memory_manager,
+
+            context_brief_manager=context_brief_manager,
+
+            business_consultant=business_consultant,
 
             settings=settings,
 
@@ -249,6 +258,10 @@ async def _handle_event(
     memory_manager: MemoryManager,
 
     settings: Settings,
+
+    context_brief_manager=None,
+
+    business_consultant: BusinessConsultant | None = None,
 
 ) -> None:
 
@@ -405,6 +418,18 @@ async def _handle_event(
             text: str = message.get("text", "")
 
             if text:
+
+                repo.save_conversation(
+
+                    tenant_id=tenant_id,
+
+                    role="customer",
+
+                    content=text,
+
+                    conversation_type="general",
+
+                )
 
                 await intent_router.dispatch(
 
@@ -628,6 +653,28 @@ async def _handle_event(
 
             boss_text_2: str = message.get("text", "")
 
+            repo.save_conversation(
+
+                tenant_id=tenant_id,
+
+                role="owner",
+
+                content=boss_text_2,
+
+                conversation_type="general",
+
+            )
+
+            if context_brief_manager is not None:
+
+                await context_brief_manager.refresh_briefs(
+
+                    tenant_id,
+
+                    reason="boss_general_message",
+
+                )
+
             # Phase 2: Use LLM classification for full intent coverage
 
             intent, topic = await intent_router.classify_text_llm(boss_text_2)
@@ -655,19 +702,26 @@ async def _handle_event(
             else:
 
                 logger.info("General chat from boss: %s", boss_text_2[:80])
-                # Phase 5: GoalParser — suggest actionable workflows
                 try:
-                    from ..goal_parser import GoalParser
-                    goal_parser = GoalParser(settings)
-                    actions = await goal_parser.parse(boss_text_2)
-                    reply_msg = goal_parser.build_text_response(boss_text_2, actions)
+                    if business_consultant is None:
+                        raise RuntimeError("BusinessConsultant unavailable")
+                    reply_msg = await business_consultant.build_reply(
+                        tenant_id=tenant_id,
+                        message=boss_text_2,
+                    )
+                    repo.save_conversation(
+                        tenant_id=tenant_id,
+                        role="ai",
+                        content=reply_msg.get("text", ""),
+                        conversation_type="general",
+                    )
                     await push_line_messages(
                         to=settings.LINE_BOSS_USER_ID,
                         messages=[reply_msg],
                         access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
                     )
                 except (httpx.HTTPError, ValueError, RuntimeError) as _gp_err:
-                    logger.warning("GoalParser failed, sending fallback guidance: %s", _gp_err)
+                    logger.warning("BusinessConsultant failed, sending fallback guidance: %s", _gp_err)
                     await _notify_processing_failure(
                         line_user_id=line_user_id,
                         settings=settings,

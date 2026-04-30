@@ -51,7 +51,7 @@ class GA4Client:
             "dateRanges": [{"startDate": start_date, "endDate": end_date}],
             "metrics": [{"name": m} for m in metrics],
             "dimensions": [{"name": d} for d in dimensions],
-            "orderBys": [{"dimension": {"dimensionName": "date"}}],
+            "orderBys": [{"dimension": {"dimensionName": dimensions[0]}}] if dimensions else [],
         }
 
         # Strip "properties/" prefix if already included

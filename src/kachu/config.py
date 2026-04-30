@@ -152,6 +152,7 @@ class Settings(BaseSettings):
                 ("TOKEN_ENCRYPTION_KEY", self.TOKEN_ENCRYPTION_KEY),
                 ("LINE_CHANNEL_SECRET", self.LINE_CHANNEL_SECRET),
                 ("LINE_CHANNEL_ACCESS_TOKEN", self.LINE_CHANNEL_ACCESS_TOKEN),
+                ("ADMIN_SERVICE_TOKEN", self.ADMIN_SERVICE_TOKEN),
                 ("GOOGLE_AI_API_KEY or OPENAI_API_KEY", self.GOOGLE_AI_API_KEY or self.OPENAI_API_KEY),
             ]
             if self.FEATURE_META:

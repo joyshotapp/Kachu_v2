@@ -4,6 +4,7 @@ from .tables import (
     ApprovalTaskTable,
     ConnectorAccountTable,
     ConversationTable,
+    DeferredDispatchTable,
     EditSessionTable,
     InviteCodeTable,
     KnowledgeChunkTable,
@@ -13,6 +14,7 @@ from .tables import (
     PushLogTable,
     RetrievalFeedbackTable,
     TenantLlmBudgetTable,
+    TenantAutomationSettingsTable,
     TenantTable,
     WorkflowRunTable,
     # Backward-compat aliases
@@ -27,6 +29,7 @@ __all__ = [
     "ApprovalTaskTable",
     "ConnectorAccountTable",
     "ConversationTable",
+    "DeferredDispatchTable",
     "EditSessionTable",
     "InviteCodeTable",
     "KnowledgeChunkTable",
@@ -36,6 +39,7 @@ __all__ = [
     "PushLogTable",
     "RetrievalFeedbackTable",
     "TenantLlmBudgetTable",
+    "TenantAutomationSettingsTable",
     "TenantTable",
     "WorkflowRunTable",
     # Backward-compat aliases

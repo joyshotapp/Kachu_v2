@@ -122,6 +122,7 @@ class GenerateReviewReplyRequest(BaseModel):
     review: dict[str, Any] | None = None
     context: dict[str, Any] | None = None
     sentiment: dict[str, Any] | None = None  # from analyze-sentiment step
+    run_id: str = ""
 
 
 class PostReviewReplyRequest(BaseModel):
@@ -136,11 +137,13 @@ class ClassifyMessageRequest(BaseModel):
     tenant_id: str
     message: str
     customer_line_id: str
+    run_id: str = ""
 
 
 class AnalyzeSentimentRequest(BaseModel):
     tenant_id: str
     review: dict[str, Any] | None = None
+    run_id: str = ""
 
 
 class GenerateResponseRequest(BaseModel):
@@ -148,18 +151,21 @@ class GenerateResponseRequest(BaseModel):
     message: str
     answer: dict[str, Any] | None = None        # from retrieve-answer
     classification: dict[str, Any] | None = None  # from classify-message
+    run_id: str = ""
 
 
 class RetrieveAnswerRequest(BaseModel):
     tenant_id: str
     message: str
     classification: dict[str, Any] | None = None
+    run_id: str = ""
 
 
 class SendOrEscalateRequest(BaseModel):
     tenant_id: str
     customer_line_id: str
     answer: dict[str, Any] | None = None
+    run_id: str = ""
 
 
 # ── Phase 2: Knowledge Update tool request models ────────────────────────────

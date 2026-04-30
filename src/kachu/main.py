@@ -8,6 +8,8 @@ from fastapi.responses import FileResponse
 
 from .agentOS_client import AgentOSClient
 from .approval_bridge import ApprovalBridge
+from .business_consultant import BusinessConsultant
+from .context_brief_manager import ContextBriefManager
 from .auth import oauth_router
 from .config import Settings, get_settings
 from .google.webhook import router as google_webhook_router
@@ -43,6 +45,8 @@ def create_app(settings: Settings | None = None, _engine=None) -> FastAPI:
     agentOS_client = AgentOSClient(settings)
     approval_bridge = ApprovalBridge(agentOS_client, repository, settings)
     memory_manager = MemoryManager(repository, settings)
+    context_brief_manager = ContextBriefManager(repository, memory_manager)
+    business_consultant = BusinessConsultant(repository, memory_manager, settings)
     # Phase 4: adaptive execution policy
     policy_resolver = KachuExecutionPolicyResolver(repository)
     intent_router = IntentRouter(agentOS_client, repository, settings, policy_resolver)
@@ -72,6 +76,8 @@ def create_app(settings: Settings | None = None, _engine=None) -> FastAPI:
     app.state.intent_router = intent_router
     app.state.onboarding_flow = onboarding_flow
     app.state.memory_manager = memory_manager
+    app.state.context_brief_manager = context_brief_manager
+    app.state.business_consultant = business_consultant
     app.state.policy_resolver = policy_resolver
 
     # Routers

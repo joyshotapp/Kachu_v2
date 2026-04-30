@@ -11,6 +11,7 @@ import httpx
 from fastapi import APIRouter, Request
 from sqlalchemy.exc import SQLAlchemyError
 
+from ..industry_playbook import build_industry_context
 from ..line.flex_builder import build_ga4_report_flex, build_google_post_flex, build_knowledge_update_flex, build_photo_content_flex, build_review_reply_flex
 from ..line.push import push_line_messages, text_message
 from ..llm import analyze_image_bytes, analyze_image_url, generate_text
@@ -142,6 +143,98 @@ def _settings(request: Request):
 
 def _memory(request: Request) -> MemoryManager:
     return request.app.state.memory_manager
+
+
+def _brief_manager(request: Request):
+    return getattr(request.app.state, "context_brief_manager", None)
+
+
+def _to_number(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ga_previous_period(period: str) -> tuple[str, str]:
+    normalized = str(period or "7daysAgo").strip()
+    mapping = {
+        "yesterday": ("2daysAgo", "2daysAgo"),
+        "7daysAgo": ("14daysAgo", "8daysAgo"),
+        "28daysAgo": ("56daysAgo", "29daysAgo"),
+        "30daysAgo": ("60daysAgo", "31daysAgo"),
+    }
+    return mapping.get(normalized, ("14daysAgo", "8daysAgo"))
+
+
+def _ga_change_ratio(current: float, previous: float) -> float | None:
+    if previous == 0:
+        if current == 0:
+            return 0.0
+        return None
+    return (current - previous) / previous
+
+
+def _build_ga4_comparisons(totals: dict[str, Any], previous_totals: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    comparisons: dict[str, dict[str, Any]] = {}
+    for metric in ["sessions", "totalUsers", "screenPageViews", "bounceRate", "conversions"]:
+        current = _to_number(totals.get(metric, 0))
+        previous = _to_number(previous_totals.get(metric, 0))
+        comparisons[metric] = {
+            "current": current,
+            "previous": previous,
+            "delta_ratio": _ga_change_ratio(current, previous),
+        }
+    return comparisons
+
+
+def _build_ga4_anomalies(
+    totals: dict[str, Any],
+    previous_totals: dict[str, Any],
+    channels: list[dict[str, Any]],
+    landing_pages: list[dict[str, Any]],
+) -> list[str]:
+    comparisons = _build_ga4_comparisons(totals, previous_totals)
+    anomalies: list[str] = []
+
+    metric_labels = {
+        "sessions": "工作階段",
+        "totalUsers": "使用者",
+        "screenPageViews": "頁面瀏覽",
+        "conversions": "轉換",
+    }
+    for metric, label in metric_labels.items():
+        delta = comparisons[metric]["delta_ratio"]
+        if delta is None:
+            anomalies.append(f"{label}從 0 提升到 {int(comparisons[metric]['current'])}，屬於新成長訊號")
+        elif abs(delta) >= 0.2:
+            direction = "上升" if delta > 0 else "下滑"
+            anomalies.append(f"{label}{direction} {abs(delta) * 100:.0f}%")
+
+    bounce_delta = comparisons["bounceRate"]["delta_ratio"]
+    if bounce_delta is not None and abs(bounce_delta) >= 0.1:
+        direction = "上升" if bounce_delta > 0 else "下降"
+        anomalies.append(f"跳出率{direction} {abs(bounce_delta) * 100:.0f}%")
+
+    total_sessions = max(_to_number(totals.get("sessions", 0)), 1.0)
+    if channels:
+        top_channel = channels[0]
+        channel_sessions = _to_number(top_channel.get("sessions", 0))
+        share = channel_sessions / total_sessions
+        if share >= 0.45:
+            anomalies.append(
+                f"流量高度集中在 {top_channel.get('sessionDefaultChannelGroup', '主要來源')}，占比 {share * 100:.0f}%"
+            )
+    if landing_pages:
+        top_page = landing_pages[0]
+        page_sessions = _to_number(top_page.get("sessions", 0))
+        share = page_sessions / total_sessions
+        if share >= 0.35:
+            anomalies.append(
+                f"主要入口頁集中在 {top_page.get('landingPagePlusQueryString', '(not set)')}，占比 {share * 100:.0f}%"
+            )
+
+    return anomalies[:5]
 
 
 def _get_gbp_creds(repo: KachuRepository, tenant_id: str, settings) -> "tuple | None":
@@ -356,6 +449,7 @@ async def retrieve_context(body: RetrieveContextRequest, request: Request) -> di
         brand_industry = tenant.industry_type
         brand_address = tenant.address
 
+    industry_context = build_industry_context(brand_industry)
     style_entries = _entries_of("style")
 
     # Collect semantically relevant facts (top ranked, non-structural categories)
@@ -388,12 +482,25 @@ async def retrieve_context(body: RetrieveContextRequest, request: Request) -> di
         from datetime import datetime, timezone as _tz
         week_idx = min((datetime.now(_tz.utc).day - 1) // 7, len(calendar_ctx["weeks"]) - 1)
         shared_context_hints["calendar_topic"] = calendar_ctx["weeks"][week_idx].get("topic", "")
+    consultant_brief = repo.get_shared_context(body.tenant_id, "consultant_brief") or {}
+    brand_brief = repo.get_shared_context(body.tenant_id, "brand_brief") or {}
+    owner_brief = repo.get_shared_context(body.tenant_id, "owner_brief") or {}
+    if (not brand_brief or not owner_brief) and _brief_manager(request) is not None:
+        try:
+            refreshed = await _brief_manager(request).refresh_briefs(
+                body.tenant_id,
+                reason="retrieve_context",
+            )
+            brand_brief = brand_brief or refreshed.get("brand_brief", {})
+            owner_brief = owner_brief or refreshed.get("owner_brief", {})
+        except Exception as exc:
+            logger.warning("brief refresh failed during retrieve_context: %s", exc)
 
     return {
         "brand_name": brand_name or "（未設定）",
         "brand_industry": brand_industry,
         "brand_address": brand_address,
-        "brand_tone": style_entries[0] if style_entries else "親切真誠、在地溫暖",
+        "brand_tone": style_entries[0] if style_entries else industry_context["recommended_tone"],
         "core_values": _entries_of("core_value"),
         "pain_points": _entries_of("pain_point"),
         "goals": _entries_of("goal"),
@@ -401,6 +508,11 @@ async def retrieve_context(body: RetrieveContextRequest, request: Request) -> di
         "preference_hints": {"ig_fb": ig_pref_hints, "google": google_pref_hints},
         "episode_hints": episode_hints,
         "shared_context_hints": shared_context_hints,
+        "industry_context": industry_context,
+        "market_calendar": industry_context["market_calendar"],
+        "brand_brief": brand_brief,
+        "owner_brief": owner_brief,
+        "consultant_brief": consultant_brief,
     }
 
 
@@ -473,6 +585,10 @@ async def generate_drafts(body: GenerateDraftsRequest, request: Request) -> dict
     brand_tone = context.get("brand_tone", "親切真誠")
     core_values = context.get("core_values", [])
     brand_address = context.get("brand_address", "")
+    industry_context = context.get("industry_context", {})
+    brand_brief = context.get("brand_brief", {})
+    owner_brief = context.get("owner_brief", {})
+    consultant_brief = context.get("consultant_brief", {})
     scene = analysis.get("scene_description", "")
     tags = analysis.get("suggested_tags", [])
 
@@ -494,6 +610,29 @@ async def generate_drafts(body: GenerateDraftsRequest, request: Request) -> dict
         f"請以下列場景資訊，撰寫一篇 Google 商家貼文（150字以內，商業風格，不用 emoji）：\n"
         f"場景描述：{scene}\n品牌：{brand_name}，地址：{brand_address}"
     )
+    industry_angles = "、".join(industry_context.get("content_angles", []))
+    market_watchpoints = "、".join(industry_context.get("market_watchpoints", []))
+    if industry_angles:
+        ig_prompt += f"\n產業上適合優先放大的題材：{industry_angles}"
+        google_prompt += f"\n產業經營重點：{industry_angles}"
+    if market_watchpoints:
+        ig_prompt += f"\n請兼顧的市場重點：{market_watchpoints}"
+        google_prompt += f"\n請兼顧的市場重點：{market_watchpoints}"
+    if consultant_brief:
+        brief_summary = consultant_brief.get("summary", "")
+        brief_actions = "、".join(consultant_brief.get("actions", []))
+        if brief_summary or brief_actions:
+            brief_block = f"{brief_summary} {brief_actions}".strip()
+            ig_prompt += f"\n\n【本週顧問摘要】{brief_block}"
+            google_prompt += f"\n\n【本週顧問摘要】{brief_block}"
+    if brand_brief:
+        ig_prompt += f"\n【品牌摘要】{brand_brief.get('summary', '')}"
+        google_prompt += f"\n【品牌摘要】{brand_brief.get('summary', '')}"
+    if owner_brief:
+        owner_focus = "、".join(owner_brief.get("current_priorities", [])[:2])
+        if owner_focus:
+            ig_prompt += f"\n【老闆近期在意】{owner_focus}"
+            google_prompt += f"\n【老闆近期在意】{owner_focus}"
 
     # ── Inject preference few-shot examples ───────────────────────────────────
     memory = _memory(request)
@@ -535,9 +674,15 @@ async def generate_drafts(body: GenerateDraftsRequest, request: Request) -> dict
     # Phase 5: inject SharedContext topic hint
     shared_hints = context.get("shared_context_hints", {})
     calendar_topic: str = shared_hints.get("calendar_topic", "")
+    ga4_recommendations = shared_hints.get("ga4_recommendations", [])
     if calendar_topic:
         ig_prompt += f"\n\n【本月行銷主題方向：{calendar_topic}，請在文案中融入此主題。】"
         google_prompt += f"\n\n【本月行銷主題方向：{calendar_topic}】"
+    if ga4_recommendations:
+        recommendation_titles = "、".join(item.get("title", "") for item in ga4_recommendations[:3] if item.get("title"))
+        if recommendation_titles:
+            ig_prompt += f"\n\n【最近數據建議】優先呼應：{recommendation_titles}"
+            google_prompt += f"\n\n【最近數據建議】優先呼應：{recommendation_titles}"
 
     direction_check = context.get("direction_check", {})
     direction_summary = direction_check.get("direction_summary", "")
@@ -883,6 +1028,8 @@ async def generate_review_reply(body: GenerateReviewReplyRequest, request: Reque
 
     brand_name = context.get("brand_name", "")
     brand_tone = context.get("brand_tone", "親切真誠")
+    industry_context = context.get("industry_context", {})
+    owner_brief = context.get("owner_brief", {})
     rating = review.get("rating", 4)
     content = review.get("content", "")
     reviewer_name = review.get("reviewer_name", "顧客")
@@ -897,6 +1044,8 @@ async def generate_review_reply(body: GenerateReviewReplyRequest, request: Reque
             )
             prompt = (
                 f"你是 {brand_name or '這家店'} 的老闆，風格「{brand_tone}」。\n"
+                f"產業顧問提醒：{'、'.join(industry_context.get('consultant_focus', [])) or '維持真誠、具體、可信賴'}。\n"
+                f"老闆最近在意：{'、'.join(owner_brief.get('current_priorities', [])[:2]) or '維持品牌信任感'}。\n"
                 f"請為以下評論撰寫回覆（100字以內，繁體中文，親切自然）：\n\n"
                 f"評論者：{reviewer_name}\n星級：{rating} 星\n{sentiment_hint}\n評論內容：{content or '（無文字評論）'}\n\n"
                 "要求：不要使用模板語氣，要真誠，若有負評要誠懇回應並承諾改善。"
@@ -1022,6 +1171,10 @@ async def retrieve_answer(body: RetrieveAnswerRequest, request: Request) -> dict
     """Phase 1: Search knowledge_entries then use LLM to formulate reply."""
     settings = _settings(request)
     repo = _repo(request)
+    tenant = repo.get_or_create_tenant(body.tenant_id)
+    industry_context = build_industry_context(tenant.industry_type)
+    owner_brief = repo.get_shared_context(body.tenant_id, "owner_brief") or {}
+    brand_brief = repo.get_shared_context(body.tenant_id, "brand_brief") or {}
 
     entries = repo.get_knowledge_entries(body.tenant_id)
     knowledge_text = "\n".join(f"- [{e.category}] {e.content}" for e in entries)
@@ -1033,6 +1186,9 @@ async def retrieve_answer(body: RetrieveAnswerRequest, request: Request) -> dict
         prompt = (
             "根據以下品牌知識庫，用繁體中文簡短回答顧客問題（80字以內）。\n"
             "若知識庫中沒有相關資訊，請設 should_escalate: true。\n\n"
+            f"產業脈絡：{industry_context['industry_name']}；回答時請維持 {industry_context['recommended_tone']}。\n"
+            f"品牌摘要：{brand_brief.get('summary', '未建立')}\n"
+            f"老闆近期在意：{'、'.join(owner_brief.get('current_priorities', [])[:2]) or '維持一致服務品質'}\n"
             f"知識庫：\n{knowledge_text}\n\n顧客問題：{body.message}\n\n"
             "回覆 JSON：answer, confidence(0.0-1.0), should_escalate(bool), escalate_reason(若升級時填寫)"
         )
@@ -1384,6 +1540,10 @@ async def generate_google_post(
     brand_tone = context.get("brand_tone", "親切真誠")
     brand_address = context.get("brand_address", "")
     core_values = context.get("core_values", [])
+    industry_context = context.get("industry_context", {})
+    brand_brief = context.get("brand_brief", {})
+    owner_brief = context.get("owner_brief", {})
+    consultant_brief = context.get("consultant_brief", {})
 
     if not brand_name:
         repo = _repo(request)
@@ -1405,6 +1565,21 @@ async def generate_google_post(
         f"動態類型：{body.post_type}\n\n"
         "要求：第一句是主標題，內容自然有說服力，結尾附上聯絡方式或地址。"
     )
+    if industry_context:
+        prompt += (
+            f"\n產業：{industry_context.get('industry_name', '')}"
+            f"\n建議題材：{'、'.join(industry_context.get('content_angles', []))}"
+            f"\n市場觀察：{'、'.join(industry_context.get('market_watchpoints', []))}"
+        )
+    if consultant_brief:
+        prompt += (
+            f"\n顧問摘要：{consultant_brief.get('summary', '')}"
+            f"\n優先行動：{'、'.join(consultant_brief.get('actions', []))}"
+        )
+    if brand_brief:
+        prompt += f"\n品牌摘要：{brand_brief.get('summary', '')}"
+    if owner_brief:
+        prompt += f"\n老闆近期在意：{'、'.join(owner_brief.get('current_priorities', [])[:2])}"
 
     # Inject preference examples
     memory = _memory(request)
@@ -1507,6 +1682,11 @@ async def fetch_ga4_data(
             "data": None,
             "note": "GA4_PROPERTY_ID not configured; returning stub data",
             "totals": {"sessions": 0, "totalUsers": 0, "screenPageViews": 0},
+            "previous_totals": {},
+            "comparisons": {},
+            "anomalies": [],
+            "channels": [],
+            "landing_pages": [],
         }
 
     access_token = ""
@@ -1524,27 +1704,128 @@ async def fetch_ga4_data(
             "data": None,
             "note": "GA4 not connected; use /auth/google/connect to authorise",
             "totals": {"sessions": 0, "totalUsers": 0, "screenPageViews": 0},
+            "previous_totals": {},
+            "comparisons": {},
+            "anomalies": [],
+            "channels": [],
+            "landing_pages": [],
         }
 
     try:
         from ..google import GA4Client
         ga4 = GA4Client(access_token)
-        raw = await _run_external_sync_call(
-            operation="fetch-ga4-data",
-            func=lambda: ga4.run_report(
+        previous_start, previous_end = _ga_previous_period(body.period)
+
+        def _parse_report(*, start_date: str, end_date: str, metrics: list[str], dimensions: list[str]) -> dict[str, Any]:
+            raw = ga4.run_report(
                 property_id=property_id,
-                start_date=body.period,
-                end_date="today",
-            ),
-            module_roots={"google"},
-        )
-        summary = GA4Client.parse_report(raw)
+                start_date=start_date,
+                end_date=end_date,
+                metrics=metrics,
+                dimensions=dimensions,
+            )
+            return GA4Client.parse_report(raw)
+
+        extended_metrics = ["sessions", "totalUsers", "screenPageViews", "bounceRate", "conversions"]
+        fallback_metrics = ["sessions", "totalUsers", "screenPageViews", "bounceRate"]
+
+        try:
+            summary = await _run_external_sync_call(
+                operation="fetch-ga4-data",
+                func=lambda: _parse_report(
+                    start_date=body.period,
+                    end_date="today",
+                    metrics=extended_metrics,
+                    dimensions=[],
+                ),
+                module_roots={"google"},
+            )
+            previous_summary = await _run_external_sync_call(
+                operation="fetch-ga4-data-previous",
+                func=lambda: _parse_report(
+                    start_date=previous_start,
+                    end_date=previous_end,
+                    metrics=extended_metrics,
+                    dimensions=[],
+                ),
+                module_roots={"google"},
+            )
+        except RecoverableToolError:
+            summary = await _run_external_sync_call(
+                operation="fetch-ga4-data-fallback",
+                func=lambda: _parse_report(
+                    start_date=body.period,
+                    end_date="today",
+                    metrics=fallback_metrics,
+                    dimensions=[],
+                ),
+                module_roots={"google"},
+            )
+            previous_summary = await _run_external_sync_call(
+                operation="fetch-ga4-data-previous-fallback",
+                func=lambda: _parse_report(
+                    start_date=previous_start,
+                    end_date=previous_end,
+                    metrics=fallback_metrics,
+                    dimensions=[],
+                ),
+                module_roots={"google"},
+            )
+
+        channels: list[dict[str, Any]] = []
+        landing_pages: list[dict[str, Any]] = []
+        try:
+            channel_summary = await _run_external_sync_call(
+                operation="fetch-ga4-channel-breakdown",
+                func=lambda: _parse_report(
+                    start_date=body.period,
+                    end_date="today",
+                    metrics=["sessions", "totalUsers"],
+                    dimensions=["sessionDefaultChannelGroup"],
+                ),
+                module_roots={"google"},
+            )
+            channels = channel_summary.get("period_rows", [])[:5]
+        except RecoverableToolError as exc:
+            logger.warning("GA4 channel breakdown unavailable: %s", exc)
+
+        try:
+            landing_summary = await _run_external_sync_call(
+                operation="fetch-ga4-landing-pages",
+                func=lambda: _parse_report(
+                    start_date=body.period,
+                    end_date="today",
+                    metrics=["sessions", "screenPageViews"],
+                    dimensions=["landingPagePlusQueryString"],
+                ),
+                module_roots={"google"},
+            )
+            landing_pages = landing_summary.get("period_rows", [])[:5]
+        except RecoverableToolError as exc:
+            logger.warning("GA4 landing page breakdown unavailable: %s", exc)
+
+        totals = summary.get("totals", {})
+        previous_totals = previous_summary.get("totals", {})
+        comparisons = _build_ga4_comparisons(totals, previous_totals)
+        anomalies = _build_ga4_anomalies(totals, previous_totals, channels, landing_pages)
         return {
             "run_id": body.run_id,
             "period": body.period,
             "property_id": property_id,
-            "data": summary,
-            "totals": summary.get("totals", {}),
+            "data": {
+                "current": summary,
+                "previous": previous_summary,
+                "channels": channels,
+                "landing_pages": landing_pages,
+                "comparisons": comparisons,
+                "anomalies": anomalies,
+            },
+            "totals": totals,
+            "previous_totals": previous_totals,
+            "comparisons": comparisons,
+            "anomalies": anomalies,
+            "channels": channels,
+            "landing_pages": landing_pages,
         }
     except RecoverableToolError as exc:
         logger.error("GA4 fetch failed: %s", exc)
@@ -1554,6 +1835,11 @@ async def fetch_ga4_data(
             "data": None,
             "error": str(exc),
             "totals": {"sessions": 0, "totalUsers": 0, "screenPageViews": 0},
+            "previous_totals": {},
+            "comparisons": {},
+            "anomalies": [],
+            "channels": [],
+            "landing_pages": [],
         }
 
 
@@ -1564,20 +1850,53 @@ async def generate_ga4_insights(
     """Generate human-readable GA4 report + action suggestions using LLM."""
     settings = _settings(request)
     totals = body.ga4_data.get("totals", {})
-    period = body.ga4_data.get("period", "7天")
+    previous_totals = body.ga4_data.get("previous_totals", {})
+    comparisons = body.ga4_data.get("comparisons") or _build_ga4_comparisons(totals, previous_totals)
+    anomalies = body.ga4_data.get("anomalies", [])
+    channels = body.ga4_data.get("channels", [])
+    landing_pages = body.ga4_data.get("landing_pages", [])
+    period = body.ga4_data.get("period", "7daysAgo")
 
     sessions = totals.get("sessions", 0)
     users = totals.get("totalUsers", 0)
     pageviews = totals.get("screenPageViews", 0)
     bounce = totals.get("bounceRate", 0)
+    conversions = totals.get("conversions", 0)
 
     # Format data summary for LLM
+    comparison_lines = []
+    for metric, label in {
+        "sessions": "工作階段",
+        "totalUsers": "使用者",
+        "screenPageViews": "頁面瀏覽",
+        "bounceRate": "跳出率",
+        "conversions": "轉換",
+    }.items():
+        delta = comparisons.get(metric, {}).get("delta_ratio")
+        previous = comparisons.get(metric, {}).get("previous", 0)
+        if delta is None:
+            comparison_lines.append(f"{label}：前期 0，本期 {_to_number(totals.get(metric, 0)):.0f}")
+        else:
+            comparison_lines.append(f"{label}：前期 {_to_number(previous):.0f}，變化 {delta * 100:+.0f}%")
+    channel_summary = "、".join(
+        f"{item.get('sessionDefaultChannelGroup', 'unknown')} {int(_to_number(item.get('sessions', 0)))}"
+        for item in channels[:3]
+    ) or "無"
+    landing_summary = "、".join(
+        f"{item.get('landingPagePlusQueryString', '(not set)')} {int(_to_number(item.get('sessions', 0)))}"
+        for item in landing_pages[:3]
+    ) or "無"
     data_summary = (
         f"時段：過去 {period}\n"
         f"工作階段（Sessions）：{int(sessions)}\n"
         f"使用者（Users）：{int(users)}\n"
         f"頁面瀏覽（Page Views）：{int(pageviews)}\n"
         f"跳出率（Bounce Rate）：{float(bounce):.1%}\n"
+        f"轉換（Conversions）：{int(_to_number(conversions))}\n"
+        f"對比前期：\n" + "\n".join(comparison_lines) + "\n"
+        f"主要流量來源：{channel_summary}\n"
+        f"主要入口頁：{landing_summary}\n"
+        f"異常訊號：{'；'.join(anomalies) or '目前沒有明顯異常'}\n"
     )
 
     if settings.GOOGLE_AI_API_KEY or settings.OPENAI_API_KEY:
@@ -1586,7 +1905,7 @@ async def generate_ga4_insights(
                 "你是一位數位行銷顧問，請幫老闆解讀以下 GA4 數據，用繁體中文、人話撰寫：\n\n"
                 f"{data_summary}\n\n"
                 "請給出：\n"
-                "1. 一句話摘要（20字以內）\n"
+                "1. 一句話摘要（20字以內，優先點出最明顯異常或成長）\n"
                 "2. 三個亮點或觀察\n"
                 "3. 兩個快速行動建議\n\n"
                 "以 JSON 格式回覆，欄位：summary, highlights（list）, actions（list）。只回傳 JSON。"
@@ -1600,6 +1919,23 @@ async def generate_ga4_insights(
                 generation_name="generate-ga4-insights",
             )
             insights = _parse_llm_json(raw, operation="generate-ga4-insights")
+            try:
+                repo = _repo(request)
+                repo.save_shared_context(
+                    tenant_id=body.tenant_id,
+                    context_type="consultant_brief",
+                    content={
+                        "summary": insights.get("summary", ""),
+                        "actions": insights.get("actions", []),
+                        "highlights": insights.get("highlights", []),
+                        "anomalies": anomalies,
+                        "period": period,
+                    },
+                    source_run_id=body.run_id,
+                    ttl_hours=168,
+                )
+            except SQLAlchemyError as _ctx_err:
+                logger.warning("Consultant brief save failed (non-blocking): %s", _ctx_err)
             return {"run_id": body.run_id, "insights": insights, "raw_data_summary": data_summary}
         except RecoverableToolError as exc:
             logger.warning("GA4 insights LLM failed: %s", exc)
@@ -1609,7 +1945,7 @@ async def generate_ga4_insights(
         "run_id": body.run_id,
         "insights": {
             "summary": f"本週網站有 {int(users)} 位使用者",
-            "highlights": [
+            "highlights": anomalies[:3] or [
                 f"工作階段：{int(sessions)}",
                 f"頁面瀏覽：{int(pageviews)}",
                 f"跳出率：{float(bounce):.1%}",
@@ -1631,6 +1967,8 @@ async def generate_recommendations(
     settings = _settings(request)
     insights = body.insights.get("insights", {})
     totals = body.ga4_data.get("totals", {})
+    anomalies = body.ga4_data.get("anomalies", [])
+    channels = body.ga4_data.get("channels", [])
 
     base_actions = insights.get("actions", [])
     period = body.ga4_data.get("period", "7天")
@@ -1644,7 +1982,9 @@ async def generate_recommendations(
                 f"使用者：{int(totals.get('totalUsers', 0))}\n"
                 f"跳出率：{float(totals.get('bounceRate', 0)):.1%}\n\n"
                 f"摘要：{insights.get('summary', '')}\n"
-                f"觀察：\n{highlights_str}"
+                f"觀察：\n{highlights_str}\n"
+                f"異常訊號：{'；'.join(anomalies) or '無'}\n"
+                f"主要流量來源：{'、'.join(item.get('sessionDefaultChannelGroup', '') for item in channels[:3]) or '無'}"
             )
             prompt = (
                 "你是數位行銷顧問，根據以下 GA4 數據與分析，提供具體可執行的改善建議。\n\n"
@@ -1671,9 +2011,22 @@ async def generate_recommendations(
                 repo.save_shared_context(
                     tenant_id=body.tenant_id,
                     context_type="ga4_recommendations",
-                    content={"recommendations": recommendations, "period": period},
+                    content={"recommendations": recommendations, "period": period, "anomalies": anomalies},
                     source_run_id=body.run_id,
                     ttl_hours=168,  # 7 days
+                )
+                repo.save_shared_context(
+                    tenant_id=body.tenant_id,
+                    context_type="consultant_brief",
+                    content={
+                        "summary": insights.get("summary", ""),
+                        "actions": [item.get("title", "") for item in recommendations if item.get("title")],
+                        "highlights": insights.get("highlights", []),
+                        "anomalies": anomalies,
+                        "period": period,
+                    },
+                    source_run_id=body.run_id,
+                    ttl_hours=168,
                 )
             except SQLAlchemyError as _ctx_err:
                 logger.warning("SharedContext save failed (non-blocking): %s", _ctx_err)
@@ -1682,11 +2035,23 @@ async def generate_recommendations(
             logger.warning("generate-recommendations LLM failed: %s", exc)
 
     # Fallback from base actions
+    fallback_recommendations = [
+        {"title": a, "detail": "", "priority": "medium"} for a in base_actions
+    ]
+    try:
+        repo = _repo(request)
+        repo.save_shared_context(
+            tenant_id=body.tenant_id,
+            context_type="ga4_recommendations",
+            content={"recommendations": fallback_recommendations, "period": period, "anomalies": anomalies},
+            source_run_id=body.run_id,
+            ttl_hours=168,
+        )
+    except SQLAlchemyError as _ctx_err:
+        logger.warning("Fallback GA4 recommendations save failed (non-blocking): %s", _ctx_err)
     return {
         "run_id": body.run_id,
-        "recommendations": [
-            {"title": a, "detail": "", "priority": "medium"} for a in base_actions
-        ],
+        "recommendations": fallback_recommendations,
     }
 
 
@@ -1703,6 +2068,14 @@ async def send_ga4_report(
         return {"status": "skipped", "insights": insights}
 
     repo = _repo(request)
+    recommendation_ctx = repo.get_shared_context(body.tenant_id, "ga4_recommendations") or {}
+    if recommendation_ctx.get("recommendations"):
+        merged_actions = list(insights.get("actions", []))
+        for item in recommendation_ctx.get("recommendations", []):
+            title = item.get("title", "")
+            if title and title not in merged_actions:
+                merged_actions.append(title)
+        insights = {**insights, "actions": merged_actions[:3]}
     if not repo.can_push(body.tenant_id):
         logger.warning(
             "send_ga4_report: daily push limit reached for tenant=%s; skipping report",

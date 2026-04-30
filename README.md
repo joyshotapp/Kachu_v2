@@ -7,6 +7,15 @@ The product remains centered on three rules:
 - The boss confirms external actions before they happen.
 - AgentOS is runtime infrastructure, not the product itself.
 
+## Recent product updates
+
+- Owner context is no longer limited to onboarding fields. Boss free-form chat is now persisted and folded into `owner_brief` and `brand_brief` shared context for downstream workflows.
+- Free-form boss chat now routes through `BusinessConsultant`, which combines knowledge entries, industry playbook hints, recent episodes, content calendar, and GA recommendations.
+- GA4 reporting now supports current-vs-previous comparison, top channel and landing page breakdowns, and anomaly-oriented summaries instead of only flat totals.
+- Dashboard now includes tenant-level automation settings for GA report cadence, Google Business post cadence, proactive nudges, content calendar timing, and tenant timezone.
+- Scheduler dispatch is now settings-driven per tenant instead of a single hard-coded weekly cadence for every account.
+- Recoverable AgentOS dispatch failures are retried through the deferred dispatch queue.
+
 ## Workspace layout
 
 - `src/kachu/` — Kachu product logic, adapters, memory, router, webhook, scheduler
@@ -23,7 +32,59 @@ The product remains centered on three rules:
 
 1. Install dependencies with `pip install -e .[dev]`.
 2. Run the app with `uvicorn kachu.main:app --app-dir src --reload`.
-3. Run tests with `python -m pytest`.
+3. Apply migrations with `alembic upgrade head` when schema changes are added.
+4. Run tests with `python -m pytest`.
+
+Recommended local commands in this workspace:
+
+```bash
+.venv311/bin/python -m pytest tests/ -q
+.venv311/bin/python -m pytest tests/test_phase5_features.py -q
+uvicorn kachu.main:app --app-dir src --reload
+```
+
+For dashboard access outside test mode, configure `ADMIN_SERVICE_TOKEN` and send it as `Authorization: Bearer <token>`.
+
+As of 2026-04-30, the full suite passes with:
+
+```bash
+.venv311/bin/python -m pytest tests/ -q
+```
+
+Result: `185 passed`
+
+## Context and automation architecture
+
+### Owner and brand context
+
+- Raw boss/customer chat is stored in `ConversationTable`.
+- `ContextBriefManager` derives `owner_brief` and `brand_brief` from recent owner messages, structured knowledge, preference memories, and episodic outcomes.
+- `retrieve-context` injects `owner_brief`, `brand_brief`, `industry_context`, `market_calendar`, and `consultant_brief` into downstream workflows.
+
+### GA insight pipeline
+
+- `fetch-ga4-data` retrieves current-period totals, previous-period totals, channel mix, and landing-page breakdowns.
+- `generate-ga4-insights` turns those comparisons into anomaly-aware executive summaries.
+- `generate-recommendations` persists recommendations back into shared context so content workflows can reuse them.
+
+### Automation settings
+
+- Automation settings are stored in `TenantAutomationSettingsTable`.
+- Dashboard endpoints:
+  - `GET /dashboard/api/automation-settings`
+  - `PUT /dashboard/api/automation-settings`
+- Scheduler runs hourly and checks each tenant's configured timezone, frequency, weekday/day, and hour before dispatching GA reports, Google posts, proactive nudges, or monthly calendars.
+
+## Files worth knowing
+
+- `src/kachu/context_brief_manager.py` — derives persistent owner/brand briefs
+- `src/kachu/business_consultant.py` — contextual boss-facing consultant replies
+- `src/kachu/scheduler.py` — tenant-configurable automation dispatch
+- `src/kachu/dashboard/router.py` — dashboard API, including automation settings endpoints
+- `src/kachu/static/dashboard.html` — admin UI for automation settings
+- `src/kachu/tools/router.py` — workflow tool implementations, including anomaly-based GA processing
+- `src/kachu/google/ga4_client.py` — GA4 client with non-date dimension ordering support
+- `alembic/versions/20260430_0002_automation_and_briefs.py` — migration for automation-settings support
 
 ## Phase 6 release gate
 

@@ -284,6 +284,27 @@ class TenantApprovalProfileTable(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
+class TenantAutomationSettingsTable(SQLModel, table=True):
+    """Per-tenant automation cadence and timing configuration."""
+    __tablename__ = "kachu_tenant_automation_settings"
+
+    tenant_id: str = Field(primary_key=True)
+    ga_report_enabled: bool = Field(default=True)
+    ga_report_frequency: str = Field(default="weekly")
+    ga_report_weekday: str = Field(default="mon")
+    ga_report_hour: int = Field(default=8)
+    google_post_enabled: bool = Field(default=True)
+    google_post_frequency: str = Field(default="weekly")
+    google_post_weekday: str = Field(default="thu")
+    google_post_hour: int = Field(default=10)
+    proactive_enabled: bool = Field(default=True)
+    proactive_hour: int = Field(default=7)
+    content_calendar_enabled: bool = Field(default=True)
+    content_calendar_day: int = Field(default=1)
+    content_calendar_hour: int = Field(default=9)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
 # ── Phase 5: Cross-Workflow Shared Context ────────────────────────────────────
 
 class SharedContextTable(SQLModel, table=True):
@@ -298,3 +319,21 @@ class SharedContextTable(SQLModel, table=True):
     source_run_id: str = Field(default="")
     expires_at: Optional[datetime] = Field(default=None)
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class DeferredDispatchTable(SQLModel, table=True):
+    """Recoverable AgentOS dispatch backlog for transient outages."""
+    __tablename__ = "kachu_deferred_dispatches"
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    tenant_id: str = Field(index=True)
+    workflow_type: str = Field(default="", index=True)
+    task_request_json: str = Field(default="{}")
+    trigger_source: str = Field(default="")
+    trigger_payload: str = Field(default="{}")
+    status: str = Field(default="pending", index=True)  # pending | dispatched | failed
+    attempts: int = Field(default=0)
+    last_error: str = Field(default="")
+    next_retry_at: datetime = Field(default_factory=utcnow, index=True)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)

@@ -216,6 +216,7 @@ class TestIntentRouterLLM:
         )
 
         repo.create_workflow_record.assert_not_called()
+        repo.create_deferred_dispatch.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_create_and_run_re_raises_unexpected_dispatch_error(self):

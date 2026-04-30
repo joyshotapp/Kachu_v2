@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -30,6 +31,7 @@ class TestProactiveMonitor:
         repo.get_pending_negative_reviews.return_value = 0
         repo.get_knowledge_last_updated_at.return_value = _utcnow() - timedelta(days=30)
         repo.can_push.return_value = True
+        repo.has_recent_audit_event.return_value = False
         repo.record_push = MagicMock()
         for k, v in repo_overrides.items():
             setattr(repo, k, MagicMock(return_value=v))
@@ -134,6 +136,17 @@ class TestProactiveMonitor:
             with pytest.raises(AssertionError, match="unexpected"):
                 await agent._trigger_nudge("t1", NUDGE_NO_POST, "2026-04-27")
 
+    @pytest.mark.asyncio
+    async def test_trigger_nudge_skips_duplicate_bucket(self):
+        from kachu.proactive_monitor import NUDGE_NO_POST
+
+        agent, repo = self._make_agent(has_recent_audit_event=True)
+        with patch("kachu.proactive_monitor.push_line_messages", new=AsyncMock()) as push_mock:
+            await agent._trigger_nudge("t1", NUDGE_NO_POST, "2026-04-27")
+
+        push_mock.assert_not_called()
+        repo.record_push.assert_not_called()
+
 
 # ── GoalParser ────────────────────────────────────────────────────────────────
 
@@ -210,6 +223,138 @@ class TestGoalParser:
         assert "workflow=kachu_ga4_report" in qr["items"][0]["action"]["data"]
 
 
+class TestBusinessConsultant:
+    @pytest.mark.asyncio
+    async def test_build_reply_uses_brand_and_quick_reply(self):
+        from kachu.business_consultant import BusinessConsultant
+
+        repo = MagicMock()
+        repo.get_or_create_tenant.return_value = SimpleNamespace(name="好吃小館", industry_type="餐廳")
+        repo.get_knowledge_entries.return_value = [
+            SimpleNamespace(category="product", content="雞腿飯是招牌品項"),
+            SimpleNamespace(category="goal", content="想增加午餐時段來客"),
+        ]
+        def _shared_context(_tenant_id, context_type):
+            if context_type == "ga4_recommendations":
+                return {"recommendations": [{"title": "強化午餐優惠"}]}
+            if context_type == "monthly_content_calendar":
+                return {"weeks": [{"topic": "母親節套餐"}]}
+            return {}
+
+        repo.get_shared_context.side_effect = _shared_context
+        memory = MagicMock()
+        memory.get_recent_episodes.return_value = []
+        settings = MagicMock()
+        settings.GOOGLE_AI_API_KEY = ""
+        settings.OPENAI_API_KEY = ""
+        settings.LITELLM_MODEL = "gemini/test"
+
+        consultant = BusinessConsultant(repo, memory, settings)
+        reply = await consultant.build_reply(tenant_id="t1", message="最近生意有點慢怎麼辦")
+
+        assert reply["type"] == "text"
+        assert "餐飲" in reply["text"]
+        assert "quickReply" in reply
+        assert reply["quickReply"]["items"]
+
+
+class TestDeferredDispatchRetry:
+    @pytest.mark.asyncio
+    async def test_scheduler_recovers_deferred_dispatch(self):
+        from kachu.scheduler import KachuScheduler
+
+        agentos = AsyncMock()
+        agentos.create_task.return_value = SimpleNamespace(task={"id": "task-1"})
+        agentos.run_task.return_value = SimpleNamespace(run={"id": "run-1", "status": "queued"})
+        repo = MagicMock()
+        repo.list_due_deferred_dispatches.return_value = [
+            SimpleNamespace(
+                id="dd-1",
+                tenant_id="tenant-1",
+                workflow_type="google_post",
+                task_request_json=json.dumps(
+                    {
+                        "tenant_id": "tenant-1",
+                        "domain": "kachu_google_post",
+                        "objective": "post",
+                        "workflow_input": {"tenant_id": "tenant-1"},
+                    }
+                ),
+                trigger_source="boss_request",
+                trigger_payload=json.dumps({"message": "寫一篇貼文"}),
+            )
+        ]
+        scheduler = KachuScheduler(agentos, repo, settings=MagicMock())
+
+        await scheduler._drain_deferred_dispatches()
+
+        repo.create_workflow_record.assert_called_once()
+        repo.mark_deferred_dispatch_dispatched.assert_called_once_with("dd-1")
+
+    @pytest.mark.asyncio
+    async def test_scheduler_marks_retry_on_recoverable_error(self):
+        from kachu.scheduler import KachuScheduler
+
+        agentos = AsyncMock()
+        agentos.create_task.side_effect = httpx.ReadTimeout("timeout")
+        repo = MagicMock()
+        repo.list_due_deferred_dispatches.return_value = [
+            SimpleNamespace(
+                id="dd-1",
+                tenant_id="tenant-1",
+                workflow_type="google_post",
+                task_request_json=json.dumps(
+                    {
+                        "tenant_id": "tenant-1",
+                        "domain": "kachu_google_post",
+                        "objective": "post",
+                        "workflow_input": {"tenant_id": "tenant-1"},
+                    }
+                ),
+                trigger_source="boss_request",
+                trigger_payload=json.dumps({"message": "寫一篇貼文"}),
+            )
+        ]
+        scheduler = KachuScheduler(agentos, repo, settings=MagicMock())
+
+        await scheduler._drain_deferred_dispatches()
+
+        repo.mark_deferred_dispatch_retry.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_runs_due_configured_automations(self):
+        from kachu.scheduler import KachuScheduler
+
+        agentos = AsyncMock()
+        repo = MagicMock()
+        repo.list_active_tenant_ids.return_value = ["tenant-A"]
+        repo.get_tenant.return_value = SimpleNamespace(timezone="Asia/Taipei")
+        repo.get_or_create_automation_settings.return_value = SimpleNamespace(
+            ga_report_enabled=True,
+            ga_report_frequency="weekly",
+            ga_report_weekday="mon",
+            ga_report_hour=8,
+            google_post_enabled=True,
+            google_post_frequency="daily",
+            google_post_weekday="thu",
+            google_post_hour=8,
+            proactive_enabled=False,
+            proactive_hour=7,
+            content_calendar_enabled=False,
+            content_calendar_day=1,
+            content_calendar_hour=9,
+        )
+        scheduler = KachuScheduler(agentos, repo, settings=MagicMock())
+        scheduler._tenant_now = MagicMock(return_value=datetime(2026, 4, 27, 8, tzinfo=timezone.utc))
+        scheduler._trigger_ga4_report_for_tenant = AsyncMock()
+        scheduler._trigger_google_post_for_tenant = AsyncMock()
+
+        await scheduler._run_configured_automations()
+
+        scheduler._trigger_ga4_report_for_tenant.assert_called_once()
+        scheduler._trigger_google_post_for_tenant.assert_called_once()
+
+
 # ── SharedContext repository ──────────────────────────────────────────────────
 
 class TestSharedContext:
@@ -272,6 +417,182 @@ class TestSharedContext:
         assert result_t2 is None
         result_t1 = repo.get_shared_context("t1", "ga4_recommendations")
         assert result_t1["for"] == "t1"
+
+
+class TestContextBriefManager:
+    def _make_repo(self):
+        from sqlmodel import create_engine
+        from kachu.persistence.tables import SQLModel
+        from kachu.persistence.repository import KachuRepository
+
+        engine = create_engine("sqlite:///:memory:")
+        SQLModel.metadata.create_all(engine)
+        return KachuRepository(engine)
+
+    @pytest.mark.asyncio
+    async def test_refresh_briefs_persists_owner_and_brand_context(self):
+        from kachu.context_brief_manager import ContextBriefManager
+
+        repo = self._make_repo()
+        tenant = repo.get_or_create_tenant("t1")
+        tenant.name = "好吃小館"
+        tenant.industry_type = "餐廳"
+        repo.save_tenant(tenant)
+        repo.save_knowledge_entry(tenant_id="t1", category="product", content="雞腿飯是招牌")
+        repo.save_knowledge_entry(tenant_id="t1", category="goal", content="這週先衝午餐客")
+        repo.save_knowledge_entry(tenant_id="t1", category="style", content="口吻要自然直接")
+        repo.save_conversation(
+            tenant_id="t1",
+            role="owner",
+            content="這週先衝午餐客，文案不要太空泛",
+            conversation_type="general",
+        )
+
+        memory = MagicMock()
+        memory.get_preference_examples.side_effect = [
+            [{"notes": "老闆調整了用詞", "edited": "午餐方案要更直接"}],
+            [],
+        ]
+        memory.get_recent_episodes.return_value = [{"outcome": "modified", "workflow_type": "google_post"}]
+
+        manager = ContextBriefManager(repo, memory)
+        briefs = await manager.refresh_briefs("t1", reason="test")
+
+        assert "雞腿飯是招牌" in briefs["brand_brief"]["products"]
+        assert briefs["owner_brief"]["current_priorities"][0].startswith("這週先衝午餐客")
+        assert repo.get_shared_context("t1", "brand_brief")["brand_name"] == "好吃小館"
+
+
+class TestAutomationSettings:
+    def _make_repo(self):
+        from sqlmodel import create_engine
+        from kachu.persistence.tables import SQLModel
+        from kachu.persistence.repository import KachuRepository
+
+        engine = create_engine("sqlite:///:memory:")
+        SQLModel.metadata.create_all(engine)
+        return KachuRepository(engine)
+
+    def test_update_automation_settings(self):
+        repo = self._make_repo()
+        default_settings = repo.get_or_create_automation_settings("t1")
+        assert default_settings.ga_report_frequency == "weekly"
+
+        updated = repo.update_automation_settings(
+            "t1",
+            ga_report_frequency="daily",
+            google_post_enabled=False,
+            proactive_hour=9,
+        )
+
+        assert updated.ga_report_frequency == "daily"
+        assert updated.google_post_enabled is False
+        assert updated.proactive_hour == 9
+
+
+class TestAutomationSettingsDashboardApi:
+    def test_dashboard_can_read_and_update_automation_settings(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        client = TestClient(
+            create_app(
+                Settings(
+                    LINE_CHANNEL_ACCESS_TOKEN="",
+                    LINE_CHANNEL_SECRET="",
+                    LINE_BOSS_USER_ID="boss-automation",
+                    ADMIN_SERVICE_TOKEN="dashboard-token",
+                    AGENTOS_BASE_URL="http://agentos-mock",
+                    KACHU_BASE_URL="http://localhost:8001",
+                    DATABASE_URL="sqlite://",
+                )
+            )
+        )
+
+        headers = {"Authorization": "Bearer dashboard-token"}
+
+        response = client.get("/dashboard/api/automation-settings", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["ga_report_frequency"] == "weekly"
+
+        updated = client.put(
+            "/dashboard/api/automation-settings",
+            headers=headers,
+            json={
+                "timezone": "Asia/Tokyo",
+                "ga_report_enabled": True,
+                "ga_report_frequency": "daily",
+                "ga_report_weekday": "mon",
+                "ga_report_hour": 6,
+                "google_post_enabled": True,
+                "google_post_frequency": "weekly",
+                "google_post_weekday": "fri",
+                "google_post_hour": 11,
+                "proactive_enabled": True,
+                "proactive_hour": 8,
+                "content_calendar_enabled": True,
+                "content_calendar_day": 3,
+                "content_calendar_hour": 10,
+            },
+        )
+        assert updated.status_code == 200
+        payload = updated.json()
+        assert payload["timezone"] == "Asia/Tokyo"
+        assert payload["ga_report_frequency"] == "daily"
+        assert payload["google_post_weekday"] == "fri"
+
+    def test_dashboard_requires_bearer_token(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        client = TestClient(
+            create_app(
+                Settings(
+                    LINE_CHANNEL_ACCESS_TOKEN="",
+                    LINE_CHANNEL_SECRET="",
+                    LINE_BOSS_USER_ID="boss-automation",
+                    ADMIN_SERVICE_TOKEN="dashboard-token",
+                    AGENTOS_BASE_URL="http://agentos-mock",
+                    KACHU_BASE_URL="http://localhost:8001",
+                    DATABASE_URL="sqlite://",
+                )
+            )
+        )
+
+        response = client.get("/dashboard/api/automation-settings")
+        assert response.status_code == 401
+
+    def test_dashboard_rejects_invalid_timezone(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        client = TestClient(
+            create_app(
+                Settings(
+                    LINE_CHANNEL_ACCESS_TOKEN="",
+                    LINE_CHANNEL_SECRET="",
+                    LINE_BOSS_USER_ID="boss-automation",
+                    ADMIN_SERVICE_TOKEN="dashboard-token",
+                    AGENTOS_BASE_URL="http://agentos-mock",
+                    KACHU_BASE_URL="http://localhost:8001",
+                    DATABASE_URL="sqlite://",
+                )
+            )
+        )
+
+        response = client.put(
+            "/dashboard/api/automation-settings",
+            headers={"Authorization": "Bearer dashboard-token"},
+            json={"timezone": "Mars/Phobos"},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid timezone"
 
 
 # ── compute_and_save_approval_profile ────────────────────────────────────────
