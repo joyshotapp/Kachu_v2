@@ -265,9 +265,56 @@ async def google_callback(
             )
         token_data = resp.json()
 
+    access_token = token_data.get("access_token", "")
+
+    repo: KachuRepository = _repo(request)
+    saved_platforms = []
+
+    if "gbp" in platforms:
+        # Auto-discover account_id and location_id so tools/router.py can use them directly.
+        # GBP API returns resource names like "accounts/12345" and "accounts/12345/locations/67890".
+        gbp_account_id = ""
+        gbp_location_id = ""
+        try:
+            import asyncio
+            from ..google import GoogleBusinessClient
+            temp_client = GoogleBusinessClient.from_oauth_token(access_token)
+            loop = asyncio.get_event_loop()
+            accounts = await loop.run_in_executor(None, temp_client.list_accounts)
+            if accounts:
+                gbp_account_id = accounts[0].get("name", "")
+                locations = await loop.run_in_executor(
+                    None, lambda: temp_client.list_locations(gbp_account_id)
+                )
+                if locations:
+                    gbp_location_id = locations[0].get("name", "")
+        except Exception as exc:
+            logger.warning("GBP account/location auto-discovery failed: %s", exc)
+
+        gbp_credentials_json = json.dumps(
+            {
+                "access_token": access_token,
+                "refresh_token": token_data.get("refresh_token", ""),
+                "expires_in": token_data.get("expires_in", 3600),
+                "expires_at": int(time.time()) + int(token_data.get("expires_in", 3600)),
+                "scope": token_data.get("scope", ""),
+                "token_type": token_data.get("token_type", "Bearer"),
+                "account_id": gbp_account_id,
+                "location_id": gbp_location_id,
+            },
+            ensure_ascii=False,
+        )
+        repo.save_connector_account(
+            tenant_id=tenant_id,
+            platform="google_business",
+            credentials_json=gbp_credentials_json,
+            account_label="Google Business Profile",
+        )
+        saved_platforms.append("google_business")
+
     credentials_json = json.dumps(
         {
-            "access_token": token_data.get("access_token", ""),
+            "access_token": access_token,
             "refresh_token": token_data.get("refresh_token", ""),
             "expires_in": token_data.get("expires_in", 3600),
             "scope": token_data.get("scope", ""),
@@ -275,18 +322,6 @@ async def google_callback(
         },
         ensure_ascii=False,
     )
-
-    repo: KachuRepository = _repo(request)
-    saved_platforms = []
-
-    if "gbp" in platforms:
-        repo.save_connector_account(
-            tenant_id=tenant_id,
-            platform="google_business",
-            credentials_json=credentials_json,
-            account_label="Google Business Profile",
-        )
-        saved_platforms.append("google_business")
 
     if "ga4" in platforms:
         repo.save_connector_account(

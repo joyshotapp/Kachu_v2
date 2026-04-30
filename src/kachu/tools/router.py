@@ -144,6 +144,75 @@ def _memory(request: Request) -> MemoryManager:
     return request.app.state.memory_manager
 
 
+def _get_gbp_creds(repo: KachuRepository, tenant_id: str, settings) -> "tuple | None":
+    """Return (GoogleBusinessClient, account_id, location_id) for a tenant, or None.
+
+    Priority:
+    1. Per-tenant OAuth token stored in connector_account table (SaaS path).
+    2. Service account + env var IDs (single-tenant / legacy fallback).
+    """
+    import time
+    from ..google import GoogleBusinessClient
+
+    # ── Path 1: per-tenant OAuth token from DB ────────────────────────────────
+    account = repo.get_connector_account(tenant_id, "google_business")
+    if account and account.credentials_encrypted:
+        try:
+            creds = json.loads(account.credentials_encrypted)
+            access_token = creds.get("access_token", "")
+            account_id = creds.get("account_id", "")
+            location_id = creds.get("location_id", "")
+
+            # ── Refresh if expired (5-minute buffer) ──────────────────────────
+            expires_at = creds.get("expires_at", 0)
+            refresh_token = creds.get("refresh_token", "")
+            if expires_at and refresh_token and time.time() > expires_at - 300:
+                try:
+                    resp = httpx.post(
+                        "https://oauth2.googleapis.com/token",
+                        data={
+                            "client_id": getattr(settings, "GOOGLE_OAUTH_CLIENT_ID", ""),
+                            "client_secret": getattr(settings, "GOOGLE_OAUTH_CLIENT_SECRET", ""),
+                            "refresh_token": refresh_token,
+                            "grant_type": "refresh_token",
+                        },
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        new_data = resp.json()
+                        creds["access_token"] = new_data["access_token"]
+                        creds["expires_at"] = int(time.time()) + int(new_data.get("expires_in", 3600))
+                        if new_data.get("refresh_token"):
+                            creds["refresh_token"] = new_data["refresh_token"]
+                        repo.save_connector_account(
+                            tenant_id=tenant_id,
+                            platform="google_business",
+                            credentials_json=json.dumps(creds),
+                        )
+                        access_token = creds["access_token"]
+                    else:
+                        logger.warning(
+                            "GBP token refresh failed (HTTP %s): %s",
+                            resp.status_code, resp.text[:200],
+                        )
+                except Exception as exc:
+                    logger.warning("GBP token refresh error: %s", exc)
+
+            if access_token and account_id and location_id:
+                return GoogleBusinessClient.from_oauth_token(access_token), account_id, location_id
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # ── Path 2: service account + env vars (single-tenant fallback) ───────────
+    sa_path = getattr(settings, "GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    account_id = getattr(settings, "GOOGLE_BUSINESS_ACCOUNT_ID", "")
+    location_id = getattr(settings, "GOOGLE_BUSINESS_LOCATION_ID", "")
+    if sa_path and account_id and location_id:
+        return GoogleBusinessClient(sa_path), account_id, location_id
+
+    return None
+
+
 async def _llm(
     *,
     prompt: str,
@@ -667,15 +736,15 @@ async def publish_content(body: PublishContentRequest, request: Request) -> dict
 
     if "google" in body.selected_platforms:
         google_text = body.drafts.get("google", "")
-        if google_text and settings.GOOGLE_SERVICE_ACCOUNT_JSON and settings.GOOGLE_BUSINESS_ACCOUNT_ID and settings.GOOGLE_BUSINESS_LOCATION_ID:
+        gbp_creds = _get_gbp_creds(repo, body.tenant_id, settings)
+        if google_text and gbp_creds:
+            gbp, gbp_account_id, gbp_location_id = gbp_creds
             try:
-                from ..google import GoogleBusinessClient
-                gbp = GoogleBusinessClient(settings.GOOGLE_SERVICE_ACCOUNT_JSON)
                 gbp_result = await _run_external_sync_call(
                     operation="publish-content/google",
                     func=lambda: gbp.create_local_post(
-                        account_id=settings.GOOGLE_BUSINESS_ACCOUNT_ID,
-                        location_id=settings.GOOGLE_BUSINESS_LOCATION_ID,
+                        account_id=gbp_account_id,
+                        location_id=gbp_location_id,
                         summary=google_text,
                     ),
                     module_roots={"google"},
@@ -769,17 +838,18 @@ async def publish_content(body: PublishContentRequest, request: Request) -> dict
 @router.post("/fetch-review")
 async def fetch_review(body: FetchReviewRequest, request: Request) -> dict[str, Any]:
     """Phase 1: Fetch review from Google Business Profile API."""
+    repo = _repo(request)
     settings = _settings(request)
+    gbp_creds = _get_gbp_creds(repo, body.tenant_id, settings)
 
-    if settings.GOOGLE_SERVICE_ACCOUNT_JSON and settings.GOOGLE_BUSINESS_ACCOUNT_ID and settings.GOOGLE_BUSINESS_LOCATION_ID:
+    if gbp_creds:
+        gbp, gbp_account_id, gbp_location_id = gbp_creds
         try:
-            from ..google import GoogleBusinessClient
-            gbp = GoogleBusinessClient(settings.GOOGLE_SERVICE_ACCOUNT_JSON)
             review = await _run_external_sync_call(
                 operation="fetch-review",
                 func=lambda: gbp.get_review(
-                    account_id=settings.GOOGLE_BUSINESS_ACCOUNT_ID,
-                    location_id=settings.GOOGLE_BUSINESS_LOCATION_ID,
+                    account_id=gbp_account_id,
+                    location_id=gbp_location_id,
                     review_id=body.review_id,
                 ),
                 module_roots={"google"},
@@ -846,6 +916,7 @@ async def generate_review_reply(body: GenerateReviewReplyRequest, request: Reque
 @router.post("/post-review-reply")
 async def post_review_reply(body: PostReviewReplyRequest, request: Request) -> dict[str, Any]:
     """Phase 1: Post reply to Google Business Profile."""
+    repo = _repo(request)
     settings = _settings(request)
     reply_text: str = ""
     if isinstance(body.reply, dict):
@@ -853,15 +924,15 @@ async def post_review_reply(body: PostReviewReplyRequest, request: Request) -> d
     if not reply_text:
         reply_text = body.confirmation.get("edited_reply", "")
 
-    if reply_text and settings.GOOGLE_SERVICE_ACCOUNT_JSON and settings.GOOGLE_BUSINESS_ACCOUNT_ID and settings.GOOGLE_BUSINESS_LOCATION_ID:
+    gbp_creds = _get_gbp_creds(repo, body.tenant_id, settings)
+    if reply_text and gbp_creds:
+        gbp, gbp_account_id, gbp_location_id = gbp_creds
         try:
-            from ..google import GoogleBusinessClient
-            gbp = GoogleBusinessClient(settings.GOOGLE_SERVICE_ACCOUNT_JSON)
             result = await _run_external_sync_call(
                 operation="post-review-reply",
                 func=lambda: gbp.post_reply(
-                    account_id=settings.GOOGLE_BUSINESS_ACCOUNT_ID,
-                    location_id=settings.GOOGLE_BUSINESS_LOCATION_ID,
+                    account_id=gbp_account_id,
+                    location_id=gbp_location_id,
                     review_id=body.review_id,
                     reply_text=reply_text,
                 ),
@@ -1381,72 +1452,38 @@ async def publish_google_post(
     if not body.post_text:
         return {"status": "skipped", "reason": "empty post text"}
 
-    # Try OAuth token first (Phase 2), fall back to service account (Phase 1)
-    connector = repo.get_connector_account(body.tenant_id, "google_business")
-    published = False
+    gbp_creds = _get_gbp_creds(repo, body.tenant_id, settings)
+    if not gbp_creds:
+        return {"status": "skipped", "reason": "GBP credentials not configured"}
 
-    if connector:
-        try:
-            creds = json.loads(connector.credentials_encrypted)
-            access_token = creds.get("access_token", "")
-            from ..google.business_client import _GBP_BASE
+    gbp, gbp_account_id, gbp_location_id = gbp_creds
+    post_body: dict[str, Any] = {
+        "languageCode": "zh-TW",
+        "summary": body.post_text,
+        "topicType": body.post_type,
+    }
+    if body.call_to_action_url:
+        post_body["callToAction"] = {"actionType": "LEARN_MORE", "url": body.call_to_action_url}
 
-            post_body: dict[str, Any] = {
-                "languageCode": "zh-TW",
-                "summary": body.post_text,
-                "topicType": body.post_type,
-            }
-            if body.call_to_action_url:
-                post_body["callToAction"] = {"actionType": "LEARN_MORE", "url": body.call_to_action_url}
-
-            # GBP requires account_id/location_id — fall through to service account path
-            # if not stored in connector. Use settings as fallback.
-            account_id = settings.GOOGLE_BUSINESS_ACCOUNT_ID
-            location_id = settings.GOOGLE_BUSINESS_LOCATION_ID
-            if account_id and location_id and access_token:
-                url = f"{_GBP_BASE}/{account_id}/{location_id}/localPosts"
-                async with httpx.AsyncClient() as client:
-                    resp = await client.post(
-                        url,
-                        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                        content=json.dumps(post_body, ensure_ascii=False).encode(),
-                        timeout=20.0,
-                    )
-                    resp.raise_for_status()
-                    gbp_result = resp.json()
-                published = True
-                repo.decide_pending_approval(agentos_run_id=body.run_id, decision="published", actor_line_id="system")
-                wf = repo.get_workflow_record_by_run_id(body.run_id)
-                if wf:
-                    repo.update_workflow_record_status(wf.id, "completed")
-                return {"status": "published", "post_name": gbp_result.get("name"), "via": "oauth"}
-        except (httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            logger.warning("OAuth GBP publish failed, trying service account: %s", exc)
-
-    if not published and settings.GOOGLE_SERVICE_ACCOUNT_JSON and settings.GOOGLE_BUSINESS_ACCOUNT_ID:
-        try:
-            from ..google import GoogleBusinessClient
-            gbp = GoogleBusinessClient(settings.GOOGLE_SERVICE_ACCOUNT_JSON)
-            gbp_result = await _run_external_sync_call(
-                operation="publish-google-post/service-account",
-                func=lambda: gbp.create_local_post(
-                    account_id=settings.GOOGLE_BUSINESS_ACCOUNT_ID,
-                    location_id=settings.GOOGLE_BUSINESS_LOCATION_ID,
-                    summary=body.post_text,
-                    call_to_action_url=body.call_to_action_url,
-                ),
-                module_roots={"google"},
-            )
-            repo.decide_pending_approval(agentos_run_id=body.run_id, decision="published", actor_line_id="system")
-            wf = repo.get_workflow_record_by_run_id(body.run_id)
-            if wf:
-                repo.update_workflow_record_status(wf.id, "completed")
-            return {"status": "published", "post_name": gbp_result.get("name"), "via": "service_account"}
-        except RecoverableToolError as exc:
-            logger.error("Service account GBP publish failed: %s", exc)
-            return {"status": "failed", "error": str(exc)}
-
-    return {"status": "skipped", "reason": "GBP credentials not configured"}
+    try:
+        gbp_result = await _run_external_sync_call(
+            operation="publish-google-post",
+            func=lambda: gbp.create_local_post(
+                account_id=gbp_account_id,
+                location_id=gbp_location_id,
+                summary=body.post_text,
+                call_to_action_url=body.call_to_action_url,
+            ),
+            module_roots={"google"},
+        )
+        repo.decide_pending_approval(agentos_run_id=body.run_id, decision="published", actor_line_id="system")
+        wf = repo.get_workflow_record_by_run_id(body.run_id)
+        if wf:
+            repo.update_workflow_record_status(wf.id, "completed")
+        return {"status": "published", "post_name": gbp_result.get("name")}
+    except RecoverableToolError as exc:
+        logger.error("GBP publish failed: %s", exc)
+        return {"status": "failed", "error": str(exc)}
 
 
 # ── GA4 Report Workflow tools ─────────────────────────────────────────────────
