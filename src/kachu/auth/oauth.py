@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 
 try:
@@ -43,6 +43,94 @@ def _repo(request: Request) -> KachuRepository:
 
 def _settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def _build_google_connector_credentials(
+    token_data: dict[str, Any],
+    *,
+    account_id: str = "",
+    location_id: str = "",
+) -> str:
+    return json.dumps(
+        {
+            "access_token": token_data.get("access_token", ""),
+            "refresh_token": token_data.get("refresh_token", ""),
+            "expires_in": token_data.get("expires_in", 3600),
+            "expires_at": int(time.time()) + int(token_data.get("expires_in", 3600)),
+            "scope": token_data.get("scope", ""),
+            "token_type": token_data.get("token_type", "Bearer"),
+            "account_id": account_id,
+            "location_id": location_id,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _save_google_business_connector(
+    repo: KachuRepository,
+    *,
+    tenant_id: str,
+    token_data: dict[str, Any],
+    account_label: str,
+    account_id: str = "",
+    location_id: str = "",
+) -> None:
+    repo.save_connector_account(
+        tenant_id=tenant_id,
+        platform="google_business",
+        credentials_json=_build_google_connector_credentials(
+            token_data,
+            account_id=account_id,
+            location_id=location_id,
+        ),
+        account_label=account_label,
+    )
+
+
+def _backfill_google_business_connector(
+    repo: KachuRepository,
+    *,
+    tenant_id: str,
+    token_data: dict[str, Any],
+    account_label: str,
+) -> None:
+    access_token = str(token_data.get("access_token", "")).strip()
+    if not access_token:
+        logger.warning("Skip GBP backfill: missing access token for tenant=%s", tenant_id)
+        return
+
+    try:
+        from ..google import GoogleBusinessClient
+
+        temp_client = GoogleBusinessClient.from_oauth_token(access_token)
+        accounts = temp_client.list_accounts()
+        if not accounts:
+            logger.warning("GBP account discovery returned no accounts for tenant=%s", tenant_id)
+            return
+
+        account_id = str(accounts[0].get("name", "")).strip()
+        locations = temp_client.list_locations(account_id) if account_id else []
+        if not locations:
+            logger.warning("GBP location discovery returned no locations for tenant=%s", tenant_id)
+            return
+
+        location_id = str(locations[0].get("name", "")).strip()
+        _save_google_business_connector(
+            repo,
+            tenant_id=tenant_id,
+            token_data=token_data,
+            account_label=account_label,
+            account_id=account_id,
+            location_id=location_id,
+        )
+        logger.info(
+            "GBP discovery backfill completed for tenant=%s account_id=%s location_id=%s",
+            tenant_id,
+            account_id,
+            location_id,
+        )
+    except Exception as exc:
+        logger.warning("GBP account/location backfill failed for tenant=%s: %s", tenant_id, exc)
 
 
 # ── In-memory state store (dev-only; use Redis in production) ─────────────────
@@ -224,6 +312,7 @@ async def google_connect(
 @router.get("/google/callback")
 async def google_callback(
     request: Request,
+    background_tasks: BackgroundTasks,
     code: str = Query(...),
     state: str = Query(...),
     settings: Settings = Depends(_settings),
@@ -271,44 +360,19 @@ async def google_callback(
     saved_platforms = []
 
     if "gbp" in platforms:
-        # Auto-discover account_id and location_id so tools/router.py can use them directly.
-        # GBP API returns resource names like "accounts/12345" and "accounts/12345/locations/67890".
-        gbp_account_id = ""
-        gbp_location_id = ""
-        try:
-            import asyncio
-            from ..google import GoogleBusinessClient
-            temp_client = GoogleBusinessClient.from_oauth_token(access_token)
-            loop = asyncio.get_event_loop()
-            accounts = await loop.run_in_executor(None, temp_client.list_accounts)
-            if accounts:
-                gbp_account_id = accounts[0].get("name", "")
-                locations = await loop.run_in_executor(
-                    None, lambda: temp_client.list_locations(gbp_account_id)
-                )
-                if locations:
-                    gbp_location_id = locations[0].get("name", "")
-        except Exception as exc:
-            logger.warning("GBP account/location auto-discovery failed: %s", exc)
-
-        gbp_credentials_json = json.dumps(
-            {
-                "access_token": access_token,
-                "refresh_token": token_data.get("refresh_token", ""),
-                "expires_in": token_data.get("expires_in", 3600),
-                "expires_at": int(time.time()) + int(token_data.get("expires_in", 3600)),
-                "scope": token_data.get("scope", ""),
-                "token_type": token_data.get("token_type", "Bearer"),
-                "account_id": gbp_account_id,
-                "location_id": gbp_location_id,
-            },
-            ensure_ascii=False,
-        )
-        repo.save_connector_account(
+        account_label = "Google Business Profile"
+        _save_google_business_connector(
+            repo,
             tenant_id=tenant_id,
-            platform="google_business",
-            credentials_json=gbp_credentials_json,
-            account_label="Google Business Profile",
+            token_data=token_data,
+            account_label=account_label,
+        )
+        background_tasks.add_task(
+            _backfill_google_business_connector,
+            repo,
+            tenant_id=tenant_id,
+            token_data=token_data,
+            account_label=account_label,
         )
         saved_platforms.append("google_business")
 
@@ -362,7 +426,6 @@ async def connector_status(
 _META_AUTH_URL = "https://www.facebook.com/dialog/oauth"
 _META_TOKEN_URL = "https://graph.facebook.com/v21.0/oauth/access_token"
 _META_SCOPES = [
-    "instagram_basic",
     "instagram_content_publish",
     "pages_manage_posts",
     "pages_read_engagement",
