@@ -62,7 +62,7 @@ curl -sf https://app.kachu.tw/health
 docker compose -f docker-compose.prod.yml exec kachu alembic current
 ```
 
-**預期**：顯示 `20260427_0001 (head)`  
+**預期**：顯示 `20260430_0002 (head)`  
 **失敗處理**：執行 `alembic upgrade head` 後重確認
 
 ---
@@ -175,7 +175,7 @@ curl -sf -o /dev/null -w "%{http_code}" \
 curl -sf -o /dev/null -w "%{http_code}" https://app.kachu.tw/dashboard
 ```
 
-**預期**：200 OK  
+**預期**：未帶 `Authorization: Bearer <ADMIN_SERVICE_TOKEN>` 時為 401；帶正確 Bearer token 時為 200 OK  
 **失敗處理**：查看 `dashboard_router` 相關 log
 
 ---
@@ -199,7 +199,7 @@ curl -sf -X POST https://app.kachu.tw/webhooks/line \
 ### T-14 — 無 signature 的 Google webhook 應被拒絕
 
 ```bash
-curl -sf -X POST https://app.kachu.tw/webhooks/google/reviews \
+curl -sf -X POST https://app.kachu.tw/webhooks/google/review \
   -H "Content-Type: application/json" \
   -d '{"test":"data"}'
 ```

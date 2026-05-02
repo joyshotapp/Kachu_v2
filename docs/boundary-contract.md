@@ -45,6 +45,7 @@ If one layer is missing, the feature is not complete.
 
 - `workflow_input.topic`
 - `workflow_input.trigger_source`
+- `workflow_input.selected_platforms`
 - `workflow_input.approval_timeout_seconds`
 - `workflow_input.require_direction_check`
 - `workflow_input.policy_generation_context`
