@@ -1,37 +1,44 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-OPENAI_EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
-OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+GEMINI_EMBEDDING_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-embedding-2:embedContent"
+)
+GEMINI_EMBEDDING_DIM = 1536
 
 
-async def get_embedding(text: str, api_key: str) -> list[float]:
-    """Return OpenAI embedding vector for *text* using text-embedding-3-small (dim 1536).
+async def get_embedding(text: str, api_key: str, *, is_query: bool = False) -> list[float]:
+    """Return Gemini Embedding 2 vector for *text* (dim 1536).
 
-    Returns an empty list when *api_key* is absent or any network/API error occurs.
-    The caller should treat an empty return as "no embedding available" and fall back
-    to keyword-based retrieval.
+    When is_query=True, formats text as a search query (asymmetric retrieval).
+    When is_query=False, formats text as a document to be indexed.
+    Returns an empty list on failure; callers fall back to keyword-based retrieval.
     """
     if not api_key or not text.strip():
         return []
+    if is_query:
+        formatted = f"task: search result | query: {text[:7900]}"
+    else:
+        formatted = f"title: none | text: {text[:7900]}"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
-                OPENAI_EMBEDDINGS_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
+                f"{GEMINI_EMBEDDING_URL}?key={api_key}",
+                json={
+                    "content": {"parts": [{"text": formatted}]},
+                    "outputDimensionality": GEMINI_EMBEDDING_DIM,
                 },
-                json={"input": text[:8000], "model": OPENAI_EMBEDDING_MODEL},
             )
             resp.raise_for_status()
             data = resp.json()
-            return data["data"][0]["embedding"]
+            return data["embedding"]["values"]
     except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
-        logger.warning("OpenAI embedding failed: %s", exc)
+        logger.warning("Gemini embedding failed: %s", exc)
         return []

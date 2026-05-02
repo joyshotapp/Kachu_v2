@@ -23,7 +23,7 @@ class MemoryManager:
 
     Layer 2 – Structured Memory:
         Categorised knowledge entries (``KnowledgeEntryTable``) enriched with
-        OpenAI text-embedding-3-small vectors for semantic retrieval.
+        Gemini Embedding 2 vectors for semantic retrieval.
 
     Layer 3 – Preference Memory:
         Boss edit diffs stored in ``KnowledgeEntryTable`` (category='preference').
@@ -60,8 +60,8 @@ class MemoryManager:
             source_type=source_type,
             source_id=source_id,
         )
-        if self._settings.OPENAI_API_KEY:
-            embedding = await get_embedding(content, self._settings.OPENAI_API_KEY)
+        if self._settings.GOOGLE_AI_API_KEY:
+            embedding = await get_embedding(content, self._settings.GOOGLE_AI_API_KEY, is_query=False)
             if embedding:
                 self._repo.update_knowledge_entry_embedding(entry.id, json.dumps(embedding))
 
@@ -71,17 +71,21 @@ class MemoryManager:
         tenant_id: str,
         query: str,
         top_k: int = 8,
+        categories: list[str] | None = None,
     ) -> list[dict]:
         """Semantic search over a tenant's knowledge base.
 
-        Falls back to returning all entries (up to *top_k*) when VoyageAI is
-        not configured or returns an empty embedding.
+        Falls back to returning all entries (up to *top_k*) when the embedding
+        service is not configured or returns an empty embedding.
         """
-        all_entries = self._repo.get_knowledge_entries(tenant_id)
+        all_entries = self._repo.get_active_knowledge_entries(
+            tenant_id,
+            categories=categories,
+        )
         if not all_entries:
             return []
 
-        query_embedding = await get_embedding(query, self._settings.OPENAI_API_KEY)
+        query_embedding = await get_embedding(query, self._settings.GOOGLE_AI_API_KEY, is_query=True)
 
         entry_dicts: list[dict] = []
         for e in all_entries:

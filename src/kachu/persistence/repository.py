@@ -211,6 +211,28 @@ class KachuRepository:
                 stmt = stmt.where(KnowledgeEntryTable.category == category)
             return list(session.exec(stmt).all())
 
+    def get_active_knowledge_entries(
+        self,
+        tenant_id: str,
+        *,
+        categories: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[KnowledgeEntryTable]:
+        with Session(self._engine) as session:
+            stmt = (
+                select(KnowledgeEntryTable)
+                .where(KnowledgeEntryTable.tenant_id == tenant_id)
+                .where(KnowledgeEntryTable.status == "active")
+                .order_by(KnowledgeEntryTable.updated_at.desc())
+            )
+            if categories:
+                from sqlalchemy import or_
+
+                stmt = stmt.where(or_(*(KnowledgeEntryTable.category == category for category in categories)))
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            return list(session.exec(stmt).all())
+
     # ── Conversation ──────────────────────────────────────────────────────────
 
     def save_conversation(

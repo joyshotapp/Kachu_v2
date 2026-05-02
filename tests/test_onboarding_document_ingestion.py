@@ -149,6 +149,45 @@ async def test_audio_returns_manual_review_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_knowledge_capture_derives_structured_facts_from_high_signal_document() -> None:
+    from sqlmodel import SQLModel, create_engine
+
+    from kachu.knowledge_capture import KnowledgeCaptureService
+    from kachu.persistence.repository import KachuRepository
+
+    engine = create_engine("sqlite:///:memory:")
+    SQLModel.metadata.create_all(engine)
+    repo = KachuRepository(engine)
+    settings = Settings(DATABASE_URL="sqlite://", GOOGLE_AI_API_KEY="", LLAMAPARSE_API_KEY="")
+    service = KnowledgeCaptureService(repo, settings)
+
+    await service.capture_knowledge_text(
+        tenant_id="t1",
+        content=(
+            "【圖片分析】這是一張四時循養堂疏通飲的產品宣傳圖片。\n"
+            "品項/內容：{'name': '疏通飲', 'description': '漢方濃縮・日常調理・支援行動力'}、{'name': '首購體驗', 'price': '0元'}\n"
+            "電話：02-1234-5678\n"
+            "LINE：@kachu\n"
+            "品牌語氣：溫暖、專業、少官腔\n"
+            "注意事項：避免直接宣稱療效"
+        ),
+        source_type="image_parsed",
+    )
+
+    product_entries = repo.get_knowledge_entries("t1", category="product")
+    contact_entries = repo.get_knowledge_entries("t1", category="contact")
+    style_entries = repo.get_knowledge_entries("t1", category="style")
+    offer_entries = repo.get_knowledge_entries("t1", category="offer")
+    restriction_entries = repo.get_knowledge_entries("t1", category="restriction")
+
+    assert any("疏通飲" in entry.content for entry in product_entries)
+    assert any("02-1234-5678" in entry.content or "@kachu" in entry.content for entry in contact_entries)
+    assert any("溫暖" in entry.content for entry in style_entries)
+    assert any("首購體驗" in entry.content and "0元" in entry.content for entry in offer_entries)
+    assert any("避免直接宣稱療效" in entry.content for entry in restriction_entries)
+
+
+@pytest.mark.asyncio
 async def test_parse_file_polls_until_llamaparse_result_ready(monkeypatch) -> None:
     from kachu import document_parser
 

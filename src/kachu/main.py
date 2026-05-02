@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import logging
 import pathlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 from fastapi.responses import FileResponse
 
 from .agentOS_client import AgentOSClient
@@ -50,7 +56,13 @@ def create_app(settings: Settings | None = None, _engine=None) -> FastAPI:
     # Phase 4: adaptive execution policy
     policy_resolver = KachuExecutionPolicyResolver(repository)
     intent_router = IntentRouter(agentOS_client, repository, settings, policy_resolver)
-    onboarding_flow = OnboardingFlow(repository, settings, intent_router)
+    onboarding_flow = OnboardingFlow(
+        repository,
+        settings,
+        intent_router,
+        memory_manager=memory_manager,
+        context_brief_manager=context_brief_manager,
+    )
     # Phase 5: pass memory to scheduler for content calendar
     scheduler = KachuScheduler(agentOS_client, repository, settings, memory_manager, policy_resolver)
 

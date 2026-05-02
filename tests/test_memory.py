@@ -129,7 +129,7 @@ def test_diff_notes_opening_changed() -> None:
 def memory_manager_with_mock_repo() -> tuple[MemoryManager, MagicMock]:
     mock_repo = MagicMock()
     mock_settings = MagicMock()
-    mock_settings.OPENAI_API_KEY = ""  # No real API key → no embeddings
+    mock_settings.GOOGLE_AI_API_KEY = ""  # No real API key → no embeddings
     manager = MemoryManager(repo=mock_repo, settings=mock_settings)
     return manager, mock_repo
 
@@ -208,7 +208,7 @@ def test_get_recent_episodes_formatted(memory_manager_with_mock_repo) -> None:
 
 @pytest.mark.asyncio
 async def test_retrieve_relevant_knowledge_no_api_key(memory_manager_with_mock_repo) -> None:
-    """Without voyage_api_key, returns all entries with score 0 (keyword fallback)."""
+    """Without a Google embedding key, returns all entries with score 0."""
     manager, mock_repo = memory_manager_with_mock_repo
 
     from kachu.persistence.tables import KnowledgeEntryTable
@@ -216,7 +216,7 @@ async def test_retrieve_relevant_knowledge_no_api_key(memory_manager_with_mock_r
         MagicMock(spec=KnowledgeEntryTable, id="k1", category="core_value", content="誠信", embedding=None),
         MagicMock(spec=KnowledgeEntryTable, id="k2", category="goal", content="增加客流", embedding=None),
     ]
-    mock_repo.get_knowledge_entries.return_value = mock_entries
+    mock_repo.get_active_knowledge_entries.return_value = mock_entries
 
     results = await manager.retrieve_relevant_knowledge(tenant_id="t1", query="誠信服務")
     assert len(results) == 2
@@ -227,7 +227,7 @@ async def test_retrieve_relevant_knowledge_no_api_key(memory_manager_with_mock_r
 async def test_retrieve_relevant_knowledge_with_embeddings(memory_manager_with_mock_repo) -> None:
     """With stored embeddings, semantic ranking is applied."""
     manager, mock_repo = memory_manager_with_mock_repo
-    manager._settings.OPENAI_API_KEY = "fake-key"
+    manager._settings.GOOGLE_AI_API_KEY = "fake-key"
 
     from kachu.persistence.tables import KnowledgeEntryTable
     mock_entries = [
@@ -242,7 +242,7 @@ async def test_retrieve_relevant_knowledge_with_embeddings(memory_manager_with_m
             embedding=json.dumps([0.0, 1.0]),
         ),
     ]
-    mock_repo.get_knowledge_entries.return_value = mock_entries
+    mock_repo.get_active_knowledge_entries.return_value = mock_entries
 
     # Mock get_embedding to return a vector similar to k1
     with patch("kachu.memory.manager.get_embedding", new=AsyncMock(return_value=[1.0, 0.0])):
@@ -279,7 +279,7 @@ def test_edit_session_lifecycle() -> None:
         ig_draft="IG 原版",
         google_draft="Google 原版",
     )
-    assert s.step == "waiting_ig"
+    assert s.step == "waiting_feedback"
 
     # get_active returns it
     active = repo.get_active_edit_session("tenant-edit")

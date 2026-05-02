@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -8,7 +9,9 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
 from kachu.config import Settings
+from kachu.context_brief_manager import ContextBriefManager
 from kachu.main import create_app
+from kachu.memory import MemoryManager
 from kachu.onboarding.flow import OnboardingFlow
 from kachu.persistence import KachuRepository, create_db_engine, init_db
 
@@ -30,8 +33,25 @@ def intent_router() -> AsyncMock:
 
 
 @pytest.fixture()
-def flow(repo: KachuRepository, intent_router: AsyncMock) -> OnboardingFlow:
-    return OnboardingFlow(repo, intent_router=intent_router)
+def settings() -> Settings:
+    return Settings(
+        APP_ENV="test",
+        DATABASE_URL="sqlite://",
+        KACHU_BASE_URL="https://app.kachu.tw",
+    )
+
+
+@pytest.fixture()
+def flow(repo: KachuRepository, intent_router: AsyncMock, settings: Settings) -> OnboardingFlow:
+    memory = MemoryManager(repo, settings)
+    brief_manager = ContextBriefManager(repo, memory)
+    return OnboardingFlow(
+        repo,
+        settings=settings,
+        intent_router=intent_router,
+        memory_manager=memory,
+        context_brief_manager=brief_manager,
+    )
 
 
 TENANT = "U_boss_test_001"
@@ -118,6 +138,7 @@ async def test_awaiting_docs_image_upload(
 
     msgs = await flow.handle_message(TENANT, "image", "msg_id_001")
     assert "收到" in msgs[0]["text"]
+    assert any("我目前已先吸收這些資訊" in message["text"] for message in msgs)
 
     # Check knowledge entry saved
     entries = repo.get_knowledge_entries(TENANT, category="document")
@@ -148,9 +169,26 @@ async def test_full_interview_creates_knowledge_entries(
     await flow.handle_message(TENANT, "text", "跳過")
     await flow.handle_message(TENANT, "text", "我們用祖傳秘方，別家沒有")
     await flow.handle_message(TENANT, "text", "客人太少，不知道怎麼宣傳")
+    repo.save_connector_account(
+        tenant_id=TENANT,
+        platform="meta",
+        credentials_json=json.dumps(
+            {
+                "access_token": "meta-token",
+                "fb_page_id": "fb-page-001",
+                "fb_page_name": "小王美食粉專",
+                "ig_user_id": "",
+            }
+        ),
+        account_label="Meta (小王美食粉專)",
+    )
 
     msgs = await flow.handle_message(TENANT, "text", "今年想開第二家店")
-    assert "太好了" in msgs[0]["text"] or "了解" in msgs[0]["text"] or "照片" in msgs[0]["text"]
+    assert len(msgs) == 3
+    assert "我目前已先吸收這些資訊" in msgs[0]["text"]
+    assert "目前渠道狀態" in msgs[1]["text"]
+    assert "Facebook：已可用" in msgs[1]["text"]
+    assert "太好了" in msgs[2]["text"] or "了解" in msgs[2]["text"] or "照片" in msgs[2]["text"]
 
     # Verify knowledge entries
     core = repo.get_knowledge_entries(TENANT, category="core_value")
@@ -166,6 +204,9 @@ async def test_full_interview_creates_knowledge_entries(
     assert "第二家" in goal[0].content
     assert len(basic) == 1
     assert "小王美食" in basic[0].content
+    brand_brief = repo.get_shared_context(TENANT, "brand_brief")
+    assert brand_brief is not None
+    assert brand_brief["brand_name"] == "小王美食"
     assert intent_router.dispatch.await_count == 3
 
     topics = [

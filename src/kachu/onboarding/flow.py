@@ -3,9 +3,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from ..knowledge_capture import KnowledgeCaptureService
 from ..persistence import KachuRepository
 
 if TYPE_CHECKING:
+    from ..context_brief_manager import ContextBriefManager
+    from ..memory import MemoryManager
     from ..config import Settings
     from ..intent_router import IntentRouter
 
@@ -43,13 +46,45 @@ _BOT_MESSAGES: dict[str, str] = {
     "interview_q2": "很棒！\n\n第 2 題：\n你現在最大的困擾是什麼？",
     "interview_q3": "了解 🙏\n\n第 3 題：\n今年你最想做的一件事是什麼？",
     "completed": (
-        "🎉 太好了！我已經了解你的生意了。\n\n"
-        "接下來我會先幫你準備 3 篇可直接審稿的 Google 草稿，你只需要確認。\n\n"
-        "試試看，傳一張你想發布的照片給我 📸"
+        "🎉 太好了！我已經更了解你的生意了。\n\n"
+        "接下來我會根據目前已就緒的渠道，陪你開始第一個任務。\n\n"
+        "如果平台已接好，直接傳一張你想發布的照片給我 📸"
     ),
 }
 
 _SKIP_KEYWORDS = {"完成", "好了", "done", "跳過", "skip", "next"}
+
+# Keywords that indicate the user wants to re-answer a previous question.
+# Intentionally conservative to avoid false positives on real answers.
+_REDO_KEYWORDS = ("重新回答", "重來", "上一題", "回到上一")
+
+# Maps each interview step to its saved knowledge category, used for cleanup on redo.
+_STEP_CATEGORY: dict[str, str] = {
+    "interview_q1": "core_value",
+    "interview_q2": "pain_point",
+}
+
+# Maps each step to the previous step for generic "go back" redo.
+_PREV_STEP: dict[str, str] = {
+    "interview_q2": "interview_q1",
+    "interview_q3": "interview_q2",
+}
+
+
+def _detect_redo_step(content: str, current_step: str) -> str | None:
+    """Return the step to roll back to if *content* is a redo request, else None."""
+    c = content.strip()
+    # Explicit question references take priority
+    if "第一題" in c:
+        return "interview_q1"
+    if "第二題" in c and current_step == "interview_q3":
+        return "interview_q2"
+    # Generic redo keywords → go back one step
+    if any(kw in c for kw in _REDO_KEYWORDS):
+        return _PREV_STEP.get(current_step)
+    return None
+
+
 _ONBOARDING_AHA_TOPIC_TEMPLATES = (
     "認識{brand}：第一次來店前最值得知道的亮點",
     "為什麼大家會選擇{brand}：主打特色與推薦理由",
@@ -76,10 +111,20 @@ class OnboardingFlow:
         repo: KachuRepository,
         settings: "Settings | None" = None,
         intent_router: "IntentRouter | None" = None,
+        memory_manager: "MemoryManager | None" = None,
+        context_brief_manager: "ContextBriefManager | None" = None,
     ) -> None:
         self._repo = repo
         self._settings = settings
         self._intent_router = intent_router
+        self._memory = memory_manager
+        self._context_brief_manager = context_brief_manager
+        self._knowledge_capture = KnowledgeCaptureService(
+            repo,
+            settings,
+            memory_manager=memory_manager,
+            context_brief_manager=context_brief_manager,
+        )
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -178,60 +223,25 @@ class OnboardingFlow:
             return [_text(_BOT_MESSAGES["interview_q1"])]
 
         if msg_type in ("image", "file", "video", "audio"):
-            if self._settings is not None and (content_bytes or msg_type == "audio"):
-                # Real parsing pipeline
-                from ..document_parser import parse_document
-                result = await parse_document(
-                    msg_type=msg_type,
-                    content_bytes=content_bytes,
-                    content_text=None,
-                    mime_type=mime_type,
-                    settings=self._settings,
-                )
-                if result.needs_manual:
-                    logger.warning(
-                        "Document parse needs_manual: tenant=%s type=%s error=%s",
-                        tenant_id, msg_type, result.error,
-                    )
-                    return [
-                        _text(
-                            "⚠️ 已收到，但這份檔案暫時無法自動解析。\n"
-                            "我已記錄下來，建議之後手動整理後再傳一次 📂"
-                        )
-                    ]
-
-                # Store parsed content as knowledge entry
-                self._repo.save_knowledge_entry(
-                    tenant_id=tenant_id,
-                    category="document",
-                    content=result.text,
-                    source_type=result.source_type,
-                    source_id=content,
-                )
-                logger.info(
-                    "Document parsed and stored: tenant=%s source=%s confidence=%.2f",
-                    tenant_id, result.source_type, result.confidence,
-                )
-            else:
-                # Fallback: no settings or no bytes — store placeholder
-                self._repo.save_knowledge_entry(
-                    tenant_id=tenant_id,
-                    category="document",
-                    content=f"[{msg_type} uploaded, message_id={content}]",
-                    source_type="document",
-                    source_id=content,
-                )
-            return [_text(_BOT_MESSAGES["doc_received"])]
+            return await self._knowledge_capture.capture_document_input(
+                tenant_id=tenant_id,
+                msg_type=msg_type,
+                content=content,
+                content_bytes=content_bytes,
+                mime_type=mime_type,
+                ack_text=_BOT_MESSAGES["doc_received"],
+            )
 
         # Text while awaiting docs — treat as additional knowledge
         if msg_type == "text" and content.strip():
-            self._repo.save_knowledge_entry(
+            return await self._knowledge_capture.capture_document_input(
                 tenant_id=tenant_id,
-                category="document",
-                content=content.strip(),
-                source_type="text",
+                msg_type=msg_type,
+                content=content,
+                content_bytes=content_bytes,
+                mime_type=mime_type,
+                ack_text=_BOT_MESSAGES["doc_received"],
             )
-            return [_text(_BOT_MESSAGES["doc_received"])]
 
         return [_text(_BOT_MESSAGES["awaiting_docs"])]
 
@@ -241,7 +251,7 @@ class OnboardingFlow:
         self._repo.save_conversation(
             tenant_id=tenant_id, role="boss", content=content, conversation_type="onboarding"
         )
-        self._repo.save_knowledge_entry(
+        await self._store_knowledge(
             tenant_id=tenant_id,
             category="core_value",
             content=content.strip(),
@@ -253,10 +263,17 @@ class OnboardingFlow:
     async def _handle_interview_q2(
         self, tenant_id: str, content: str
     ) -> list[dict[str, Any]]:
+        redo_step = _detect_redo_step(content, current_step="interview_q2")
+        if redo_step:
+            # Delete previously saved core_value entries and roll back
+            for entry in self._repo.get_knowledge_entries(tenant_id, category=_STEP_CATEGORY.get(redo_step, "")):
+                self._repo.delete_knowledge_entry(entry.id)
+            self._repo.update_onboarding_state(tenant_id, redo_step)
+            return [_text("沒問題！讓我們重新來 ✍️\n\n" + _BOT_MESSAGES[redo_step])]
         self._repo.save_conversation(
             tenant_id=tenant_id, role="boss", content=content, conversation_type="onboarding"
         )
-        self._repo.save_knowledge_entry(
+        await self._store_knowledge(
             tenant_id=tenant_id,
             category="pain_point",
             content=content.strip(),
@@ -268,10 +285,18 @@ class OnboardingFlow:
     async def _handle_interview_q3(
         self, tenant_id: str, content: str
     ) -> list[dict[str, Any]]:
+        redo_step = _detect_redo_step(content, current_step="interview_q3")
+        if redo_step:
+            # Delete previously saved knowledge for the target step and beyond
+            for category in [_STEP_CATEGORY[s] for s in ("interview_q1", "interview_q2") if _STEP_CATEGORY.get(s) and (redo_step == "interview_q1" or s == "interview_q2")]:
+                for entry in self._repo.get_knowledge_entries(tenant_id, category=category):
+                    self._repo.delete_knowledge_entry(entry.id)
+            self._repo.update_onboarding_state(tenant_id, redo_step)
+            return [_text("沒問題！讓我們重新來 ✍️\n\n" + _BOT_MESSAGES[redo_step])]
         self._repo.save_conversation(
             tenant_id=tenant_id, role="boss", content=content, conversation_type="onboarding"
         )
-        self._repo.save_knowledge_entry(
+        await self._store_knowledge(
             tenant_id=tenant_id,
             category="goal",
             content=content.strip(),
@@ -283,7 +308,7 @@ class OnboardingFlow:
         basic_info = (
             f"店名：{tenant.name}，行業：{tenant.industry_type}，地址：{tenant.address}"
         )
-        self._repo.save_knowledge_entry(
+        await self._store_knowledge(
             tenant_id=tenant_id,
             category="basic_info",
             content=basic_info,
@@ -291,8 +316,70 @@ class OnboardingFlow:
         )
 
         self._repo.update_onboarding_state(tenant_id, "completed")
+        if self._context_brief_manager is not None:
+            try:
+                await self._context_brief_manager.refresh_briefs(
+                    tenant_id,
+                    reason="onboarding_completed",
+                )
+            except Exception as exc:
+                logger.warning("brief refresh failed after onboarding completion: %s", exc)
         await self._dispatch_onboarding_aha(tenant_id, tenant.name, tenant.industry_type)
-        return [_text(_BOT_MESSAGES["completed"])]
+        absorption = self._knowledge_capture.build_absorption_summary_text(tenant_id)
+        messages = []
+        if absorption:
+            messages.append(_text(absorption))
+        readiness = self._build_readiness_summary_text(tenant_id)
+        if readiness:
+            messages.append(_text(readiness))
+        messages.append(_text(_BOT_MESSAGES["completed"]))
+        return messages
+
+    async def _store_knowledge(
+        self,
+        *,
+        tenant_id: str,
+        category: str,
+        content: str,
+        source_type: str,
+        source_id: str | None = None,
+    ) -> None:
+        if self._memory is not None:
+            await self._memory.store_knowledge(
+                tenant_id=tenant_id,
+                category=category,
+                content=content,
+                source_type=source_type,
+                source_id=source_id,
+            )
+            return
+        self._repo.save_knowledge_entry(
+            tenant_id=tenant_id,
+            category=category,
+            content=content,
+            source_type=source_type,
+            source_id=source_id,
+        )
+
+    def _build_doc_absorption_messages(self, tenant_id: str) -> list[dict[str, Any]]:
+        return self._knowledge_capture.build_absorption_messages(
+            tenant_id,
+            ack_text=_BOT_MESSAGES["doc_received"],
+        )
+
+    def _build_absorption_summary_text(self, tenant_id: str) -> str:
+        return self._knowledge_capture.build_absorption_summary_text(tenant_id)
+
+    def _build_readiness_summary_text(self, tenant_id: str) -> str:
+        if not hasattr(self._repo, "get_connector_account"):
+            return ""
+        try:
+            from ..auth.oauth import _build_phase0_readiness_lines
+
+            return "\n".join(_build_phase0_readiness_lines(self._repo, tenant_id))
+        except Exception as exc:
+            logger.warning("failed to build readiness summary for tenant=%s: %s", tenant_id, exc)
+            return ""
 
     async def _dispatch_onboarding_aha(
         self,
