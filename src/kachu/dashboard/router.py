@@ -219,6 +219,10 @@ def _automation_settings_to_dict(row: Any, tenant: Any) -> dict[str, Any]:
         "google_post_frequency": row.google_post_frequency,
         "google_post_weekday": row.google_post_weekday,
         "google_post_hour": row.google_post_hour,
+        "meta_post_enabled": row.meta_post_enabled,
+        "meta_post_frequency": row.meta_post_frequency,
+        "meta_post_weekday": row.meta_post_weekday,
+        "meta_post_hour": row.meta_post_hour,
         "proactive_enabled": row.proactive_enabled,
         "proactive_hour": row.proactive_hour,
         "content_calendar_enabled": row.content_calendar_enabled,
@@ -301,6 +305,10 @@ class AutomationSettingsUpdateRequest(BaseModel):
     google_post_frequency: str = "weekly"
     google_post_weekday: str = "thu"
     google_post_hour: int = 10
+    meta_post_enabled: bool = False
+    meta_post_frequency: str = "weekly"
+    meta_post_weekday: str = "fri"
+    meta_post_hour: int = 11
     proactive_enabled: bool = True
     proactive_hour: int = 7
     content_calendar_enabled: bool = True
@@ -406,6 +414,10 @@ def api_update_automation_settings(body: AutomationSettingsUpdateRequest, reques
         google_post_frequency=_normalize_frequency(body.google_post_frequency),
         google_post_weekday=_normalize_weekday(body.google_post_weekday, "thu"),
         google_post_hour=_normalize_hour(body.google_post_hour, 10),
+        meta_post_enabled=body.meta_post_enabled,
+        meta_post_frequency=_normalize_frequency(body.meta_post_frequency),
+        meta_post_weekday=_normalize_weekday(body.meta_post_weekday, "fri"),
+        meta_post_hour=_normalize_hour(body.meta_post_hour, 11),
         proactive_enabled=body.proactive_enabled,
         proactive_hour=_normalize_hour(body.proactive_hour, 7),
         content_calendar_enabled=body.content_calendar_enabled,

@@ -37,6 +37,7 @@ def _connect_meta_account(client: TestClient, tenant_id: str) -> None:
     creds = json.dumps(
         {
             "access_token": "meta-token",
+            "fb_access_token": "fb-page-token",
             "ig_user_id": "ig-user-123",
             "fb_page_id": "fb-page-456",
         }
@@ -124,6 +125,30 @@ def test_publish_content_ig_fb_text_only_falls_back_to_facebook(client: TestClie
     assert data["instagram"]["status"] == "skipped"
     assert data["facebook"]["status"] == "published"
     mock_fb_text.assert_awaited_once()
+
+
+def test_publish_content_ig_fb_uses_page_access_token_for_facebook(client: TestClient) -> None:
+    _connect_meta_account(client, "tenant-meta-page-token")
+
+    captured_tokens: list[str] = []
+
+    async def fake_post_fb_text(self, *, message: str) -> dict[str, str]:
+        captured_tokens.append(self._fb_token)
+        return {"fb_post_id": "fb-text-002"}
+
+    with patch("kachu.meta.client.MetaClient.post_fb_text", new=fake_post_fb_text):
+        resp = client.post(
+            "/tools/publish-content",
+            json={
+                "tenant_id": "tenant-meta-page-token",
+                "run_id": "run-meta-006",
+                "selected_platforms": ["ig_fb"],
+                "drafts": {"ig_fb": "Text only caption"},
+            },
+        )
+
+    assert resp.status_code == 200
+    assert captured_tokens == ["fb-page-token"]
 
 
 def test_publish_content_ig_fb_meta_failure_isolated(client: TestClient) -> None:

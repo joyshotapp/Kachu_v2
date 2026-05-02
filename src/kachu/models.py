@@ -11,12 +11,29 @@ from pydantic import BaseModel, Field
 
 class Intent(StrEnum):
     PHOTO_CONTENT = "photo_content"
+    BUSINESS_PROFILE_UPDATE = "business_profile_update"
     KNOWLEDGE_UPDATE = "knowledge_update"
     GOOGLE_POST = "google_post"
     GA4_REPORT = "ga4_report"
     REVIEW_REPLY = "review_reply"
+    META_INSIGHTS = "meta_insights"
     FAQ_QUERY = "faq_query"
     GENERAL_CHAT = "general_chat"
+
+
+class BossRouteMode(StrEnum):
+    CONSULT = "consult"
+    CLARIFY = "clarify"
+    EXECUTE = "execute"
+
+
+class BossRouteDecision(BaseModel):
+    mode: BossRouteMode = BossRouteMode.CONSULT
+    intent: Intent = Intent.GENERAL_CHAT
+    topic: str = ""
+    actions: list[dict[str, str]] = Field(default_factory=list)
+    clarify_question: str = ""
+    small_talk: bool = False
 
 
 # ── Approval ─────────────────────────────────────────────────────────────────
@@ -188,12 +205,25 @@ class ApplyKnowledgeUpdateRequest(BaseModel):
     diff: dict[str, Any]            # output of diff-knowledge
 
 
+class ParseBusinessProfileUpdateRequest(BaseModel):
+    tenant_id: str
+    boss_message: str
+    run_id: str = ""
+
+
+class ApplyBusinessProfileUpdateRequest(BaseModel):
+    tenant_id: str
+    run_id: str
+    update_request: dict[str, Any]
+
+
 # ── Phase 2: Google Post tool request models ─────────────────────────────────
 
 class GenerateGooglePostRequest(BaseModel):
     tenant_id: str
     topic: str = ""
     post_type: str = "STANDARD"    # STANDARD | EVENT | OFFER
+    selected_platforms: list[str] = Field(default_factory=lambda: ["google"])
     context: dict[str, Any] | None = None
     run_id: str = ""
 
@@ -201,8 +231,10 @@ class GenerateGooglePostRequest(BaseModel):
 class PublishGooglePostRequest(BaseModel):
     tenant_id: str
     run_id: str
-    post_text: str
+    post_text: str = ""
     post_type: str = "STANDARD"
+    selected_platforms: list[str] = Field(default_factory=lambda: ["google"])
+    drafts: dict[str, Any] | None = None
     call_to_action_url: str = ""
 
 
@@ -240,6 +272,96 @@ class SendGA4ReportRequest(BaseModel):
     tenant_id: str
     run_id: str
     insights: dict[str, Any]
+
+
+# ── Meta Insights & Comment Management ───────────────────────────────────────
+
+class GetFBPageInsightsRequest(BaseModel):
+    """Fetch FB Page-level Insights.  Requires ``read_insights`` scope."""
+    tenant_id: str
+    metric_names: list[str] = Field(default_factory=list)
+    period: str = "day"     # day | week | days_28 | month
+    since: str = ""         # ISO-8601 date, e.g. "2026-04-25"
+    until: str = ""         # ISO-8601 date, e.g. "2026-05-02"
+    run_id: str = ""
+
+
+class GetFBPostInsightsRequest(BaseModel):
+    """Fetch Insights for a specific FB Page post.  Requires ``read_insights`` scope."""
+    tenant_id: str
+    post_id: str
+    metric_names: list[str] = Field(default_factory=list)
+    run_id: str = ""
+
+
+class ListFBCommentsRequest(BaseModel):
+    """List comments on a FB post/photo.  Requires ``pages_manage_engagement`` scope."""
+    tenant_id: str
+    object_id: str          # FB post or photo ID
+    limit: int = 25
+    run_id: str = ""
+
+
+class ReplyFBCommentRequest(BaseModel):
+    """Reply to a FB comment as the Page.  Requires ``pages_manage_engagement`` scope."""
+    tenant_id: str
+    comment_id: str
+    message: str
+    run_id: str = ""
+
+
+class HideFBCommentRequest(BaseModel):
+    """Hide or unhide a FB comment.  Requires ``pages_manage_engagement`` scope."""
+    tenant_id: str
+    comment_id: str
+    is_hidden: bool = True
+    run_id: str = ""
+
+
+class ListIGCommentsRequest(BaseModel):
+    """List comments on an IG media.  Requires ``instagram_manage_comments`` scope."""
+    tenant_id: str
+    media_id: str           # IG media ID
+    limit: int = 25
+    run_id: str = ""
+
+
+class ReplyIGCommentRequest(BaseModel):
+    """Reply to an IG comment.  Requires ``instagram_manage_comments`` scope."""
+    tenant_id: str
+    comment_id: str
+    message: str
+    run_id: str = ""
+
+
+class HideIGCommentRequest(BaseModel):
+    """Hide or unhide an IG comment.  Requires ``instagram_manage_comments`` scope."""
+    tenant_id: str
+    comment_id: str
+    hide: bool = True
+    run_id: str = ""
+
+
+class FetchMetaInsightsRequest(BaseModel):
+    """On-demand FB Page + recent post insights requested from LINE."""
+    tenant_id: str
+    period: str = "week"         # "week" | "month"
+    run_id: str = ""
+
+
+class GenerateMetaInsightsSummaryRequest(BaseModel):
+    """Generate an LLM summary from raw Meta insights data."""
+    tenant_id: str
+    insights_json: str           # serialized raw insights dict
+    run_id: str = ""
+
+
+class SendMetaInsightsReportRequest(BaseModel):
+    """Push the insights report Flex message to the boss via LINE."""
+    tenant_id: str
+    summary: str
+    details_json: str = "[]"     # JSON array of {label, value} dicts
+    run_id: str = ""
 
 
 # ── LINE Postback ─────────────────────────────────────────────────────────────

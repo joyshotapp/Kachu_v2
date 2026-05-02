@@ -27,6 +27,7 @@ from .llm import generate_text
 logger = logging.getLogger(__name__)
 
 _INTENT_TO_WORKFLOW = {
+    "business_profile_update": "kachu_business_profile_update",
     "ga4_report": "kachu_ga4_report",
     "google_post": "kachu_google_post",
     "knowledge_update": "kachu_knowledge_update",
@@ -53,8 +54,8 @@ _DOMAIN_ACTIONS: dict[str, list[dict[str, str]]] = {
         {"label": "查看本週 GA4 報告", "intent": "ga4_report", "topic": ""},
     ],
     "operations": [
-        {"label": "更新產品或價格資訊", "intent": "knowledge_update", "topic": "價格更新"},
-        {"label": "查看待確認的任務", "intent": "ga4_report", "topic": ""},
+        {"label": "更新 Google 商家營業資訊", "intent": "business_profile_update", "topic": "營業資訊更新"},
+        {"label": "發一篇 Google 商家動態", "intent": "google_post", "topic": "營業狀態公告"},
     ],
 }
 

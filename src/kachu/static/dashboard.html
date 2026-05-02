@@ -816,6 +816,45 @@
           <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
             <div class="flex items-center justify-between">
               <div>
+                <div class="text-sm font-semibold text-slate-700">Meta 排程發文</div>
+                <div class="text-xs text-slate-400 mt-1">設定每週或每日自動起草 Facebook / Instagram 貼文。</div>
+              </div>
+              <label class="inline-flex items-center gap-2 text-sm text-slate-600">
+                <input type="checkbox" x-model="automationSettings.meta_post_enabled" class="rounded border-slate-300 text-emerald-600" />
+                啟用
+              </label>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">頻率</label>
+                <select x-model="automationSettings.meta_post_frequency" class="select w-full">
+                  <option value="off">關閉</option>
+                  <option value="daily">每日</option>
+                  <option value="weekly">每週</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">星期</label>
+                <select x-model="automationSettings.meta_post_weekday" class="select w-full" :disabled="automationSettings.meta_post_frequency !== 'weekly'">
+                  <option value="mon">週一</option>
+                  <option value="tue">週二</option>
+                  <option value="wed">週三</option>
+                  <option value="thu">週四</option>
+                  <option value="fri">週五</option>
+                  <option value="sat">週六</option>
+                  <option value="sun">週日</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">小時</label>
+                <input x-model.number="automationSettings.meta_post_hour" type="number" min="0" max="23" class="input" />
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+            <div class="flex items-center justify-between">
+              <div>
                 <div class="text-sm font-semibold text-slate-700">主動提醒與月曆</div>
                 <div class="text-xs text-slate-400 mt-1">控制每日 proactive nudge 與每月內容月曆生成。</div>
               </div>
@@ -884,6 +923,10 @@ function app() {
       google_post_frequency: 'weekly',
       google_post_weekday: 'thu',
       google_post_hour: 10,
+      meta_post_enabled: false,
+      meta_post_frequency: 'weekly',
+      meta_post_weekday: 'fri',
+      meta_post_hour: 11,
       proactive_enabled: true,
       proactive_hour: 7,
       content_calendar_enabled: true,

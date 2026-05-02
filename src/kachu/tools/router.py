@@ -6,18 +6,44 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import RedirectResponse, Response
 from sqlalchemy.exc import SQLAlchemyError
 
+from ..conversation_context import (
+    extract_document_contact_facts,
+    extract_document_offer_facts,
+    extract_document_product_facts,
+    extract_document_restriction_facts,
+    extract_document_style_facts,
+    is_valid_contact_fact,
+    is_valid_offer_fact,
+    is_valid_restriction_fact,
+    is_low_signal_document_text,
+    parse_basic_info_text,
+)
 from ..industry_playbook import build_industry_context
-from ..line.flex_builder import build_ga4_report_flex, build_google_post_flex, build_knowledge_update_flex, build_photo_content_flex, build_review_reply_flex
+from ..line.flex_builder import (
+    build_business_profile_update_flex,
+    build_comment_notify_flex,
+    build_ga4_report_flex,
+    build_google_post_flex,
+    build_knowledge_update_flex,
+    build_meta_post_flex,
+    build_meta_insights_flex,
+    build_photo_content_flex,
+    build_post_performance_flex,
+    build_review_reply_flex,
+)
 from ..line.push import push_line_messages, text_message
 from ..llm import analyze_image_bytes, analyze_image_url, generate_text
 from ..models import (
     AnalyzePhotoRequest,
     AnalyzeSentimentRequest,
+    ApplyBusinessProfileUpdateRequest,
     ApplyKnowledgeUpdateRequest,
     CheckDraftDirectionRequest,
     ClassifyMessageRequest,
@@ -31,14 +57,26 @@ from ..models import (
     GenerateRecommendationsRequest,
     GenerateResponseRequest,
     GenerateReviewReplyRequest,
+    GetFBPageInsightsRequest,
+    GetFBPostInsightsRequest,
+    HideFBCommentRequest,
+    HideIGCommentRequest,
+    ListFBCommentsRequest,
+    ListIGCommentsRequest,
     NotifyApprovalRequest,
+    ParseBusinessProfileUpdateRequest,
     ParseKnowledgeUpdateRequest,
     PostReviewReplyRequest,
     PublishContentRequest,
     PublishGooglePostRequest,
+    ReplyFBCommentRequest,
+    ReplyIGCommentRequest,
     RetrieveAnswerRequest,
     RetrieveContextRequest,
+    FetchMetaInsightsRequest,
+    GenerateMetaInsightsSummaryRequest,
     SendGA4ReportRequest,
+    SendMetaInsightsReportRequest,
     SendOrEscalateRequest,
 )
 from ..memory import MemoryManager
@@ -47,6 +85,38 @@ from ..persistence import KachuRepository
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tools", tags=["tools"])
+
+_BUSINESS_PROFILE_STATE_CONTEXT = "business_profile_state_override"
+
+
+def _dedupe_texts(items: list[str], *, limit: int | None = None) -> list[str]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for item in items:
+        cleaned = " ".join(str(item or "").split()).strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            results.append(cleaned)
+        if limit is not None and len(results) >= limit:
+            break
+    return results
+
+
+def _query_focus(query: str) -> str:
+    text = str(query or "")
+    if any(token in text for token in ("聯絡", "電話", "地址", "LINE", "IG", "預約", "怎麼去")):
+        return "contact"
+    if any(token in text for token in ("優惠", "活動", "折扣", "方案", "價格", "售價")):
+        return "offer"
+    if any(token in text for token in ("語氣", "口吻", "風格", "調性", "禁語", "避免", "注意事項")):
+        return "style"
+    if any(token in text for token in ("改善", "經營", "問題", "痛點", "目標", "流量", "知名度")):
+        return "operations"
+    if any(token in text for token in ("主打", "特色", "產品", "品項", "成分", "疏通飲")):
+        return "product"
+    if any(token in text for token in ("品牌", "定位", "核心價值")):
+        return "brand"
+    return "general"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -106,6 +176,26 @@ def _parse_llm_json(raw: str, *, operation: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RecoverableToolError(f"{operation} returned a non-object JSON payload")
     return payload
+
+
+def _get_photo_preview_source(repo: KachuRepository, run_id: str) -> str:
+    if not run_id:
+        return ""
+
+    record = repo.get_workflow_record_by_run_id(run_id)
+    if record is None or not record.trigger_payload:
+        return ""
+
+    try:
+        trigger_payload = json.loads(record.trigger_payload)
+    except json.JSONDecodeError:
+        return ""
+
+    return str(trigger_payload.get("photo_url", "")).strip()
+
+
+def _build_approval_photo_preview_url(base_url: str, run_id: str) -> str:
+    return f"{base_url.rstrip('/')}/tools/approval-photo/{quote(run_id)}"
 
 
 def _is_recoverable_external_api_error(exc: Exception, *, module_roots: set[str]) -> bool:
@@ -358,12 +448,13 @@ async def analyze_photo(body: AnalyzePhotoRequest, request: Request) -> dict[str
         )
 
     prompt = (
-        "你是一位專業社群媒體行銷人員。請分析這張照片並用繁體中文回覆：\n"
-        "1. 場景描述（50字內）\n"
-        "2. 主要物件（最多5個，逗號分隔）\n"
-        "3. 適合的社群標籤（最多6個，#開頭）\n"
-        "4. 照片品質評分（0.0-1.0）\n"
-        "請以 JSON 格式回覆，欄位名稱：scene_description, detected_objects(list), suggested_tags(list), quality_score"
+        "你是一位專業社群媒體行銷人員。老闆剛傳來這張照片，準備發社群貼文。請分析並用繁體中文回覆：\n"
+        "1. 照片主體與亮點（50字內，用【品牌主動分享】的視角描述，例如：我們今天推出的...、這是我們剛完成的...）\n"
+        "2. 推測老闆上傳意圖（從以下選一：新品上市/每日特餐/服務展示/環境展示/活動記錄/優惠促銷/日常分享）\n"
+        "3. 主要物件（最多5個，逗號分隔）\n"
+        "4. 適合的社群標籤（最多6個，#開頭）\n"
+        "5. 照片品質評分（0.0-1.0）\n"
+        "請以 JSON 格式回覆，欄位名稱：scene_description, upload_intent, detected_objects(list), suggested_tags(list), quality_score"
     )
     try:
         if body.photo_url.startswith("data:"):
@@ -425,40 +516,118 @@ async def retrieve_context(body: RetrieveContextRequest, request: Request) -> di
         top_k=12,
     )
 
-    # Also load all entries for structured fields (basic_info, style) which are
-    # always needed regardless of query relevance.
-    all_entries = repo.get_knowledge_entries(body.tenant_id)
+    # Also load active structured entries regardless of query relevance.
+    all_entries = repo.get_active_knowledge_entries(body.tenant_id)
 
     def _entries_of(cat: str) -> list[str]:
-        return [e.content for e in all_entries if e.category == cat]
+        values = [e.content for e in all_entries if e.category == cat]
+        if cat == "contact":
+            values = [value for value in values if is_valid_contact_fact(value)]
+        elif cat == "offer":
+            values = [value for value in values if is_valid_offer_fact(value)]
+        elif cat == "restriction":
+            values = [value for value in values if is_valid_restriction_fact(value)]
+        return values
 
     basic = _entries_of("basic_info")
     brand_name = brand_industry = brand_address = ""
     if basic:
-        for part in basic[0].split("\n"):
-            if part.startswith("店名："):
-                brand_name = part[3:]
-            elif part.startswith("行業："):
-                brand_industry = part[3:]
-            elif part.startswith("地址："):
-                brand_address = part[3:]
+        parsed_basic = parse_basic_info_text(basic[0])
+        brand_name = parsed_basic.get("brand_name", "")
+        brand_industry = parsed_basic.get("industry", "")
+        brand_address = parsed_basic.get("address", "")
+
+    consultant_brief = repo.get_shared_context(body.tenant_id, "consultant_brief") or {}
+    brand_brief = repo.get_shared_context(body.tenant_id, "brand_brief") or {}
+    owner_brief = repo.get_shared_context(body.tenant_id, "owner_brief") or {}
+    if (not brand_brief or not owner_brief) and _brief_manager(request) is not None:
+        try:
+            refreshed = await _brief_manager(request).refresh_briefs(
+                body.tenant_id,
+                reason="retrieve_context",
+            )
+            brand_brief = brand_brief or refreshed.get("brand_brief", {})
+            owner_brief = owner_brief or refreshed.get("owner_brief", {})
+        except Exception as exc:
+            logger.warning("brief refresh failed during retrieve_context: %s", exc)
+
+    if brand_brief:
+        brand_name = brand_name or brand_brief.get("brand_name", "")
+        brand_industry = brand_industry or brand_brief.get("industry", "")
+        brand_address = brand_address or brand_brief.get("address", "")
 
     if not brand_name:
         tenant = repo.get_or_create_tenant(body.tenant_id)
         brand_name = tenant.name
-        brand_industry = tenant.industry_type
-        brand_address = tenant.address
+        brand_industry = brand_industry or tenant.industry_type
+        brand_address = brand_address or tenant.address
 
     industry_context = build_industry_context(brand_industry)
-    style_entries = _entries_of("style")
+    document_entries = _entries_of("document")
+    style_entries = _dedupe_texts([
+        *(_entries_of("style")),
+        *[fact for doc in document_entries for fact in extract_document_style_facts(doc, max_items=2)],
+    ], limit=3)
+    contact_entries = _dedupe_texts([
+        *(_entries_of("contact")),
+        *[fact for doc in document_entries for fact in extract_document_contact_facts(doc, max_items=3)],
+        *( [f"地址：{brand_address}"] if brand_address else []),
+    ], limit=4)
+    offer_entries = _dedupe_texts([
+        *(_entries_of("offer")),
+        *[fact for doc in document_entries for fact in extract_document_offer_facts(doc, max_items=2)],
+    ], limit=4)
+    restriction_entries = _dedupe_texts([
+        *(_entries_of("restriction")),
+        *[fact for doc in document_entries for fact in extract_document_restriction_facts(doc, max_items=2)],
+    ], limit=4)
+
+    structured_facts = _dedupe_texts(
+        [
+            *(_entries_of("product")),
+            *[fact for doc in document_entries for fact in extract_document_product_facts(doc, max_items=2)],
+            *(_entries_of("core_value")),
+            *(_entries_of("pain_point")),
+            *(_entries_of("goal")),
+            *contact_entries,
+            *offer_entries,
+            *restriction_entries,
+        ],
+        limit=10,
+    )
+    operations_facts = _dedupe_texts([
+        *(_entries_of("pain_point")),
+        *(_entries_of("goal")),
+        *(_entries_of("core_value")),
+    ], limit=6)
+    product_facts = _dedupe_texts([
+        *(_entries_of("product")),
+        *[fact for doc in document_entries for fact in extract_document_product_facts(doc, max_items=2)],
+    ], limit=6)
+    style_facts = _dedupe_texts([*style_entries, *restriction_entries], limit=6)
 
     # Collect semantically relevant facts (top ranked, non-structural categories)
-    structural_cats = {"basic_info", "style"}
-    relevant_facts = [
+    structural_cats = {"basic_info", "style", "contact", "offer", "restriction"}
+    semantic_facts = [
         e["content"]
         for e in ranked
         if e["category"] not in structural_cats
-    ][:6]
+        and not (e["category"] == "document" and is_low_signal_document_text(e["content"]))
+    ]
+    focus = _query_focus(body.query)
+    if focus == "operations":
+        fact_pool = [*operations_facts, *semantic_facts, *product_facts]
+    elif focus == "contact":
+        fact_pool = [*contact_entries, *structured_facts, *semantic_facts]
+    elif focus == "offer":
+        fact_pool = [*offer_entries, *product_facts, *semantic_facts]
+    elif focus == "style":
+        fact_pool = [*style_facts, *semantic_facts, *structured_facts]
+    elif focus in {"product", "brand"}:
+        fact_pool = [*product_facts, *offer_entries, *structured_facts, *semantic_facts]
+    else:
+        fact_pool = [*semantic_facts, *structured_facts, *contact_entries, *style_facts]
+    relevant_facts = _dedupe_texts(fact_pool, limit=6)
 
     # Collect preference hints (recent boss edit examples, per platform)
     ig_pref_hints = memory.get_preference_examples(body.tenant_id, "ig_fb", limit=2)
@@ -482,29 +651,18 @@ async def retrieve_context(body: RetrieveContextRequest, request: Request) -> di
         from datetime import datetime, timezone as _tz
         week_idx = min((datetime.now(_tz.utc).day - 1) // 7, len(calendar_ctx["weeks"]) - 1)
         shared_context_hints["calendar_topic"] = calendar_ctx["weeks"][week_idx].get("topic", "")
-    consultant_brief = repo.get_shared_context(body.tenant_id, "consultant_brief") or {}
-    brand_brief = repo.get_shared_context(body.tenant_id, "brand_brief") or {}
-    owner_brief = repo.get_shared_context(body.tenant_id, "owner_brief") or {}
-    if (not brand_brief or not owner_brief) and _brief_manager(request) is not None:
-        try:
-            refreshed = await _brief_manager(request).refresh_briefs(
-                body.tenant_id,
-                reason="retrieve_context",
-            )
-            brand_brief = brand_brief or refreshed.get("brand_brief", {})
-            owner_brief = owner_brief or refreshed.get("owner_brief", {})
-        except Exception as exc:
-            logger.warning("brief refresh failed during retrieve_context: %s", exc)
-
     return {
         "brand_name": brand_name or "（未設定）",
         "brand_industry": brand_industry,
         "brand_address": brand_address,
-        "brand_tone": style_entries[0] if style_entries else industry_context["recommended_tone"],
+        "brand_tone": style_entries[0] if style_entries else brand_brief.get("tone", industry_context["recommended_tone"]),
         "core_values": _entries_of("core_value"),
         "pain_points": _entries_of("pain_point"),
         "goals": _entries_of("goal"),
-        "relevant_facts": relevant_facts or [e.content for e in all_entries if e.category in ("product", "contact")],
+        "contact_points": contact_entries,
+        "offer_facts": offer_entries,
+        "restrictions": restriction_entries,
+        "relevant_facts": relevant_facts or _dedupe_texts([e.content for e in all_entries if e.category in ("product", "contact", "offer", "restriction")], limit=6),
         "preference_hints": {"ig_fb": ig_pref_hints, "google": google_pref_hints},
         "episode_hints": episode_hints,
         "shared_context_hints": shared_context_hints,
@@ -590,6 +748,7 @@ async def generate_drafts(body: GenerateDraftsRequest, request: Request) -> dict
     owner_brief = context.get("owner_brief", {})
     consultant_brief = context.get("consultant_brief", {})
     scene = analysis.get("scene_description", "")
+    upload_intent = analysis.get("upload_intent", "日常分享")
     tags = analysis.get("suggested_tags", [])
 
     core_values_str = "、".join(core_values) if core_values else "尚未設定"
@@ -597,18 +756,26 @@ async def generate_drafts(body: GenerateDraftsRequest, request: Request) -> dict
     address_hint = f"📍 {brand_address}" if brand_address else ""
 
     system_prompt = (
-        f"你是 {brand_name or '這家店'} 的社群媒體小編，風格「{brand_tone}」。\n"
+        f"你代表【{brand_name or '這家店'}】在社群媒體發文，用第一人稱品牌視角撰寫，風格「{brand_tone}」。\n"
         f"品牌核心價值：{core_values_str}\n"
-        "請用繁體中文撰寫貼文，語氣自然，適度行銷。\n"
+        "寫作原則：\n"
+        "- 以品牌主人的口吻直接分享（我們、本店、歡迎），不要用旁觀者描述照片的語氣\n"
+        "- 禁止出現「看著這張照片」、「照片中的」、「圖片裡」等轉述語\n"
+        "- 語氣自然真誠，適度行銷\n"
+        "請用繁體中文撰寫。\n"
     )
     ig_prompt = (
-        f"請以下列場景資訊，撰寫一篇 IG/FB 貼文（200字以內）：\n"
-        f"場景描述：{scene}\n建議標籤：{tags_str}\n{address_hint}\n\n"
-        "要求：第一行寫吸引人的標題（可用 emoji），內容自然真誠，結尾附上 2-4 個 hashtag"
+        f"老闆上傳了一張照片要發社群貼文，目的是：{upload_intent}。\n"
+        f"照片主體：{scene}\n"
+        f"建議標籤：{tags_str}\n{address_hint}\n\n"
+        "請以品牌主人的角度，撰寫一篇 IG/FB 貼文（200字以內）。\n"
+        "要求：第一行寫吸引人的標題（可用 emoji），以第一人稱品牌聲音分享，結尾附上 2-4 個 hashtag"
     )
     google_prompt = (
-        f"請以下列場景資訊，撰寫一篇 Google 商家貼文（150字以內，商業風格，不用 emoji）：\n"
-        f"場景描述：{scene}\n品牌：{brand_name}，地址：{brand_address}"
+        f"老闆上傳了一張照片要發 Google 商家動態，目的是：{upload_intent}。\n"
+        f"照片主體：{scene}\n"
+        f"品牌：{brand_name}，地址：{brand_address}\n\n"
+        "請以品牌名義撰寫一篇 Google 商家貼文（150字以內，商業風格，不用 emoji，直接介紹/宣傳，不描述照片）"
     )
     industry_angles = "、".join(industry_context.get("content_angles", []))
     market_watchpoints = "、".join(industry_context.get("market_watchpoints", []))
@@ -628,6 +795,11 @@ async def generate_drafts(body: GenerateDraftsRequest, request: Request) -> dict
     if brand_brief:
         ig_prompt += f"\n【品牌摘要】{brand_brief.get('summary', '')}"
         google_prompt += f"\n【品牌摘要】{brand_brief.get('summary', '')}"
+        document_highlights = brand_brief.get("document_highlights", [])
+        if document_highlights:
+            document_hint = "；".join(str(item)[:120] for item in document_highlights[:2])
+            ig_prompt += f"\n【品牌資料摘要】{document_hint}"
+            google_prompt += f"\n【品牌資料摘要】{document_hint}"
     if owner_brief:
         owner_focus = "、".join(owner_brief.get("current_priorities", [])[:2])
         if owner_focus:
@@ -726,11 +898,20 @@ async def notify_approval(body: NotifyApprovalRequest, request: Request) -> dict
 
     # Store pending approval in DB
     expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+    # For photo_content workflows, include image_url so publish-content can post a photo
+    draft_content: dict[str, Any] = dict(body.drafts)
+    if body.workflow in ("kachu_photo_content", "photo_content") and body.run_id and not draft_content.get("image_url"):
+        # The local workflow record may not exist yet when AgentOS first asks for approval.
+        # Persist the stable preview URL now so later scheduled publishes still have an image.
+        draft_content["image_url"] = _build_approval_photo_preview_url(
+            settings.KACHU_BASE_URL,
+            body.run_id,
+        )
     approval_record = repo.create_pending_approval(
         tenant_id=body.tenant_id,
         agentos_run_id=body.run_id,
         workflow_type=body.workflow,
-        draft_content=body.drafts,
+        draft_content=draft_content,
         expires_at=expires_at,
     )
     repo.save_audit_event(
@@ -754,6 +935,14 @@ async def notify_approval(body: NotifyApprovalRequest, request: Request) -> dict
             quiet_hours_end=tenant.quiet_hours_end,
         ):
             try:
+                photo_preview_url = ""
+                if body.workflow in ("kachu_photo_content", "photo_content"):
+                    photo_source = _get_photo_preview_source(repo, body.run_id)
+                    if photo_source:
+                        photo_preview_url = _build_approval_photo_preview_url(
+                            settings.KACHU_BASE_URL,
+                            body.run_id,
+                        )
                 await _push_flex_to_boss(
                     run_id=body.run_id,
                     tenant_id=body.tenant_id,
@@ -761,6 +950,7 @@ async def notify_approval(body: NotifyApprovalRequest, request: Request) -> dict
                     drafts=body.drafts,
                     boss_user_id=boss_user_id,
                     channel_access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+                    photo_preview_url=photo_preview_url,
                 )
                 repo.record_push(
                     tenant_id=body.tenant_id,
@@ -821,6 +1011,7 @@ async def _push_flex_to_boss(
     drafts: dict[str, Any],
     boss_user_id: str,
     channel_access_token: str,
+    photo_preview_url: str = "",
 ) -> None:
     import httpx
 
@@ -828,27 +1019,50 @@ async def _push_flex_to_boss(
         flex_content = build_photo_content_flex(run_id=run_id, tenant_id=tenant_id, drafts=drafts)
     elif workflow in ("kachu_review_reply", "review_reply"):
         review_text = drafts.get("review_content", "")
-        reply_text = drafts.get("reply_draft", "")
+        _reply_raw = drafts.get("reply_draft", "")
+        # generate-review-reply returns a dict {reply_draft, tone, confidence};
+        # handle both the nested-dict form and a plain string.
+        if isinstance(_reply_raw, dict):
+            reply_text = _reply_raw.get("reply_draft", "")
+        else:
+            reply_text = _reply_raw
         flex_content = build_review_reply_flex(
             run_id=run_id, tenant_id=tenant_id, review_content=review_text, reply_draft=reply_text
         )
     elif workflow in ("kachu_knowledge_update", "knowledge_update"):
         flex_content = build_knowledge_update_flex(run_id=run_id, tenant_id=tenant_id, drafts=drafts)
+    elif workflow in ("kachu_business_profile_update", "business_profile_update"):
+        flex_content = build_business_profile_update_flex(run_id=run_id, tenant_id=tenant_id, drafts=drafts)
     elif workflow in ("kachu_google_post", "google_post"):
-        post_text = drafts.get("post_text", "")
-        flex_content = build_google_post_flex(run_id=run_id, tenant_id=tenant_id, post_text=post_text)
+        selected_platforms = drafts.get("selected_platforms") or ["google"]
+        post_text = drafts.get("ig_fb") or drafts.get("post_text", "")
+        if "ig_fb" in selected_platforms and "google" not in selected_platforms:
+            flex_content = build_meta_post_flex(run_id=run_id, tenant_id=tenant_id, post_text=post_text)
+        else:
+            flex_content = build_google_post_flex(run_id=run_id, tenant_id=tenant_id, post_text=post_text)
     else:
         flex_content = build_photo_content_flex(run_id=run_id, tenant_id=tenant_id, drafts=drafts)
 
+    messages: list[dict[str, Any]] = []
+    if workflow in ("kachu_photo_content", "photo_content") and photo_preview_url:
+        messages.append(
+            {
+                "type": "image",
+                "originalContentUrl": photo_preview_url,
+                "previewImageUrl": photo_preview_url,
+            }
+        )
+    messages.append(
+        {
+            "type": "flex",
+            "altText": "新任務草稿準備好了，請確認",
+            "contents": flex_content,
+        }
+    )
+
     push_body = {
         "to": boss_user_id,
-        "messages": [
-            {
-                "type": "flex",
-                "altText": "新任務草稿準備好了，請確認",
-                "contents": flex_content,
-            }
-        ],
+        "messages": messages,
     }
 
     async with httpx.AsyncClient() as client:
@@ -861,7 +1075,36 @@ async def _push_flex_to_boss(
             content=json.dumps(push_body, ensure_ascii=False).encode(),
             timeout=10.0,
         )
+        if not resp.is_success:
+            logger.error(
+                "LINE push failed %s: %s",
+                resp.status_code,
+                resp.text,
+            )
         resp.raise_for_status()
+
+
+@router.get("/approval-photo/{run_id}")
+async def approval_photo_preview(run_id: str, request: Request):
+    repo = _repo(request)
+    photo_source = _get_photo_preview_source(repo, run_id)
+    if not photo_source:
+        raise HTTPException(status_code=404, detail="Approval photo not found")
+
+    if photo_source.startswith("http://") or photo_source.startswith("https://"):
+        return RedirectResponse(url=photo_source)
+
+    if not photo_source.startswith("data:"):
+        raise HTTPException(status_code=404, detail="Approval photo not found")
+
+    try:
+        header, encoded = photo_source.split(",", 1)
+        media_type = header.split(";", 1)[0].split(":", 1)[1]
+        image_bytes = base64.b64decode(encoded)
+    except (ValueError, IndexError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail="Approval photo is invalid") from exc
+
+    return Response(content=image_bytes, media_type=media_type)
 
 
 @router.post("/publish-content")
@@ -912,9 +1155,18 @@ async def publish_content(body: PublishContentRequest, request: Request) -> dict
                     access_token=creds.get("access_token", ""),
                     ig_user_id=creds.get("ig_user_id") or None,
                     fb_page_id=creds.get("fb_page_id") or None,
+                    fb_access_token=creds.get("fb_access_token") or None,
                 )
                 caption = body.drafts.get("ig_fb", "") or body.drafts.get("ig", "")
                 image_url = body.drafts.get("image_url", "")
+                # Fallback: race condition fix — notify-approval may have run before
+                # create_workflow_record (AgentOS executes tools synchronously within run_task).
+                if not image_url:
+                    photo_src = _get_photo_preview_source(repo, body.run_id)
+                    if photo_src:
+                        image_url = _build_approval_photo_preview_url(
+                            settings.KACHU_BASE_URL, body.run_id
+                        )
                 meta_results: dict[str, Any] = {}
 
                 if image_url and creds.get("ig_user_id"):
@@ -947,6 +1199,14 @@ async def publish_content(body: PublishContentRequest, request: Request) -> dict
     wf_record = repo.get_workflow_record_by_run_id(body.run_id)
     if wf_record:
         repo.update_workflow_record_status(wf_record.id, "completed")
+        # Persist fb_post_id into output_data so scheduler can find it for perf check
+        fb_post_id = (
+            results.get("ig_fb", {}).get("facebook", {}).get("fb_post_id")
+            or results.get("ig_fb", {}).get("facebook", {}).get("post_id")
+            or ""
+        )
+        if fb_post_id:
+            repo.update_workflow_run_output(body.run_id, {"fb_post_id": fb_post_id})
 
     # Record episode: boss approved and content was published
     memory = _memory(request)
@@ -1329,6 +1589,60 @@ async def send_or_escalate(body: SendOrEscalateRequest, request: Request) -> dic
 # ── Knowledge Update Workflow tools ──────────────────────────────────────────
 
 
+def _parse_business_profile_update_message(message: str) -> dict[str, Any]:
+    today = datetime.now(timezone.utc).date().isoformat()
+    normalized = "".join(message.split())
+    if any(token in normalized for token in ("今天公休", "今日公休", "今天店休", "今日店休", "今天休息", "今日休息")):
+        return {
+            "update_type": "special_hours",
+            "field": "今日營業狀態",
+            "subject": "今日營業狀態",
+            "new_value": "公休",
+            "effective_date": today,
+            "status": "closed",
+            "channel_targets": ["google_business"],
+            "followup_hint": "若你要同步通知客人，下一步可再發一篇今日公休公告貼文。",
+        }
+    if "營業時間" in message or any(token in message for token in ("延後開店", "提早打烊", "不營業", "暫停營業")):
+        return {
+            "update_type": "business_hours",
+            "field": "營業資訊",
+            "subject": "營業資訊變更",
+            "new_value": message,
+            "effective_date": today,
+            "status": "updated",
+            "channel_targets": ["google_business"],
+            "followup_hint": "若這次變更也需要對外公告，下一步可再發一篇營業資訊公告貼文。",
+        }
+    return {
+        "update_type": "business_status",
+        "field": "營運資訊",
+        "subject": "營運資訊更新",
+        "new_value": message,
+        "effective_date": today,
+        "status": "updated",
+        "channel_targets": ["google_business"],
+        "followup_hint": "這則更新會先走營運資訊流程，不會直接寫進長期知識庫。",
+    }
+
+
+@router.post("/parse-business-profile-update")
+async def parse_business_profile_update(
+    body: ParseBusinessProfileUpdateRequest, request: Request
+) -> dict[str, Any]:
+    parsed = _parse_business_profile_update_message(body.boss_message)
+    diff_summary = (
+        f"將把 {parsed.get('effective_date', '')} 的{parsed.get('field', '營運資訊')}更新為「{parsed.get('new_value', '')}」。"
+        " 這類變更會先視為短期營運狀態，不會直接寫入長期知識庫。"
+    )
+    return {
+        "run_id": body.run_id,
+        "boss_message": body.boss_message,
+        "parsed_update": parsed,
+        "diff_summary": diff_summary,
+    }
+
+
 @router.post("/parse-knowledge-update")
 async def parse_knowledge_update(
     body: ParseKnowledgeUpdateRequest, request: Request
@@ -1421,6 +1735,43 @@ async def diff_knowledge(
             if conflicting
             else "知識庫中沒有找到相關的既有條目，將新增一條。"
         ),
+    }
+
+
+@router.post("/apply-business-profile-update")
+async def apply_business_profile_update(
+    body: ApplyBusinessProfileUpdateRequest, request: Request
+) -> dict[str, Any]:
+    repo = _repo(request)
+    settings = _settings(request)
+    update_request = body.update_request
+    parsed = update_request.get("parsed_update", {})
+    today = datetime.now(timezone.utc).date().isoformat()
+    effective_date = parsed.get("effective_date") or today
+    sync_status = "google_connector_missing"
+    if _get_gbp_creds(repo, body.tenant_id, settings):
+        sync_status = "routing_ready_google_sync_not_implemented"
+
+    content = {
+        "source_message": update_request.get("boss_message", ""),
+        "parsed_update": parsed,
+        "google_business_sync_status": sync_status,
+        "applied_at": datetime.now(timezone.utc).isoformat(),
+    }
+    ttl_hours = 48 if effective_date == today else 7 * 24
+    repo.save_shared_context(
+        tenant_id=body.tenant_id,
+        context_type=_BUSINESS_PROFILE_STATE_CONTEXT,
+        content=content,
+        source_run_id=body.run_id,
+        ttl_hours=ttl_hours,
+    )
+    return {
+        "status": "applied",
+        "run_id": body.run_id,
+        "parsed_update": parsed,
+        "shared_context_type": _BUSINESS_PROFILE_STATE_CONTEXT,
+        "google_business_sync_status": sync_status,
     }
 
 
@@ -1535,6 +1886,8 @@ async def generate_google_post(
 ) -> dict[str, Any]:
     """Generate a Google Business post text for a given topic."""
     settings = _settings(request)
+    selected_platforms = body.selected_platforms or ["google"]
+    is_meta_only = "ig_fb" in selected_platforms and "google" not in selected_platforms
     context = body.context or {}
     brand_name = context.get("brand_name", "")
     brand_tone = context.get("brand_tone", "親切真誠")
@@ -1554,17 +1907,29 @@ async def generate_google_post(
     core_values_str = "、".join(core_values) if core_values else ""
     topic_hint = f"主題：{body.topic}\n" if body.topic else ""
 
-    system_prompt = (
-        f"你是 {brand_name or '這家店'} 的行銷助理，風格「{brand_tone}」。\n"
-        "請撰寫 Google 商家動態（150字以內，正式商業風格，不用 emoji）。\n"
-    )
-    prompt = (
-        f"{topic_hint}"
-        f"品牌：{brand_name}，地址：{brand_address}\n"
-        f"核心價值：{core_values_str or '用心服務'}\n"
-        f"動態類型：{body.post_type}\n\n"
-        "要求：第一句是主標題，內容自然有說服力，結尾附上聯絡方式或地址。"
-    )
+    if is_meta_only:
+        system_prompt = (
+            f"你是 {brand_name or '這家店'} 的社群編輯，風格「{brand_tone}」。\n"
+            "請撰寫 Facebook / Instagram 共用貼文（180字以內，繁體中文，可自然使用 1-2 個 emoji）。\n"
+        )
+        prompt = (
+            f"{topic_hint}"
+            f"品牌：{brand_name}，地址：{brand_address}\n"
+            f"核心價值：{core_values_str or '用心服務'}\n\n"
+            "要求：開頭直接切入亮點，語氣自然、有人味，可加入一行簡短 CTA，不要使用過度制式商業語氣。"
+        )
+    else:
+        system_prompt = (
+            f"你是 {brand_name or '這家店'} 的行銷助理，風格「{brand_tone}」。\n"
+            "請撰寫 Google 商家動態（150字以內，正式商業風格，不用 emoji）。\n"
+        )
+        prompt = (
+            f"{topic_hint}"
+            f"品牌：{brand_name}，地址：{brand_address}\n"
+            f"核心價值：{core_values_str or '用心服務'}\n"
+            f"動態類型：{body.post_type}\n\n"
+            "要求：第一句是主標題，內容自然有說服力，結尾附上聯絡方式或地址。"
+        )
     if industry_context:
         prompt += (
             f"\n產業：{industry_context.get('industry_name', '')}"
@@ -1583,10 +1948,11 @@ async def generate_google_post(
 
     # Inject preference examples
     memory = _memory(request)
-    google_prefs = memory.get_preference_examples(body.tenant_id, "google", limit=2)
-    if google_prefs:
+    preference_platform = "ig_fb" if is_meta_only else "google"
+    preference_examples = memory.get_preference_examples(body.tenant_id, preference_platform, limit=2)
+    if preference_examples:
         prompt += "\n\n【參考：老闆過去修改的風格】\n"
-        for p in google_prefs:
+        for p in preference_examples:
             prompt += f"原版：{p['original'][:100]}\n老闆改為：{p['edited'][:100]}\n---\n"
 
     if settings.GOOGLE_AI_API_KEY or settings.OPENAI_API_KEY:
@@ -1600,20 +1966,38 @@ async def generate_google_post(
                 run_id=body.run_id,
                 generation_name="generate-google-post",
             )
-            return {
-                "post_text": post_text.strip(),
+            final_text = post_text.strip()
+            response = {
+                "post_text": final_text,
                 "post_type": body.post_type,
                 "topic": body.topic,
+                "selected_platforms": selected_platforms,
             }
+            if is_meta_only:
+                response["ig_fb"] = final_text
+            else:
+                response["google"] = final_text
+            return response
         except RecoverableToolError as exc:
             logger.warning("generate-google-post LLM failed: %s", exc)
 
     # Fallback stub
-    return {
-        "post_text": f"【{brand_name}】{body.topic or '最新消息'}\n\n歡迎蒞臨，用心為您服務。\n📍 {brand_address}",
+    fallback_text = (
+        f"【{brand_name}】{body.topic or '最新消息'}\n\n歡迎蒞臨，用心為您服務。\n📍 {brand_address}"
+        if not is_meta_only
+        else f"{brand_name}｜{body.topic or '本週新消息'}\n一起來看看本週重點，歡迎私訊或留言和我們聊聊。"
+    )
+    response = {
+        "post_text": fallback_text,
         "post_type": body.post_type,
         "topic": body.topic,
+        "selected_platforms": selected_platforms,
     }
+    if is_meta_only:
+        response["ig_fb"] = fallback_text
+    else:
+        response["google"] = fallback_text
+    return response
 
 
 @router.post("/publish-google-post")
@@ -1623,9 +2007,27 @@ async def publish_google_post(
     """Publish a pre-approved post to Google Business Profile."""
     repo = _repo(request)
     settings = _settings(request)
+    selected_platforms = body.selected_platforms or ["google"]
+    drafts = dict(body.drafts or {})
+    post_text = body.post_text or drafts.get("post_text") or drafts.get("google") or drafts.get("ig_fb") or ""
 
-    if not body.post_text:
+    if not post_text:
         return {"status": "skipped", "reason": "empty post text"}
+
+    if "ig_fb" in selected_platforms and "google" not in selected_platforms:
+        meta_drafts = {"ig_fb": drafts.get("ig_fb") or post_text}
+        for key in ("image_url", "image_urls"):
+            if key in drafts:
+                meta_drafts[key] = drafts[key]
+        return await publish_content(
+            PublishContentRequest(
+                tenant_id=body.tenant_id,
+                run_id=body.run_id,
+                selected_platforms=["ig_fb"],
+                drafts=meta_drafts,
+            ),
+            request,
+        )
 
     gbp_creds = _get_gbp_creds(repo, body.tenant_id, settings)
     if not gbp_creds:
@@ -1646,7 +2048,7 @@ async def publish_google_post(
             func=lambda: gbp.create_local_post(
                 account_id=gbp_account_id,
                 location_id=gbp_location_id,
-                summary=body.post_text,
+                summary=post_text,
                 call_to_action_url=body.call_to_action_url,
             ),
             module_roots={"google"},
@@ -2122,3 +2524,482 @@ async def send_ga4_report(
             payload={"message_type": "report", "error": str(exc)},
         )
         return {"status": "failed", "error": str(exc)}
+
+
+# ── Meta Insights & Comment Management ───────────────────────────────────────
+
+
+def _get_meta_client(repo: "KachuRepository", tenant_id: str) -> "tuple[Any, dict]":
+    """Load Meta credentials and return (MetaClient, creds_dict).
+
+    Raises ``HTTPException(400)`` when the tenant has no connected Meta account.
+    """
+    import json as _json
+    from ..meta import MetaClient, MetaAPIError  # noqa: F401 — re-exported for callers
+
+    meta_account = repo.get_connector_account(tenant_id, "meta")
+    if not meta_account or not meta_account.credentials_encrypted:
+        raise HTTPException(status_code=400, detail="Meta account not connected for this tenant")
+
+    creds = _json.loads(meta_account.credentials_encrypted)
+    client = MetaClient(
+        access_token=creds.get("access_token", ""),
+        ig_user_id=creds.get("ig_user_id") or None,
+        fb_page_id=creds.get("fb_page_id") or None,
+        fb_access_token=creds.get("fb_access_token") or None,
+    )
+    return client, creds
+
+
+@router.post("/fb-page-insights")
+async def fb_page_insights(body: GetFBPageInsightsRequest, request: Request) -> dict[str, Any]:
+    """Fetch FB Page-level Insights metrics.  Requires ``read_insights`` scope."""
+    from ..meta import MetaAPIError
+
+    repo = _repo(request)
+    meta, _creds = _get_meta_client(repo, body.tenant_id)
+
+    try:
+        data = await meta.get_fb_page_insights(
+            metric_names=body.metric_names or None,
+            period=body.period,
+            since=body.since,
+            until=body.until,
+        )
+    except MetaAPIError as exc:
+        logger.error("fb-page-insights failed: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    repo.save_audit_event(
+        tenant_id=body.tenant_id,
+        agentos_run_id=body.run_id,
+        workflow_type="meta_insights",
+        event_type="fb_page_insights_fetched",
+        source="fb_page_insights",
+        payload={"period": body.period, "metric_count": len(data.get("data", []))},
+    )
+    return {"status": "ok", "insights": data}
+
+
+@router.post("/fb-post-insights")
+async def fb_post_insights(body: GetFBPostInsightsRequest, request: Request) -> dict[str, Any]:
+    """Fetch Insights for a specific FB Page post.  Requires ``read_insights`` scope."""
+    from ..meta import MetaAPIError
+
+    repo = _repo(request)
+    meta, _creds = _get_meta_client(repo, body.tenant_id)
+
+    try:
+        data = await meta.get_fb_post_insights(
+            post_id=body.post_id,
+            metric_names=body.metric_names or None,
+        )
+    except MetaAPIError as exc:
+        logger.error("fb-post-insights failed for post %s: %s", body.post_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    repo.save_audit_event(
+        tenant_id=body.tenant_id,
+        agentos_run_id=body.run_id,
+        workflow_type="meta_insights",
+        event_type="fb_post_insights_fetched",
+        source="fb_post_insights",
+        payload={"post_id": body.post_id, "metric_count": len(data.get("data", []))},
+    )
+    return {"status": "ok", "insights": data}
+
+
+@router.post("/fb-list-comments")
+async def fb_list_comments(body: ListFBCommentsRequest, request: Request) -> dict[str, Any]:
+    """List comments on a FB post/photo.  Requires ``pages_manage_engagement`` scope."""
+    from ..meta import MetaAPIError
+
+    repo = _repo(request)
+    meta, _creds = _get_meta_client(repo, body.tenant_id)
+
+    try:
+        data = await meta.get_fb_comments(object_id=body.object_id, limit=body.limit)
+    except MetaAPIError as exc:
+        logger.error("fb-list-comments failed for object %s: %s", body.object_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {"status": "ok", "comments": data}
+
+
+@router.post("/fb-reply-comment")
+async def fb_reply_comment(body: ReplyFBCommentRequest, request: Request) -> dict[str, Any]:
+    """Reply to a FB comment as the Page.  Requires ``pages_manage_engagement`` scope."""
+    from ..meta import MetaAPIError
+
+    repo = _repo(request)
+    meta, _creds = _get_meta_client(repo, body.tenant_id)
+
+    try:
+        result = await meta.reply_fb_comment(comment_id=body.comment_id, message=body.message)
+    except MetaAPIError as exc:
+        logger.error("fb-reply-comment failed for comment %s: %s", body.comment_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    repo.save_audit_event(
+        tenant_id=body.tenant_id,
+        agentos_run_id=body.run_id,
+        workflow_type="meta_comment",
+        event_type="fb_comment_replied",
+        source="fb_reply_comment",
+        payload={"comment_id": body.comment_id, "reply_id": result.get("id")},
+    )
+    return {"status": "replied", "result": result}
+
+
+@router.post("/fb-hide-comment")
+async def fb_hide_comment(body: HideFBCommentRequest, request: Request) -> dict[str, Any]:
+    """Hide or unhide a FB comment.  Requires ``pages_manage_engagement`` scope."""
+    from ..meta import MetaAPIError
+
+    repo = _repo(request)
+    meta, _creds = _get_meta_client(repo, body.tenant_id)
+
+    try:
+        result = await meta.hide_fb_comment(comment_id=body.comment_id, is_hidden=body.is_hidden)
+    except MetaAPIError as exc:
+        logger.error("fb-hide-comment failed for comment %s: %s", body.comment_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    action = "hidden" if body.is_hidden else "unhidden"
+    repo.save_audit_event(
+        tenant_id=body.tenant_id,
+        agentos_run_id=body.run_id,
+        workflow_type="meta_comment",
+        event_type=f"fb_comment_{action}",
+        source="fb_hide_comment",
+        payload={"comment_id": body.comment_id, "is_hidden": body.is_hidden},
+    )
+    return {"status": action, "result": result}
+
+
+@router.post("/ig-list-comments")
+async def ig_list_comments(body: ListIGCommentsRequest, request: Request) -> dict[str, Any]:
+    """List comments on an IG media.  Requires ``instagram_manage_comments`` scope."""
+    from ..meta import MetaAPIError
+
+    repo = _repo(request)
+    meta, creds = _get_meta_client(repo, body.tenant_id)
+
+    if not creds.get("ig_user_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="ig_user_id not configured — ensure the Facebook Page is linked to an Instagram Business account",
+        )
+
+    try:
+        data = await meta.get_ig_comments(media_id=body.media_id, limit=body.limit)
+    except MetaAPIError as exc:
+        logger.error("ig-list-comments failed for media %s: %s", body.media_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {"status": "ok", "comments": data}
+
+
+@router.post("/ig-reply-comment")
+async def ig_reply_comment(body: ReplyIGCommentRequest, request: Request) -> dict[str, Any]:
+    """Reply to an IG comment.  Requires ``instagram_manage_comments`` scope."""
+    from ..meta import MetaAPIError
+
+    repo = _repo(request)
+    meta, creds = _get_meta_client(repo, body.tenant_id)
+
+    if not creds.get("ig_user_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="ig_user_id not configured — ensure the Facebook Page is linked to an Instagram Business account",
+        )
+
+    try:
+        result = await meta.reply_ig_comment(comment_id=body.comment_id, message=body.message)
+    except MetaAPIError as exc:
+        logger.error("ig-reply-comment failed for comment %s: %s", body.comment_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    repo.save_audit_event(
+        tenant_id=body.tenant_id,
+        agentos_run_id=body.run_id,
+        workflow_type="meta_comment",
+        event_type="ig_comment_replied",
+        source="ig_reply_comment",
+        payload={"comment_id": body.comment_id, "reply_id": result.get("id")},
+    )
+    return {"status": "replied", "result": result}
+
+
+@router.post("/ig-hide-comment")
+async def ig_hide_comment(body: HideIGCommentRequest, request: Request) -> dict[str, Any]:
+    """Hide or unhide an IG comment.  Requires ``instagram_manage_comments`` scope."""
+    from ..meta import MetaAPIError
+
+    repo = _repo(request)
+    meta, creds = _get_meta_client(repo, body.tenant_id)
+
+    if not creds.get("ig_user_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="ig_user_id not configured — ensure the Facebook Page is linked to an Instagram Business account",
+        )
+
+    try:
+        result = await meta.hide_ig_comment(comment_id=body.comment_id, hide=body.hide)
+    except MetaAPIError as exc:
+        logger.error("ig-hide-comment failed for comment %s: %s", body.comment_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    action = "hidden" if body.hide else "unhidden"
+    repo.save_audit_event(
+        tenant_id=body.tenant_id,
+        agentos_run_id=body.run_id,
+        workflow_type="meta_comment",
+        event_type=f"ig_comment_{action}",
+        source="ig_hide_comment",
+        payload={"comment_id": body.comment_id, "hide": body.hide},
+    )
+    return {"status": action, "result": result}
+
+
+# ── Flow A: Meta Insights on-demand ──────────────────────────────────────────
+
+@router.post("/fetch-meta-insights")
+async def fetch_meta_insights(body: FetchMetaInsightsRequest, request: Request) -> dict[str, Any]:
+    """Fetch FB Page insights (reach, impressions, engaged_users) for the requested period."""
+    from ..meta import MetaAPIError
+
+    def _flatten_insights_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        flattened: dict[str, Any] = {}
+        for item in payload.get("data", []):
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not name:
+                continue
+            values = item.get("values", [])
+            if not values or not isinstance(values, list):
+                continue
+            latest = values[-1]
+            if not isinstance(latest, dict):
+                continue
+            value = latest.get("value")
+            if isinstance(value, dict):
+                flattened[name] = json.dumps(value, ensure_ascii=False)
+            elif value is not None:
+                flattened[name] = value
+        return flattened
+
+    repo = _repo(request)
+    meta, creds = _get_meta_client(repo, body.tenant_id)
+
+    period = "week" if body.period in ("week", "7daysAgo") else "month"
+    metric_names = ["page_impressions_unique", "page_post_engagements", "page_views_total", "page_total_actions"]
+    try:
+        page_data = _flatten_insights_payload(
+            await meta.get_fb_page_insights(metric_names=metric_names, period=period)
+        )
+    except MetaAPIError as exc:
+        logger.error("fetch-meta-insights page failed tenant=%s: %s", body.tenant_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # Fetch insights of the last published post if available
+    post_data: dict[str, Any] = {}
+    try:
+        recent_runs = repo.list_comment_trackable_runs(body.tenant_id, within_days=7)
+        if recent_runs:
+            fb_post_id, _run_id = recent_runs[0]
+            post_metrics = ["post_impressions", "post_impressions_unique", "post_engagements", "post_clicks"]
+            post_data = _flatten_insights_payload(
+                await meta.get_fb_post_insights(post_id=fb_post_id, metric_names=post_metrics)
+            )
+    except (MetaAPIError, Exception) as exc:
+        logger.warning("fetch-meta-insights post failed: %s", exc)
+
+    return {
+        "status": "ok",
+        "period": period,
+        "page_insights": page_data,
+        "last_post_insights": post_data,
+        "fb_page_id": creds.get("fb_page_id", ""),
+    }
+
+
+@router.post("/generate-meta-insights-summary")
+async def generate_meta_insights_summary(body: GenerateMetaInsightsSummaryRequest, request: Request) -> dict[str, Any]:
+    """Use LLM to generate a human-readable summary from raw Meta insights JSON."""
+    settings = _settings(request)
+    api_key = getattr(settings, "GOOGLE_AI_API_KEY", "")
+    openai_key = getattr(settings, "OPENAI_API_KEY", "")
+    model = getattr(settings, "LITELLM_MODEL", "gemini/gemini-2.5-flash")
+
+    try:
+        raw_insights = json.loads(body.insights_json)
+    except (json.JSONDecodeError, TypeError):
+        raw_insights = {}
+
+    prompt = (
+        "以下是 Facebook 商家粉絲頁的成效數據（JSON 格式），"
+        "請用繁體中文寫一段 3-4 行的重點摘要給老闆看，"
+        "強調最值得注意的數字，並給一個行動建議。\n\n"
+        f"```json\n{json.dumps(raw_insights, ensure_ascii=False, indent=2)}\n```\n"
+        "只輸出摘要段落，不要加標題或 markdown。"
+    )
+    try:
+        summary = await generate_text(
+            prompt=prompt,
+            model=model,
+            api_key=api_key,
+            openai_api_key=openai_key,
+        )
+        summary = summary.strip()
+    except Exception as exc:
+        logger.warning("generate-meta-insights-summary LLM failed: %s", exc)
+        summary = "目前無法生成摘要，請直接查閱數據。"
+
+    # Build a flat details list for the Flex message
+    details: list[dict[str, Any]] = []
+    label_map = {
+        "page_impressions_unique": "觸及人數",
+        "page_post_engagements": "貼文互動",
+        "page_views_total": "頁面瀏覽",
+        "page_total_actions": "聯絡動作",
+        "post_impressions": "貼文曝光", "post_impressions_unique": "貼文觸及",
+        "post_engagements": "貼文互動", "post_clicks": "貼文點擊",
+    }
+    for section_key in ("page_insights", "last_post_insights"):
+        section = raw_insights.get(section_key, {})
+        if isinstance(section, dict):
+            for key, val in section.items():
+                if isinstance(val, (int, float, str)) and key in label_map:
+                    details.append({"label": label_map[key], "value": val})
+
+    return {
+        "status": "ok",
+        "summary": summary,
+        "details": details,
+    }
+
+
+@router.post("/send-meta-insights-report")
+async def send_meta_insights_report(body: SendMetaInsightsReportRequest, request: Request) -> dict[str, Any]:
+    """Push the Meta Insights Flex message to the boss via LINE."""
+    import json as _json
+
+    repo = _repo(request)
+    settings = _settings(request)
+
+    if not settings.LINE_BOSS_USER_ID or not settings.LINE_CHANNEL_ACCESS_TOKEN:
+        raise HTTPException(status_code=400, detail="LINE boss user ID or token not configured")
+
+    try:
+        details = _json.loads(body.details_json)
+    except (_json.JSONDecodeError, TypeError):
+        details = []
+
+    flex_msg = build_meta_insights_flex(
+        tenant_id=body.tenant_id,
+        summary=body.summary,
+        details=details,
+    )
+    await push_line_messages(
+        to=settings.LINE_BOSS_USER_ID,
+        messages=[{"type": "flex", "altText": "📊 Facebook 成效報告", "contents": flex_msg}],
+        access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+    )
+    repo.record_push(
+        tenant_id=body.tenant_id,
+        recipient_line_id=settings.LINE_BOSS_USER_ID,
+        message_type="meta_insights_report",
+    )
+    repo.save_audit_event(
+        tenant_id=body.tenant_id,
+        agentos_run_id=body.run_id,
+        workflow_type="meta_insights",
+        event_type="insights_report_sent",
+        source="send_meta_insights_report",
+        payload={"summary_length": len(body.summary)},
+    )
+    return {"status": "sent"}
+
+
+# ── Flow B: Post performance report (24h auto) ───────────────────────────────
+
+@router.post("/send-post-performance-report")
+async def send_post_performance_report(request: Request) -> dict[str, Any]:
+    """Internal endpoint called by scheduler: fetch post insights for eligible runs and push LINE."""
+    from ..meta import MetaAPIError
+
+    repo = _repo(request)
+    settings = _settings(request)
+
+    if not settings.LINE_BOSS_USER_ID or not settings.LINE_CHANNEL_ACCESS_TOKEN:
+        raise HTTPException(status_code=400, detail="LINE config missing")
+
+    tenant_id = settings.LINE_BOSS_USER_ID
+    eligible_runs = repo.list_completed_photo_runs_for_perf_check(tenant_id)
+    sent = 0
+    for wf_run in eligible_runs:
+        # Deduplicate: skip if we've already sent a perf report for this run
+        from datetime import timedelta
+        already_sent = repo.has_recent_audit_event(
+            tenant_id=tenant_id,
+            workflow_type="photo_content",
+            event_type="perf_report_sent",
+            source="post_performance_scheduler",
+            since=datetime.now(timezone.utc) - timedelta(days=3),
+            payload_subset={"agentos_run_id": wf_run.agentos_run_id},
+        )
+        if already_sent:
+            continue
+
+        try:
+            output_data = json.loads(wf_run.output_data or "{}")
+            fb_post_id = output_data.get("fb_post_id", "")
+            if not fb_post_id:
+                continue
+
+            meta, _creds = _get_meta_client(repo, tenant_id)
+            post_metrics = ["post_impressions", "post_reach", "post_engaged_users", "post_clicks"]
+            raw_insights = await meta.get_fb_post_insights(post_id=fb_post_id, metric_names=post_metrics)
+
+            label_map = {
+                "post_impressions": "貼文曝光", "post_reach": "貼文觸及",
+                "post_engaged_users": "互動用戶", "post_clicks": "貼文點擊",
+            }
+            details = [{"label": label_map.get(k, k), "value": v} for k, v in raw_insights.items() if isinstance(v, (int, float, str))]
+            summary = (
+                f"你 24 小時前發的貼文表現：觸及 {raw_insights.get('post_reach', '-')} 人，"
+                f"曝光 {raw_insights.get('post_impressions', '-')} 次，"
+                f"互動 {raw_insights.get('post_engaged_users', '-')} 人。"
+            )
+
+            flex_msg = build_post_performance_flex(
+                tenant_id=tenant_id,
+                fb_post_id=fb_post_id,
+                summary=summary,
+                details=details,
+            )
+            await push_line_messages(
+                to=settings.LINE_BOSS_USER_ID,
+                messages=[{"type": "flex", "altText": "📈 貼文成效回報（發文後 24h）", "contents": flex_msg}],
+                access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+            )
+            repo.record_push(
+                tenant_id=tenant_id,
+                recipient_line_id=settings.LINE_BOSS_USER_ID,
+                message_type="post_performance_report",
+            )
+            repo.save_audit_event(
+                tenant_id=tenant_id,
+                workflow_type="photo_content",
+                event_type="perf_report_sent",
+                source="post_performance_scheduler",
+                payload={"agentos_run_id": wf_run.agentos_run_id, "fb_post_id": fb_post_id},
+            )
+            sent += 1
+        except (MetaAPIError, httpx.HTTPError, SQLAlchemyError, json.JSONDecodeError) as exc:
+            logger.error("send-post-performance-report failed for run=%s: %s", wf_run.agentos_run_id, exc)
+
+    return {"status": "done", "sent": sent}

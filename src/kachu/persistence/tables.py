@@ -81,6 +81,26 @@ class ApprovalTaskTable(SQLModel, table=True):
     expires_at: Optional[datetime] = Field(default=None)
 
 
+class ScheduledPublishTable(SQLModel, table=True):
+    __tablename__ = "kachu_scheduled_publishes"
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    tenant_id: str = Field(index=True)
+    source_run_id: str = Field(default="", index=True)
+    workflow_type: str = Field(default="")
+    selected_platforms: str = Field(default="[]")  # JSON list[str]
+    draft_content: str = Field(default="{}")       # JSON payload used at publish time
+    status: str = Field(default="pending", index=True)
+    actor_line_id: str = Field(default="")
+    scheduled_for: datetime = Field(index=True)
+    confirmed_at: Optional[datetime] = Field(default=None)
+    published_at: Optional[datetime] = Field(default=None)
+    cancelled_at: Optional[datetime] = Field(default=None)
+    error_message: Optional[str] = Field(default=None)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
 class KnowledgeEntryTable(SQLModel, table=True):
     __tablename__ = "kachu_knowledge_entries"
 
@@ -204,7 +224,7 @@ class EditSessionTable(SQLModel, table=True):
     original_google_draft: str = Field(default="")
     edited_ig_draft: str = Field(default="")  # Set by boss when responding to IG edit prompt
     edited_google_draft: str = Field(default="")  # Set by boss when responding to Google edit prompt
-    step: str = Field(default="waiting_ig")    # waiting_ig | waiting_google | completed
+    step: str = Field(default="waiting_feedback")  # waiting_feedback | waiting_ig | waiting_google | completed
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -297,6 +317,10 @@ class TenantAutomationSettingsTable(SQLModel, table=True):
     google_post_frequency: str = Field(default="weekly")
     google_post_weekday: str = Field(default="thu")
     google_post_hour: int = Field(default=10)
+    meta_post_enabled: bool = Field(default=False)
+    meta_post_frequency: str = Field(default="weekly")
+    meta_post_weekday: str = Field(default="fri")
+    meta_post_hour: int = Field(default=11)
     proactive_enabled: bool = Field(default=True)
     proactive_hour: int = Field(default=7)
     content_calendar_enabled: bool = Field(default=True)

@@ -14,6 +14,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -96,9 +97,14 @@ class TestIntentRouterKeywords:
             settings=None,
         )
 
+    def test_business_profile_update_keywords(self):
+        router = self._router()
+        for text in ["幫我更新這項資訊：今天公休", "今天店休", "營業時間改成下午兩點開"]:
+            assert router.classify_text(text) == Intent.BUSINESS_PROFILE_UPDATE, text
+
     def test_knowledge_update_keywords(self):
         router = self._router()
-        for text in ["雞腿飯改成90元", "價格更新一下", "刪除舊菜單", "調整營業時間"]:
+        for text in ["雞腿飯改成90元", "價格更新一下", "刪除舊菜單"]:
             assert router.classify_text(text) == Intent.KNOWLEDGE_UPDATE, text
 
     def test_google_post_keywords(self):
@@ -125,6 +131,71 @@ class TestIntentRouterKeywords:
         router = self._router()
         assert router.classify_text("你好") == Intent.GENERAL_CHAT
         assert router.classify_text("今天天氣真好") == Intent.GENERAL_CHAT
+
+
+@pytest.mark.asyncio
+async def test_plan_boss_message_marks_small_talk_without_actions(test_settings):
+    router = IntentRouter(
+        agentOS_client=MagicMock(),
+        repository=MagicMock(),
+        settings=test_settings,
+    )
+
+    route = await router.plan_boss_message("你好")
+
+    assert route.intent == Intent.GENERAL_CHAT
+    assert route.small_talk is True
+    assert route.actions == []
+
+
+@pytest.mark.asyncio
+async def test_knowledge_update_dispatch_uses_line_message_id_as_idempotency_key():
+    agentos = MagicMock()
+    agentos.create_task = AsyncMock(return_value=SimpleNamespace(task={"id": "task-1"}))
+    agentos.run_task = AsyncMock(return_value=SimpleNamespace(run={"id": "run-1", "status": "running"}))
+    repo = MagicMock()
+    router = IntentRouter(
+        agentOS_client=agentos,
+        repository=repo,
+        settings=None,
+    )
+
+    await router._dispatch_knowledge_update(
+        tenant_id="T001",
+        trigger_source="line",
+        trigger_payload={
+            "message": "幫我更新這項資訊：我們今天公休",
+            "line_message_id": "msg-knowledge-1",
+        },
+    )
+
+    task_request = agentos.create_task.await_args.args[0]
+    assert task_request.idempotency_key == "T001:knowledge_update:line:msg-knowledge-1"
+
+
+@pytest.mark.asyncio
+async def test_business_profile_update_dispatch_uses_line_message_id_as_idempotency_key():
+    agentos = MagicMock()
+    agentos.create_task = AsyncMock(return_value=SimpleNamespace(task={"id": "task-1"}))
+    agentos.run_task = AsyncMock(return_value=SimpleNamespace(run={"id": "run-1", "status": "running"}))
+    repo = MagicMock()
+    router = IntentRouter(
+        agentOS_client=agentos,
+        repository=repo,
+        settings=None,
+    )
+
+    await router._dispatch_business_profile_update(
+        tenant_id="T001",
+        trigger_source="line",
+        trigger_payload={
+            "message": "幫我更新這項資訊：今天公休",
+            "line_message_id": "msg-biz-1",
+        },
+    )
+
+    task_request = agentos.create_task.await_args.args[0]
+    assert task_request.idempotency_key == "T001:business_profile_update:line:msg-biz-1"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -194,6 +265,53 @@ class TestIntentRouterLLM:
         intent, topic = await router.classify_text_llm("幫我寫個活動貼文")
         # Should fall back to keyword (GOOGLE_POST matches 幫我寫)
         assert intent == Intent.GOOGLE_POST
+
+    @pytest.mark.asyncio
+    async def test_plan_boss_message_defaults_question_to_consult(self):
+        mock_settings = MagicMock()
+        mock_settings.GOOGLE_AI_API_KEY = "fake"
+        mock_settings.OPENAI_API_KEY = ""
+        mock_settings.LITELLM_MODEL = "gemini/gemini-3-flash-preview"
+
+        router = IntentRouter(
+            agentOS_client=MagicMock(),
+            repository=MagicMock(),
+            settings=mock_settings,
+        )
+        llm_response = json.dumps({"intent": "ga4_report", "topic": "流量下滑"})
+        with patch("kachu.llm.generate_text", new=AsyncMock(return_value=llm_response)):
+            router._goal_parser.parse = AsyncMock(return_value=[{"label": "幫我拉一份流量報告", "intent": "ga4_report", "topic": ""}])
+            decision = await router.plan_boss_message("最近流量掉很多，我想先理解問題在哪？")
+
+        assert decision.mode.value == "consult"
+        assert decision.intent == Intent.GA4_REPORT
+        assert decision.actions
+
+    @pytest.mark.asyncio
+    async def test_plan_boss_message_routes_ambiguous_statement_to_clarify(self):
+        mock_settings = MagicMock()
+        mock_settings.GOOGLE_AI_API_KEY = "fake"
+        mock_settings.OPENAI_API_KEY = ""
+        mock_settings.LITELLM_MODEL = "gemini/gemini-3-flash-preview"
+
+        router = IntentRouter(
+            agentOS_client=MagicMock(),
+            repository=MagicMock(),
+            settings=mock_settings,
+        )
+        llm_response = json.dumps({"intent": "ga4_report", "topic": ""})
+        clarify_q = "你說流量掉很多，是要我直接拉報告看數字，還是先討論可能原因？"
+        with patch("kachu.llm.generate_text", new=AsyncMock(side_effect=[
+            llm_response,   # classify_text_llm 呼叫
+            clarify_q,      # _generate_clarify_question 呼叫
+        ])):
+            router._goal_parser.parse = AsyncMock(return_value=[{"label": "幫我拉一份流量報告", "intent": "ga4_report", "topic": ""}])
+            decision = await router.plan_boss_message("最近流量掉很多")
+
+        assert decision.mode.value == "clarify"
+        assert decision.intent == Intent.GA4_REPORT
+        assert decision.clarify_question
+        assert decision.actions == []
 
     @pytest.mark.asyncio
     async def test_create_and_run_logs_recoverable_dispatch_error(self):
@@ -369,6 +487,17 @@ class TestGooglePostTools:
         assert "post_text" in data
         assert data["topic"] == "七夕情人節優惠"
 
+    def test_generate_google_post_meta_only_returns_ig_fb_draft(self, client, tenant_id):
+        resp = client.post("/tools/generate-google-post", json={
+            "tenant_id": tenant_id,
+            "topic": "本週調理提醒",
+            "selected_platforms": ["ig_fb"],
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["selected_platforms"] == ["ig_fb"]
+        assert data["ig_fb"] == data["post_text"]
+
     def test_generate_google_post_with_context(self, client, tenant_id):
         resp = client.post("/tools/generate-google-post", json={
             "tenant_id": tenant_id,
@@ -404,6 +533,17 @@ class TestGooglePostTools:
         })
         assert resp.status_code == 200
         assert resp.json()["status"] == "skipped"
+
+    def test_publish_google_post_meta_only_uses_publish_content(self, client, tenant_id):
+        resp = client.post("/tools/publish-google-post", json={
+            "tenant_id": tenant_id,
+            "run_id": "run-gp-003",
+            "selected_platforms": ["ig_fb"],
+            "drafts": {"ig_fb": "Meta 排程文案"},
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["results"]["ig_fb"]["status"] == "skipped_no_credentials"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -545,6 +685,41 @@ class TestGoogleOAuth:
         data = resp.json()
         assert data["connectors"]["google_business"]["connected"] is False
         assert data["connectors"]["ga4"]["connected"] is False
+        assert data["readiness"]["channels"]["facebook"]["connected"] is False
+        assert data["readiness"]["channels"]["instagram"]["status"] == "pending_connection"
+
+    def test_connector_status_returns_phase0_readiness_summary(self, client, tenant_id):
+        repo = client.app.state.repository
+        repo.save_connector_account(
+            tenant_id=tenant_id,
+            platform="meta",
+            credentials_json=json.dumps(
+                {
+                    "access_token": "meta-token",
+                    "fb_page_id": "fb-page-123",
+                    "fb_page_name": "示範粉專",
+                    "ig_user_id": "",
+                }
+            ),
+            account_label="Meta (示範粉專)",
+        )
+        repo.save_connector_account(
+            tenant_id=tenant_id,
+            platform="google_business",
+            credentials_json=json.dumps({"access_token": "google-token"}),
+            account_label="Google Business",
+        )
+
+        resp = client.get(f"/auth/status/{tenant_id}")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        readiness = data["readiness"]
+        assert readiness["channels"]["facebook"]["connected"] is True
+        assert readiness["channels"]["facebook"]["label"] == "示範粉專"
+        assert readiness["channels"]["instagram"]["status"] == "needs_business_link"
+        assert readiness["channels"]["google_business"]["connected"] is True
+        assert "Facebook" in readiness["next_step"]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -629,12 +804,69 @@ class TestKnowledgeSupersede:
         assert "麻辣" in results[0].content
 
 
+class TestBusinessProfileUpdateTools:
+    def test_parse_business_profile_update_today_closed(self, client, tenant_id):
+        resp = client.post("/tools/parse-business-profile-update", json={
+            "tenant_id": tenant_id,
+            "boss_message": "幫我更新這項資訊：今天公休",
+            "run_id": "run-biz-001",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["parsed_update"]["field"] == "今日營業狀態"
+        assert data["parsed_update"]["new_value"] == "公休"
+
+    def test_apply_business_profile_update_saves_shared_context_without_knowledge_entry(self, client, tenant_id, repo):
+        resp = client.post("/tools/apply-business-profile-update", json={
+            "tenant_id": tenant_id,
+            "run_id": "run-biz-002",
+            "update_request": {
+                "boss_message": "幫我更新這項資訊：今天公休",
+                "parsed_update": {
+                    "update_type": "special_hours",
+                    "field": "今日營業狀態",
+                    "new_value": "公休",
+                    "effective_date": "2026-05-02",
+                    "status": "closed",
+                    "channel_targets": ["google_business"],
+                },
+            },
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["shared_context_type"] == "business_profile_state_override"
+        ctx = repo.get_shared_context(tenant_id, "business_profile_state_override")
+        assert ctx is not None
+        assert ctx["parsed_update"]["new_value"] == "公休"
+        assert repo.get_knowledge_entries(tenant_id) == []
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # AgentOS pipeline definitions (smoke tests)
 # ════════════════════════════════════════════════════════════════════════════
 
 
 class TestAgentOSPipelines:
+    def test_business_profile_update_pipeline_builds_plan(self):
+        from agent_platform.models import TaskCreateRequest
+        from agent_platform.kachu_workflows.business_profile_update_pipeline import (
+            build_kachu_business_profile_update_plan,
+        )
+        req = TaskCreateRequest(
+            tenant_id="T001",
+            domain="kachu_business_profile_update",
+            objective="update special hours",
+            workflow_input={"tenant_id": "T001", "boss_message": "今天公休"},
+        )
+        plan = build_kachu_business_profile_update_plan(req)
+        step_names = [s.name for s in plan.steps]
+        assert step_names == [
+            "parse-business-profile-update",
+            "notify-approval",
+            "confirm-business-profile-update",
+            "apply-business-profile-update",
+        ]
+
     def test_knowledge_update_pipeline_builds_plan(self):
         from agent_platform.models import TaskCreateRequest
         from agent_platform.kachu_workflows.knowledge_update_pipeline import (
@@ -695,10 +927,12 @@ class TestAgentOSPipelines:
 
     def test_all_workflows_in_init(self):
         from agent_platform.kachu_workflows import (
+            kachu_business_profile_update_workflow_definition,
             kachu_knowledge_update_workflow_definition,
             kachu_google_post_workflow_definition,
             kachu_ga4_report_workflow_definition,
         )
+        assert kachu_business_profile_update_workflow_definition().domain == "kachu_business_profile_update"
         assert kachu_knowledge_update_workflow_definition().domain == "kachu_knowledge_update"
         assert kachu_google_post_workflow_definition().domain == "kachu_google_post"
         assert kachu_ga4_report_workflow_definition().domain == "kachu_ga4_report"

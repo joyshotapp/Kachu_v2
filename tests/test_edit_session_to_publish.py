@@ -33,7 +33,7 @@ def repo(settings: Settings) -> KachuRepository:
 
 
 @pytest.mark.asyncio
-async def test_start_edit_session_creates_waiting_ig_record(
+async def test_start_edit_session_creates_waiting_feedback_record(
     repo: KachuRepository, settings: Settings,
 ) -> None:
     repo.create_pending_approval(
@@ -57,7 +57,7 @@ async def test_start_edit_session_creates_waiting_ig_record(
     active = repo.get_active_edit_session("tenant-001")
     assert active is not None
     assert active.run_id == "run-edit-001"
-    assert active.step == "waiting_ig"
+    assert active.step == "waiting_feedback"
     assert active.original_ig_draft == "原始 IG 草稿"
     assert active.original_google_draft == "原始 Google 草稿"
 

@@ -16,6 +16,7 @@ from .tables import (
     KnowledgeEntryTable,
     OnboardingStateTable,
     PushLogTable,
+    ScheduledPublishTable,
     SharedContextTable,
     TenantApprovalProfileTable,
     TenantAutomationSettingsTable,
@@ -126,6 +127,75 @@ class KachuRepository:
     def get_workflow_record_by_run_id(self, agentos_run_id: str) -> WorkflowRunTable | None:
         return self.get_workflow_run_by_run_id(agentos_run_id)
 
+    def update_workflow_run_output(self, agentos_run_id: str, output_data: dict) -> None:
+        """Persist publish results (including fb_post_id) into the workflow run record."""
+        with Session(self._engine) as session:
+            stmt = select(WorkflowRunTable).where(WorkflowRunTable.agentos_run_id == agentos_run_id)
+            record = session.exec(stmt).first()
+            if record:
+                record.output_data = json.dumps(output_data, ensure_ascii=False)
+                record.updated_at = datetime.now(timezone.utc)
+                session.add(record)
+                session.commit()
+
+    def list_completed_photo_runs_for_perf_check(
+        self, tenant_id: str, since_hours: int = 48, max_age_hours: int = 23
+    ) -> list[WorkflowRunTable]:
+        """Return completed photo_content runs whose created_at is between 23–48 h ago
+        and that have output_data containing a fb_post_id."""
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+        lower = now - timedelta(hours=since_hours)
+        upper = now - timedelta(hours=max_age_hours)
+        with Session(self._engine) as session:
+            stmt = (
+                select(WorkflowRunTable)
+                .where(WorkflowRunTable.tenant_id == tenant_id)
+                .where(WorkflowRunTable.workflow_type == "photo_content")
+                .where(WorkflowRunTable.status == "completed")
+                .where(WorkflowRunTable.created_at >= lower)
+                .where(WorkflowRunTable.created_at <= upper)
+                .where(WorkflowRunTable.output_data.isnot(None))
+            )
+            rows = session.exec(stmt).all()
+        result = []
+        for row in rows:
+            try:
+                data = json.loads(row.output_data or "{}")
+                if data.get("fb_post_id"):
+                    result.append(row)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return result
+
+    def list_comment_trackable_runs(
+        self, tenant_id: str, within_days: int = 7
+    ) -> list[tuple[str, str]]:
+        """Return [(fb_post_id, agentos_run_id), ...] for recent completed photo_content runs
+        that have a fb_post_id stored in output_data."""
+        from datetime import timedelta
+        lower = datetime.now(timezone.utc) - timedelta(days=within_days)
+        with Session(self._engine) as session:
+            stmt = (
+                select(WorkflowRunTable)
+                .where(WorkflowRunTable.tenant_id == tenant_id)
+                .where(WorkflowRunTable.workflow_type == "photo_content")
+                .where(WorkflowRunTable.status == "completed")
+                .where(WorkflowRunTable.created_at >= lower)
+                .where(WorkflowRunTable.output_data.isnot(None))
+            )
+            rows = session.exec(stmt).all()
+        result = []
+        for row in rows:
+            try:
+                data = json.loads(row.output_data or "{}")
+                fb_post_id = data.get("fb_post_id", "")
+                if fb_post_id:
+                    result.append((fb_post_id, row.agentos_run_id))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return result
+
     # ── PendingApproval ───────────────────────────────────────────────────────
 
     def create_pending_approval(
@@ -137,6 +207,10 @@ class KachuRepository:
         draft_content: dict,
         expires_at: datetime | None = None,
     ) -> PendingApprovalTable:
+        # Guard against AgentOS retries re-inserting the same run_id.
+        existing = self.get_pending_approval_by_run_id(agentos_run_id)
+        if existing is not None:
+            return existing
         record = PendingApprovalTable(
             tenant_id=tenant_id,
             agentos_run_id=agentos_run_id,
@@ -171,6 +245,79 @@ class KachuRepository:
             record.decision = decision
             record.actor_line_id = actor_line_id
             record.decided_at = datetime.now(timezone.utc)
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            return record
+
+    # ── ScheduledPublish ─────────────────────────────────────────────────────
+
+    def create_scheduled_publish(
+        self,
+        *,
+        tenant_id: str,
+        source_run_id: str,
+        workflow_type: str,
+        selected_platforms: list[str],
+        draft_content: dict,
+        scheduled_for: datetime,
+        actor_line_id: str,
+    ) -> ScheduledPublishTable:
+        record = ScheduledPublishTable(
+            tenant_id=tenant_id,
+            source_run_id=source_run_id,
+            workflow_type=workflow_type,
+            selected_platforms=json.dumps(selected_platforms, ensure_ascii=False),
+            draft_content=json.dumps(draft_content, ensure_ascii=False),
+            actor_line_id=actor_line_id,
+            scheduled_for=scheduled_for,
+            confirmed_at=datetime.now(timezone.utc),
+        )
+        with Session(self._engine) as session:
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            return record
+
+    def get_scheduled_publish(self, scheduled_publish_id: str) -> ScheduledPublishTable | None:
+        with Session(self._engine) as session:
+            return session.get(ScheduledPublishTable, scheduled_publish_id)
+
+    def list_due_scheduled_publishes(
+        self,
+        *,
+        due_before: datetime | None = None,
+        limit: int = 50,
+    ) -> list[ScheduledPublishTable]:
+        cutoff = due_before or datetime.now(timezone.utc)
+        with Session(self._engine) as session:
+            stmt = (
+                select(ScheduledPublishTable)
+                .where(ScheduledPublishTable.status == "pending")
+                .where(ScheduledPublishTable.scheduled_for <= cutoff)
+                .order_by(ScheduledPublishTable.scheduled_for.asc())
+                .limit(limit)
+            )
+            return list(session.exec(stmt).all())
+
+    def update_scheduled_publish_status(
+        self,
+        scheduled_publish_id: str,
+        *,
+        status: str,
+        error_message: str | None = None,
+        published_at: datetime | None = None,
+        cancelled_at: datetime | None = None,
+    ) -> ScheduledPublishTable | None:
+        with Session(self._engine) as session:
+            record = session.get(ScheduledPublishTable, scheduled_publish_id)
+            if record is None:
+                return None
+            record.status = status
+            record.error_message = error_message
+            record.published_at = published_at
+            record.cancelled_at = cancelled_at
+            record.updated_at = datetime.now(timezone.utc)
             session.add(record)
             session.commit()
             session.refresh(record)
@@ -432,7 +579,7 @@ class KachuRepository:
             run_id=run_id,
             original_ig_draft=ig_draft,
             original_google_draft=google_draft,
-            step="waiting_ig",
+            step="waiting_feedback",
         )
         with Session(self._engine) as session:
             session.add(session_record)
@@ -476,6 +623,26 @@ class KachuRepository:
 
     def complete_edit_session(self, session_id: str) -> None:
         self.advance_edit_session(session_id, "completed")
+
+    def update_approval_draft_content(self, run_id: str, draft_content: dict) -> None:
+        """Merge draft_content fields into the existing kachu_approval_tasks record.
+
+        Preserves fields like image_url that are not in draft_content.
+        """
+        with Session(self._engine) as session:
+            stmt = select(ApprovalTaskTable).where(ApprovalTaskTable.agentos_run_id == run_id)
+            record = session.exec(stmt).first()
+            if record:
+                existing: dict = {}
+                if record.draft_content:
+                    try:
+                        existing = json.loads(record.draft_content)
+                    except Exception:  # noqa: BLE001
+                        pass
+                existing.update(draft_content)
+                record.draft_content = json.dumps(existing, ensure_ascii=False)
+                session.add(record)
+                session.commit()
 
     # ── ConnectorAccount ──────────────────────────────────────────────────────
 

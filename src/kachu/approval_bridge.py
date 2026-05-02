@@ -66,11 +66,49 @@ class ApprovalBridge:
             )
             return
 
+        # Include local draft_content as edited_payload so AgentOS always publishes
+        # the (possibly regenerated) draft stored in our DB, not its original.
+        edited_payload: dict[str, Any] | None = None
+        if agentos_decision == "approved":
+            pending_rec = self._repo.get_pending_approval_by_run_id(run_id)
+            if pending_rec and pending_rec.draft_content:
+                try:
+                    edited_payload = json.loads(pending_rec.draft_content)
+                except Exception:  # noqa: BLE001
+                    pass
+
         decision = AgentOSApprovalDecision(
             decision=agentos_decision,
             actor_id=actor_line_id,
+            edited_payload=edited_payload,
         )
         run_view = await self._agentOS.decide_approval(approval_id, decision)
+
+        # If the run is still waiting_approval after user approval, there is a
+        # system-level checkpoint (e.g. "publish-content") that must be
+        # auto-approved to let AgentOS proceed to call the publish tool.
+        if agentos_decision == "approved" and run_view.run.get("status") == "waiting_approval":
+            system_approval_id = await self._agentOS.get_pending_approval_id_for_run(run_id)
+            if system_approval_id:
+                system_decision = AgentOSApprovalDecision(
+                    decision="approved",
+                    actor_id="system",
+                    edited_payload=None,
+                )
+                try:
+                    run_view = await self._agentOS.decide_approval(system_approval_id, system_decision)
+                    logger.info(
+                        "Auto-approved system checkpoint: run_id=%s approval_id=%s new_status=%s",
+                        run_id,
+                        system_approval_id,
+                        run_view.run.get("status"),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to auto-approve system checkpoint for run_id=%s approval_id=%s",
+                        run_id,
+                        system_approval_id,
+                    )
 
         self._repo.decide_pending_approval(
             agentos_run_id=run_id,
@@ -105,6 +143,62 @@ class ApprovalBridge:
             agentos_decision,
             run_view.run.get("status"),
         )
+
+    async def defer_with_schedule(
+        self,
+        *,
+        run_id: str,
+        tenant_id: str,
+        actor_line_id: str,
+        scheduled_for: str,
+    ) -> bool:
+        if not run_id:
+            logger.warning("Schedule defer received with empty run_id")
+            return False
+
+        approval_id = await self._agentOS.get_pending_approval_id_for_run(run_id)
+        if approval_id is None:
+            logger.warning(
+                "No pending approval found in AgentOS for scheduled run_id=%s",
+                run_id,
+            )
+            return False
+
+        decision = AgentOSApprovalDecision(
+            decision="rejected",
+            actor_id=actor_line_id,
+            edited_payload=None,
+        )
+        try:
+            run_view = await self._agentOS.decide_approval(approval_id, decision)
+        except (httpx.HTTPError, ValidationError) as exc:
+            logger.error("Failed to defer approval for run_id=%s: %s", run_id, exc)
+            return False
+
+        pending_rec = self._repo.decide_pending_approval(
+            agentos_run_id=run_id,
+            decision="scheduled",
+            actor_line_id=actor_line_id,
+        )
+        self._repo.save_audit_event(
+            tenant_id=tenant_id,
+            agentos_run_id=run_id,
+            workflow_type=(pending_rec.workflow_type if pending_rec else ""),
+            event_type="approval_scheduled",
+            actor_id=actor_line_id,
+            source="approval_bridge",
+            payload={
+                "scheduled_for": scheduled_for,
+                "new_run_status": run_view.run.get("status"),
+            },
+        )
+        logger.info(
+            "Approval deferred to schedule: run_id=%s scheduled_for=%s new_run_status=%s",
+            run_id,
+            scheduled_for,
+            run_view.run.get("status"),
+        )
+        return True
 
     async def _start_edit_session(
         self,
@@ -141,8 +235,8 @@ class ApprovalBridge:
                     to=actor_line_id,
                     messages=[
                         text_message(
-                            "好的！請輸入修改後的 IG / Facebook 文本：\n"
-                            "（如果不需要修改，輸入「跳過」）"
+                            "好的！你想怎麼調整這份草稿？\n"
+                            "（例如：語氣輕鬆一點、強調免費體驗、加入 hashtag）"
                         )
                     ],
                     access_token=self._settings.LINE_CHANNEL_ACCESS_TOKEN,

@@ -350,6 +350,10 @@ class TestDeferredDispatchRetry:
             google_post_frequency="daily",
             google_post_weekday="thu",
             google_post_hour=8,
+            meta_post_enabled=True,
+            meta_post_frequency="daily",
+            meta_post_weekday="fri",
+            meta_post_hour=8,
             proactive_enabled=False,
             proactive_hour=7,
             content_calendar_enabled=False,
@@ -364,7 +368,68 @@ class TestDeferredDispatchRetry:
         await scheduler._run_configured_automations()
 
         scheduler._trigger_ga4_report_for_tenant.assert_called_once()
-        scheduler._trigger_google_post_for_tenant.assert_called_once()
+        assert scheduler._trigger_google_post_for_tenant.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_scheduler_google_post_task_includes_platform_selection(self):
+        from kachu.scheduler import KachuScheduler
+
+        agentos = AsyncMock()
+        agentos.create_task.return_value = SimpleNamespace(task={"id": "task-1"})
+        repo = MagicMock()
+        scheduler = KachuScheduler(agentos, repo, settings=MagicMock())
+
+        await scheduler._trigger_google_post_for_tenant(
+            "tenant-A",
+            trigger_date="2026-05-02",
+            schedule_bucket="2026-05-02",
+            selected_platforms=["ig_fb"],
+            objective="Weekly Meta scheduled post",
+            idempotency_prefix="meta_post",
+        )
+
+        task_request = agentos.create_task.await_args.args[0]
+        assert task_request.domain == "kachu_google_post"
+        assert task_request.workflow_input["selected_platforms"] == ["ig_fb"]
+        assert task_request.objective == "Weekly Meta scheduled post"
+
+    @pytest.mark.asyncio
+    async def test_scheduler_dispatches_due_line_scheduled_publish(self):
+        from kachu.scheduler import KachuScheduler
+
+        repo = MagicMock()
+        repo.list_due_scheduled_publishes.return_value = [
+            SimpleNamespace(
+                id="sp-1",
+                tenant_id="tenant-1",
+                source_run_id="run-1",
+                workflow_type="kachu_google_post",
+                draft_content=json.dumps({"ig_fb": "今晚來店保養一下", "post_text": "今晚來店保養一下"}),
+                selected_platforms=json.dumps(["ig_fb"]),
+            )
+        ]
+        settings = MagicMock()
+        settings.KACHU_BASE_URL = "https://app.kachu.tw"
+        settings.KACHU_INTERNAL_API_KEY = "internal-key"
+        settings.AGENTOS_API_KEY = ""
+        scheduler = KachuScheduler(AsyncMock(), repo, settings=settings)
+
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json.return_value = {"status": "published"}
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=response)
+        client_cm = AsyncMock()
+        client_cm.__aenter__.return_value = client
+        client_cm.__aexit__.return_value = False
+
+        with patch("kachu.scheduler.httpx.AsyncClient", return_value=client_cm):
+            await scheduler._dispatch_scheduled_publishes()
+
+        client.post.assert_awaited_once()
+        assert client.post.await_args.args[0] == "https://app.kachu.tw/tools/publish-google-post"
+        assert client.post.await_args.kwargs["json"]["selected_platforms"] == ["ig_fb"]
+        repo.update_scheduled_publish_status.assert_any_call("sp-1", status="publishing")
 
 
 # ── SharedContext repository ──────────────────────────────────────────────────
@@ -450,14 +515,16 @@ class TestContextBriefManager:
         tenant.name = "好吃小館"
         tenant.industry_type = "餐廳"
         repo.save_tenant(tenant)
+        repo.update_onboarding_state("t1", "completed")
         repo.save_knowledge_entry(tenant_id="t1", category="product", content="雞腿飯是招牌")
         repo.save_knowledge_entry(tenant_id="t1", category="goal", content="這週先衝午餐客")
+        repo.save_knowledge_entry(tenant_id="t1", category="document", content="菜單顯示雞腿飯、排骨飯與例湯")
         repo.save_knowledge_entry(tenant_id="t1", category="style", content="口吻要自然直接")
         repo.save_conversation(
             tenant_id="t1",
-            role="owner",
+            role="boss",
             content="這週先衝午餐客，文案不要太空泛",
-            conversation_type="general",
+            conversation_type="onboarding",
         )
 
         memory = MagicMock()
@@ -471,8 +538,116 @@ class TestContextBriefManager:
         briefs = await manager.refresh_briefs("t1", reason="test")
 
         assert "雞腿飯是招牌" in briefs["brand_brief"]["products"]
+        assert briefs["brand_brief"]["document_highlights"][0].startswith("菜單顯示雞腿飯")
         assert briefs["owner_brief"]["current_priorities"][0].startswith("這週先衝午餐客")
         assert repo.get_shared_context("t1", "brand_brief")["brand_name"] == "好吃小館"
+
+    @pytest.mark.asyncio
+    async def test_refresh_briefs_reconciles_brand_identity_from_latest_documents(self):
+        from kachu.context_brief_manager import ContextBriefManager
+
+        repo = self._make_repo()
+        tenant = repo.get_or_create_tenant("t1")
+        tenant.name = "坐骨新經 陳老師"
+        tenant.industry_type = "保健食品"
+        tenant.address = "新北市泰山區仁義路222號"
+        repo.save_tenant(tenant)
+        repo.update_onboarding_state("t1", "completed")
+        repo.save_knowledge_entry(tenant_id="t1", category="basic_info", content="店名：坐骨新經 陳老師，行業：保健食品，地址：新北市泰山區仁義路222號")
+        repo.save_knowledge_entry(tenant_id="t1", category="document", content="【圖片分析】這是一張四時循養堂「疏通飲」的產品宣傳圖片，主打草本濃縮與日常調理。")
+
+        memory = MagicMock()
+        memory.get_preference_examples.side_effect = [[], []]
+        memory.get_recent_episodes.return_value = []
+
+        manager = ContextBriefManager(repo, memory)
+        briefs = await manager.refresh_briefs("t1", reason="test")
+
+        refreshed_tenant = repo.get_tenant("t1")
+        assert refreshed_tenant is not None
+        assert refreshed_tenant.name == "四時循養堂"
+        assert briefs["brand_brief"]["brand_name"] == "四時循養堂"
+        basic_info_entries = repo.get_knowledge_entries("t1", category="basic_info")
+        active_basic_info = [entry for entry in basic_info_entries if entry.status == "active"]
+        superseded_basic_info = [entry for entry in basic_info_entries if entry.status == "superseded"]
+        assert len(active_basic_info) == 1
+        assert "四時循養堂" in active_basic_info[0].content
+        assert len(superseded_basic_info) == 1
+
+    @pytest.mark.asyncio
+    async def test_refresh_briefs_does_not_reconcile_identity_before_onboarding_completed(self):
+        from kachu.context_brief_manager import ContextBriefManager
+
+        repo = self._make_repo()
+        tenant = repo.get_or_create_tenant("t1")
+        tenant.name = "坐骨新經 陳老師"
+        tenant.industry_type = "保健食品"
+        tenant.address = "新北市泰山區仁義路222號"
+        repo.save_tenant(tenant)
+        repo.save_knowledge_entry(tenant_id="t1", category="document", content="【圖片分析】這是一張四時循養堂「疏通飲」的產品宣傳圖片，主打草本濃縮與日常調理。")
+
+        memory = MagicMock()
+        memory.get_preference_examples.side_effect = [[], []]
+        memory.get_recent_episodes.return_value = []
+
+        manager = ContextBriefManager(repo, memory)
+        briefs = await manager.refresh_briefs("t1", reason="test")
+
+        refreshed_tenant = repo.get_tenant("t1")
+        assert refreshed_tenant is not None
+        assert refreshed_tenant.name == "坐骨新經 陳老師"
+        assert briefs["brand_brief"] == {}
+        assert repo.get_shared_context("t1", "brand_brief") is None
+
+    @pytest.mark.asyncio
+    async def test_refresh_briefs_extracts_products_from_documents_and_skips_noise(self):
+        from kachu.context_brief_manager import ContextBriefManager
+
+        repo = self._make_repo()
+        tenant = repo.get_or_create_tenant("t1")
+        tenant.name = "四時循養堂"
+        tenant.industry_type = "保健食品"
+        repo.save_tenant(tenant)
+        repo.update_onboarding_state("t1", "completed")
+        repo.save_knowledge_entry(
+            tenant_id="t1",
+            category="document",
+            content=(
+                "【圖片分析】這是一張四時循養堂疏通飲的產品宣傳圖片。\n"
+                "品項/內容：{'name': '疏通飲', 'description': '漢方濃縮・日常調理・支援行動力'}、{'name': '限時體驗', 'price': '0元'}\n"
+                "LINE：@fourseasons\n"
+                "品牌語氣：溫暖、專業、少官腔\n"
+                "注意事項：避免直接宣稱療效"
+            ),
+        )
+        repo.save_knowledge_entry(tenant_id="t1", category="document", content="那你覺得目標客群要怎麼設定？")
+        repo.save_conversation(
+            tenant_id="t1",
+            role="owner",
+            content="幫我寫一篇 Google 商家動態",
+            conversation_type="command",
+        )
+        repo.save_conversation(
+            tenant_id="t1",
+            role="boss",
+            content="這週先提升回購率",
+            conversation_type="onboarding",
+        )
+
+        memory = MagicMock()
+        memory.get_preference_examples.side_effect = [[], []]
+        memory.get_recent_episodes.return_value = []
+
+        manager = ContextBriefManager(repo, memory)
+        briefs = await manager.refresh_briefs("t1", reason="test")
+
+        assert any("疏通飲" in item for item in briefs["brand_brief"]["products"])
+        assert any("@fourseasons" in item for item in briefs["brand_brief"]["contact_points"])
+        assert any("限時體驗" in item for item in briefs["brand_brief"]["offers"])
+        assert any("避免直接宣稱療效" in item for item in briefs["brand_brief"]["restrictions"])
+        assert "溫暖" in briefs["brand_brief"]["tone"]
+        assert all("那你覺得" not in item for item in briefs["brand_brief"]["document_highlights"])
+        assert briefs["owner_brief"]["current_priorities"][0].startswith("這週先提升回購率")
 
 
 class TestAutomationSettings:

@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     LITELLM_MASTER_KEY: str = ""
     LITELLM_TENANT_BUDGET_DURATION: str = "monthly"
     LITELLM_MODEL: str = "gemini/gemini-3-flash-preview"  # direct model fallback
+    CONSULTANT_LLM_MODEL: str = "gemini/gemini-3-flash-preview"
 
     # ── AI API keys ───────────────────────────────────────────────────────────
     GOOGLE_AI_API_KEY: str = Field(
