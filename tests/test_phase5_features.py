@@ -227,13 +227,15 @@ class TestBusinessConsultant:
     @pytest.mark.asyncio
     async def test_build_reply_uses_brand_and_quick_reply(self):
         from kachu.business_consultant import BusinessConsultant
+        from kachu.conversation_context import CONSULTATION_CONVERSATION_TYPE
 
         repo = MagicMock()
         repo.get_or_create_tenant.return_value = SimpleNamespace(name="好吃小館", industry_type="餐廳")
-        repo.get_knowledge_entries.return_value = [
+        repo.get_active_knowledge_entries.return_value = [
             SimpleNamespace(category="product", content="雞腿飯是招牌品項"),
             SimpleNamespace(category="goal", content="想增加午餐時段來客"),
         ]
+        repo.list_recent_conversations.return_value = []
         def _shared_context(_tenant_id, context_type):
             if context_type == "ga4_recommendations":
                 return {"recommendations": [{"title": "強化午餐優惠"}]}
@@ -244,6 +246,10 @@ class TestBusinessConsultant:
         repo.get_shared_context.side_effect = _shared_context
         memory = MagicMock()
         memory.get_recent_episodes.return_value = []
+        memory.retrieve_relevant_knowledge = AsyncMock(return_value=[
+            {"category": "product", "content": "雞腿飯是招牌品項"},
+            {"category": "goal", "content": "想增加午餐時段來客"},
+        ])
         settings = MagicMock()
         settings.GOOGLE_AI_API_KEY = ""
         settings.OPENAI_API_KEY = ""
@@ -256,6 +262,12 @@ class TestBusinessConsultant:
         assert "餐飲" in reply["text"]
         assert "quickReply" in reply
         assert reply["quickReply"]["items"]
+        repo.list_recent_conversations.assert_called_once_with(
+            "t1",
+            conversation_type=CONSULTATION_CONVERSATION_TYPE,
+            limit=10,
+        )
+        memory.retrieve_relevant_knowledge.assert_awaited_once()
 
 
 class TestDeferredDispatchRetry:
