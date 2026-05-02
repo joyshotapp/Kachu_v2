@@ -309,3 +309,31 @@ async def test_oauth_pending_state_expires_after_ttl() -> None:
         assert await oauth_module._pop_pending_state(settings, "state-1") is None
 
     assert "state-1" not in oauth_module._pending_states
+
+
+def test_save_connector_account_updates_account_label_on_existing_record() -> None:
+    app = create_app(
+        Settings(
+            APP_ENV="development",
+            DATABASE_URL="sqlite://",
+        )
+    )
+    repo = app.state.repository
+
+    repo.save_connector_account(
+        tenant_id="tenant-1",
+        platform="meta",
+        credentials_json=json.dumps({"fb_page_id": "page-1"}),
+        account_label="Meta (Old Page)",
+    )
+    updated = repo.save_connector_account(
+        tenant_id="tenant-1",
+        platform="meta",
+        credentials_json=json.dumps({"fb_page_id": "page-2"}),
+        account_label="Meta (New Page)",
+    )
+
+    assert updated.account_label == "Meta (New Page)"
+    connector = repo.get_connector_account("tenant-1", "meta")
+    assert connector is not None
+    assert connector.account_label == "Meta (New Page)"

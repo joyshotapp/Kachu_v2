@@ -498,6 +498,7 @@ class KachuRepository:
             existing = session.exec(stmt).first()
             if existing:
                 existing.credentials_encrypted = credentials_json
+                existing.account_label = account_label
                 existing.last_refreshed_at = datetime.now(timezone.utc)
                 existing.updated_at = datetime.now(timezone.utc)
                 session.add(existing)
