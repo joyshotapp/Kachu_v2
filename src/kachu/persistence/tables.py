@@ -22,14 +22,28 @@ class TenantTable(SQLModel, table=True):
     name: str = Field(default="")
     industry_type: str = Field(default="")
     address: str = Field(default="")
-    # v1 alignment: line_boss_user_id → line_user_id (the owner's LINE user ID)
+    # Legacy v1/backfill compatibility: owner LINE user ID before memberships existed.
     line_user_id: str = Field(default="")
     timezone: str = Field(default="Asia/Taipei")
     plan: str = Field(default="trial")              # trial | starter | growth | pro
     plan_expires_at: Optional[datetime] = Field(default=None)
+    merchant_slug: str = Field(default="")
     is_active: bool = Field(default=True)
     quiet_hours_start: Optional[int] = Field(default=None)   # hour 0-23
     quiet_hours_end: Optional[int] = Field(default=None)     # hour 0-23
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class TenantMembershipTable(SQLModel, table=True):
+    __tablename__ = "kachu_tenant_memberships"
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    tenant_id: str = Field(index=True)
+    line_user_id: str = Field(index=True)
+    role: str = Field(default="owner")
+    display_name: str = Field(default="")
+    is_active: bool = Field(default=True)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -116,7 +130,7 @@ class KnowledgeEntryTable(SQLModel, table=True):
     source_id: Optional[str] = Field(default=None)
     # v1 alignment: qdrant_point_id replaces inline embedding for production
     qdrant_point_id: Optional[str] = Field(default=None)
-    # status: active | conflict | superseded | archived
+    # status: active | stale | conflict | superseded | archived
     status: str = Field(default="active")
     conflict_with: Optional[str] = Field(default=None)  # ID of conflicting entry
     # Phase 1 compat: inline embedding for in-process semantic search
@@ -124,6 +138,8 @@ class KnowledgeEntryTable(SQLModel, table=True):
     embedding: Optional[str] = Field(default=None)   # JSON-serialised list[float]
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+    last_retrieved_at: Optional[datetime] = Field(default=None)
+    last_reviewed_at: Optional[datetime] = Field(default=None)
 
 
 class KnowledgeDocumentTable(SQLModel, table=True):
@@ -184,6 +200,18 @@ class TenantLlmBudgetTable(SQLModel, table=True):
     enabled: bool = Field(default=True)
     last_synced_at: Optional[datetime] = Field(default=None)
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class TenantFeatureFlagTable(SQLModel, table=True):
+    """Per-tenant product feature switches for SaaS operations."""
+    __tablename__ = "kachu_tenant_feature_flags"
+
+    tenant_id: str = Field(primary_key=True)
+    ga4_enabled: bool = Field(default=True)
+    meta_enabled: bool = Field(default=True)
+    cross_channel_enabled: bool = Field(default=True)
+    crm_enabled: bool = Field(default=False)
+    updated_at: datetime = Field(default_factory=utcnow)
 
 
 class RetrievalFeedbackTable(SQLModel, table=True):

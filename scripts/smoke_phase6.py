@@ -60,7 +60,6 @@ def main() -> int:
         DATABASE_URL=args.database_url,
         LINE_CHANNEL_ACCESS_TOKEN="",
         LINE_CHANNEL_SECRET="",
-        LINE_BOSS_USER_ID="U_phase6_boss",
         AGENTOS_BASE_URL="http://agentos.local",
         KACHU_BASE_URL="http://kachu.local",
     )

@@ -29,7 +29,7 @@
 |---|---|---|
 | `LINE_CHANNEL_ACCESS_TOKEN` | [LINE Developers Console](https://developers.line.biz/) → Channel → Messaging API | 長效 token |
 | `LINE_CHANNEL_SECRET` | 同上 → Basic settings | Channel Secret |
-| `LINE_BOSS_USER_ID` | LINE 開發者工具，或傳訊息給 bot 後從 webhook payload 取得 `source.userId` |
+| `LINE_BOSS_USER_ID` | 選填；僅舊版單租戶 smoke 或本機 fallback 需要 | 多租戶 production 應改用 `kachu_tenant_memberships` 綁定，不作正式 routing 依據 |
 | `POSTGRES_PASSWORD` | 自訂，至少 20 個字元隨機字串 | 同時更新 `DATABASE_URL` 裡的密碼 |
 | `DATABASE_URL` | `postgresql+psycopg://kachu:<POSTGRES_PASSWORD>@postgres:5432/kachu` | 替換密碼 |
 | `GOOGLE_AI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) → API Keys | Gemini 用 |

@@ -14,6 +14,12 @@ from kachu.line import webhook as line_webhook_module
 from kachu.models import BossRouteDecision, BossRouteMode, Intent
 
 
+# These tests still keep a legacy boss id when they intentionally exercise the
+# single-boss compatibility path instead of membership-based tenant resolution.
+LEGACY_BOSS_ACTOR_USER_ID = "U123"
+LEGACY_FALLBACK_BOSS_USER_ID = "U-legacy-boss"
+
+
 @pytest.mark.asyncio
 async def test_download_line_content_retries_until_success() -> None:
     with patch(
@@ -109,6 +115,148 @@ async def test_schedule_publish_backfills_preview_image_url_for_photo_content() 
     assert saved_content["draft_content"]["image_url"].endswith(
         "/tools/approval-photo/run-photo-1"
     )
+
+
+@pytest.mark.asyncio
+async def test_schedule_publish_backfills_photo_source_for_photo_content() -> None:
+    repo = MagicMock()
+    repo.get_pending_approval_by_run_id.return_value = SimpleNamespace(
+        workflow_type="kachu_photo_content",
+        draft_content='{"ig_fb": "測試 IG 草稿", "google": "測試 Google 商家草稿"}',
+    )
+    repo.get_workflow_record_by_run_id.return_value = SimpleNamespace(
+        trigger_payload='{"photo_url": "data:image/jpeg;base64,ZmFrZS1pbWFnZQ=="}',
+    )
+
+    with patch(
+        "kachu.line.webhook.push_line_messages",
+        new=AsyncMock(),
+    ):
+        await line_webhook_module._handle_event(
+            event={
+                "type": "postback",
+                "source": {"userId": "U123"},
+                "postback": {"data": "action=schedule_publish&run_id=run-photo-1&tenant_id=U123"},
+            },
+            repo=repo,
+            agentOS_client=AsyncMock(),
+            approval_bridge=AsyncMock(),
+            intent_router=AsyncMock(),
+            onboarding_flow=AsyncMock(),
+            memory_manager=AsyncMock(),
+            settings=Settings(
+                APP_ENV="development",
+                DATABASE_URL="sqlite://",
+                LINE_CHANNEL_ACCESS_TOKEN="token",
+                LINE_BOSS_USER_ID="U123",
+                KACHU_BASE_URL="https://app.kachu.tw",
+            ),
+        )
+
+    saved_content = repo.save_shared_context.call_args.kwargs["content"]
+    assert saved_content["draft_content"]["approval_photo_source"].startswith(
+        "data:image/jpeg;base64,"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_schedule_reply_pushes_confirmation_message() -> None:
+    repo = MagicMock()
+    repo.get_shared_context.return_value = {
+        "run_id": "run-photo-1",
+        "workflow_type": "kachu_photo_content",
+        "draft_content": {"ig_fb": "測試 IG 草稿", "google": "測試 Google 草稿"},
+        "selected_platforms": ["ig_fb", "google"],
+    }
+    repo.get_tenant.return_value = SimpleNamespace(timezone="Asia/Taipei")
+
+    with patch(
+        "kachu.line.webhook.push_line_messages",
+        new=AsyncMock(),
+    ) as push_mock:
+        handled = await line_webhook_module._handle_pending_schedule_reply(
+            repo=repo,
+            tenant_id="tenant-001",
+            line_user_id="U123",
+            line_text="5月3日晚上8點",
+            settings=Settings(
+                APP_ENV="development",
+                DATABASE_URL="sqlite://",
+                LINE_CHANNEL_ACCESS_TOKEN="token",
+            ),
+        )
+
+    assert handled is True
+    save_calls = repo.save_shared_context.call_args_list
+    assert save_calls[0].kwargs["context_type"] == line_webhook_module._PENDING_SCHEDULE_CONFIRMATION
+    assert save_calls[0].kwargs["content"]["scheduled_label"] == "5月3日（週一）20:00"
+    assert push_mock.await_args.kwargs["messages"][0]["text"] == "我會在 5月3日（週一）20:00 幫你發布。確認無誤後，請點「確認排程」。"
+
+
+@pytest.mark.asyncio
+async def test_confirm_schedule_publish_defers_approval_and_persists_photo_schedule() -> None:
+    repo = MagicMock()
+    pending_confirmation = {
+        "run_id": "run-photo-1",
+        "workflow_type": "kachu_photo_content",
+        "draft_content": {
+            "ig_fb": "測試 IG 草稿",
+            "google": "測試 Google 草稿",
+        },
+        "selected_platforms": ["ig_fb", "google"],
+        "scheduled_for": "2026-05-03T12:00:00+00:00",
+        "scheduled_label": "5月3日（週一）20:00",
+    }
+    repo.get_shared_context.side_effect = (
+        lambda tenant_id, context_type: pending_confirmation
+        if context_type == line_webhook_module._PENDING_SCHEDULE_CONFIRMATION
+        else None
+    )
+    approval_bridge = AsyncMock()
+    approval_bridge.defer_with_schedule.return_value = True
+
+    with patch(
+        "kachu.line.webhook.push_line_messages",
+        new=AsyncMock(),
+    ) as push_mock:
+        await line_webhook_module._handle_event(
+            event={
+                "type": "postback",
+                "source": {"userId": "U123"},
+                "postback": {"data": "action=confirm_schedule_publish&run_id=run-photo-1&tenant_id=U123"},
+            },
+            repo=repo,
+            agentOS_client=AsyncMock(),
+            approval_bridge=approval_bridge,
+            intent_router=AsyncMock(),
+            onboarding_flow=AsyncMock(),
+            memory_manager=AsyncMock(),
+            settings=Settings(
+                APP_ENV="development",
+                DATABASE_URL="sqlite://",
+                LINE_CHANNEL_ACCESS_TOKEN="token",
+                LINE_BOSS_USER_ID="U123",
+                KACHU_BASE_URL="https://app.kachu.tw",
+            ),
+            context_brief_manager=AsyncMock(),
+            business_consultant=AsyncMock(),
+        )
+
+    approval_bridge.defer_with_schedule.assert_awaited_once_with(
+        run_id="run-photo-1",
+        tenant_id="U123",
+        actor_line_id="U123",
+        scheduled_for="2026-05-03T12:00:00+00:00",
+    )
+    repo.create_scheduled_publish.assert_called_once()
+    create_call = repo.create_scheduled_publish.call_args.kwargs
+    assert create_call["tenant_id"] == "U123"
+    assert create_call["source_run_id"] == "run-photo-1"
+    assert create_call["workflow_type"] == "kachu_photo_content"
+    assert create_call["selected_platforms"] == ["ig_fb", "google"]
+    assert create_call["scheduled_for"] == datetime.fromisoformat("2026-05-03T12:00:00+00:00")
+    assert create_call["draft_content"]["image_url"].endswith("/tools/approval-photo/run-photo-1")
+    assert push_mock.await_args.kwargs["messages"][0]["text"] == "好，我會在 5月3日（週一）20:00 幫你自動發布。"
 
 
 @pytest.mark.asyncio
@@ -779,6 +927,353 @@ async def test_pending_text_intent_manual_execute_reply_dispatches() -> None:
     intent_router.dispatch.assert_awaited_once()
     assert intent_router.dispatch.await_args.kwargs["intent"] == line_webhook_module.Intent.GA4_REPORT
     assert intent_router.dispatch.await_args.kwargs["trigger_payload"]["line_message_id"] == "msg-123"
+
+
+@pytest.mark.asyncio
+async def test_membership_bound_boss_message_uses_membership_tenant_id() -> None:
+    repo = MagicMock()
+    repo.get_active_membership_by_line_user_id.return_value = SimpleNamespace(
+        tenant_id="tenant-a",
+        line_user_id="U-member-a",
+        is_active=True,
+    )
+    repo.get_active_edit_session.return_value = None
+    repo.get_or_create_tenant.return_value = SimpleNamespace(name="四時循養堂", industry_type="保健")
+    repo.get_knowledge_entries.return_value = []
+    repo.get_shared_context.side_effect = [None, None]
+    onboarding_flow = MagicMock()
+    onboarding_flow.is_in_onboarding.return_value = False
+    intent_router = AsyncMock()
+    intent_router.plan_boss_message = AsyncMock(return_value=BossRouteDecision(
+        mode=BossRouteMode.EXECUTE,
+        intent=Intent.GA4_REPORT,
+        topic="流量概況",
+        actions=[],
+    ))
+
+    await line_webhook_module._handle_event(
+        event={
+            "type": "message",
+            "source": {"userId": "U-member-a"},
+            "message": {"id": "msg-member-1", "type": "text", "text": "幫我看這週流量"},
+        },
+        repo=repo,
+        agentOS_client=AsyncMock(),
+        approval_bridge=AsyncMock(),
+        intent_router=intent_router,
+        onboarding_flow=onboarding_flow,
+        memory_manager=AsyncMock(),
+        settings=Settings(
+            APP_ENV="development",
+            DATABASE_URL="sqlite://",
+            LINE_CHANNEL_ACCESS_TOKEN="token",
+            LINE_BOSS_USER_ID=LEGACY_FALLBACK_BOSS_USER_ID,
+        ),
+        context_brief_manager=AsyncMock(),
+        business_consultant=AsyncMock(),
+    )
+
+    intent_router.dispatch.assert_awaited_once()
+    assert intent_router.dispatch.await_args.kwargs["tenant_id"] == "tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_unbound_line_user_gets_safe_rejection() -> None:
+    repo = MagicMock()
+    repo.get_active_membership_by_line_user_id.return_value = None
+    onboarding_flow = MagicMock()
+    intent_router = AsyncMock()
+
+    with patch(
+        "kachu.line.webhook.push_line_messages",
+        new=AsyncMock(),
+    ) as push_mock:
+        await line_webhook_module._handle_event(
+            event={
+                "type": "message",
+                "source": {"userId": "U-unbound"},
+                "message": {"id": "msg-unbound-1", "type": "text", "text": "你好"},
+            },
+            repo=repo,
+            agentOS_client=AsyncMock(),
+            approval_bridge=AsyncMock(),
+            intent_router=intent_router,
+            onboarding_flow=onboarding_flow,
+            memory_manager=AsyncMock(),
+            settings=Settings(
+                APP_ENV="development",
+                DATABASE_URL="sqlite://",
+                LINE_CHANNEL_ACCESS_TOKEN="token",
+                LINE_BOSS_USER_ID=LEGACY_FALLBACK_BOSS_USER_ID,
+            ),
+            context_brief_manager=AsyncMock(),
+            business_consultant=AsyncMock(),
+        )
+
+    intent_router.dispatch.assert_not_awaited()
+    push_mock.assert_awaited_once()
+    assert "尚未綁定" in push_mock.await_args.kwargs["messages"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_membership_bound_postback_rejects_mismatched_tenant_id() -> None:
+    repo = MagicMock()
+    repo.get_active_membership_by_line_user_id.return_value = SimpleNamespace(
+        tenant_id="tenant-a",
+        line_user_id="U-member-a",
+        is_active=True,
+    )
+    onboarding_flow = MagicMock()
+    intent_router = AsyncMock()
+
+    with patch(
+        "kachu.line.webhook.push_line_messages",
+        new=AsyncMock(),
+    ) as push_mock:
+        await line_webhook_module._handle_event(
+            event={
+                "type": "postback",
+                "source": {"userId": "U-member-a"},
+                "postback": {"data": "action=retry_run&run_id=run-1&tenant_id=tenant-b"},
+            },
+            repo=repo,
+            agentOS_client=AsyncMock(),
+            approval_bridge=AsyncMock(),
+            intent_router=intent_router,
+            onboarding_flow=onboarding_flow,
+            memory_manager=AsyncMock(),
+            settings=Settings(
+                APP_ENV="development",
+                DATABASE_URL="sqlite://",
+                LINE_CHANNEL_ACCESS_TOKEN="token",
+            ),
+            context_brief_manager=AsyncMock(),
+            business_consultant=AsyncMock(),
+        )
+
+    intent_router.dispatch.assert_not_awaited()
+    push_mock.assert_awaited_once()
+    assert "不屬於你目前綁定的品牌" in push_mock.await_args.kwargs["messages"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_workflow_postback_preserves_selected_platforms_for_ig_fb() -> None:
+    repo = MagicMock()
+    repo.get_active_membership_by_line_user_id.return_value = SimpleNamespace(
+        tenant_id="tenant-a",
+        line_user_id="U-owner-a",
+        role="owner",
+        is_active=True,
+    )
+    onboarding_flow = MagicMock()
+    onboarding_flow.is_in_onboarding.return_value = False
+    intent_router = AsyncMock()
+
+    await line_webhook_module._handle_event(
+        event={
+            "type": "postback",
+            "timestamp": 1714895904000,
+            "source": {"userId": "U-owner-a"},
+            "postback": {
+                "data": "action=trigger_workflow&workflow=kachu_google_post&intent=google_post&topic=%E5%85%A7%E5%AE%B9%E8%A1%8C%E9%8A%B7&selected_platforms=ig_fb"
+            },
+        },
+        repo=repo,
+        agentOS_client=AsyncMock(),
+        approval_bridge=AsyncMock(),
+        intent_router=intent_router,
+        onboarding_flow=onboarding_flow,
+        memory_manager=AsyncMock(),
+        settings=Settings(
+            APP_ENV="development",
+            DATABASE_URL="sqlite://",
+            LINE_CHANNEL_ACCESS_TOKEN="token",
+        ),
+        context_brief_manager=AsyncMock(),
+        business_consultant=AsyncMock(),
+    )
+
+    intent_router.dispatch.assert_awaited_once()
+    assert intent_router.dispatch.await_args.kwargs["intent"] == line_webhook_module.Intent.GOOGLE_POST
+    assert intent_router.dispatch.await_args.kwargs["trigger_payload"]["line_event_ts"] == "1714895904000"
+    assert intent_router.dispatch.await_args.kwargs["trigger_payload"]["selected_platforms"] == ["ig_fb"]
+
+
+@pytest.mark.asyncio
+async def test_manager_membership_cannot_decide_approval_postback() -> None:
+    repo = MagicMock()
+    repo.get_active_membership_by_line_user_id.return_value = SimpleNamespace(
+        tenant_id="tenant-a",
+        line_user_id="U-manager-a",
+        role="manager",
+        is_active=True,
+    )
+    approval_bridge = AsyncMock()
+
+    with patch(
+        "kachu.line.webhook.push_line_messages",
+        new=AsyncMock(),
+    ) as push_mock:
+        await line_webhook_module._handle_event(
+            event={
+                "type": "postback",
+                "source": {"userId": "U-manager-a"},
+                "postback": {"data": "action=approve&run_id=run-1&tenant_id=tenant-a"},
+            },
+            repo=repo,
+            agentOS_client=AsyncMock(),
+            approval_bridge=approval_bridge,
+            intent_router=AsyncMock(),
+            onboarding_flow=MagicMock(),
+            memory_manager=AsyncMock(),
+            settings=Settings(
+                APP_ENV="development",
+                DATABASE_URL="sqlite://",
+                LINE_CHANNEL_ACCESS_TOKEN="token",
+            ),
+            context_brief_manager=AsyncMock(),
+            business_consultant=AsyncMock(),
+        )
+
+    approval_bridge.handle_postback.assert_not_awaited()
+    push_mock.assert_awaited_once()
+    assert "只開放品牌 owner" in push_mock.await_args.kwargs["messages"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_owner_membership_can_decide_approval_postback() -> None:
+    repo = MagicMock()
+    repo.get_active_membership_by_line_user_id.return_value = SimpleNamespace(
+        tenant_id="tenant-a",
+        line_user_id="U-owner-a",
+        role="owner",
+        is_active=True,
+    )
+    approval_bridge = AsyncMock()
+
+    await line_webhook_module._handle_event(
+        event={
+            "type": "postback",
+            "source": {"userId": "U-owner-a"},
+            "postback": {"data": "action=approve&run_id=run-1&tenant_id=tenant-a"},
+        },
+        repo=repo,
+        agentOS_client=AsyncMock(),
+        approval_bridge=approval_bridge,
+        intent_router=AsyncMock(),
+        onboarding_flow=MagicMock(),
+        memory_manager=AsyncMock(),
+        settings=Settings(
+            APP_ENV="development",
+            DATABASE_URL="sqlite://",
+            LINE_CHANNEL_ACCESS_TOKEN="token",
+        ),
+        context_brief_manager=AsyncMock(),
+        business_consultant=AsyncMock(),
+    )
+
+    approval_bridge.handle_postback.assert_awaited_once()
+    assert approval_bridge.handle_postback.await_args.kwargs["tenant_id"] == "tenant-a"
+    assert approval_bridge.handle_postback.await_args.kwargs["action"] == line_webhook_module.ApprovalAction.APPROVE
+
+
+@pytest.mark.asyncio
+async def test_manager_membership_cannot_retry_run_postback() -> None:
+    repo = MagicMock()
+    repo.get_active_membership_by_line_user_id.return_value = SimpleNamespace(
+        tenant_id="tenant-a",
+        line_user_id="U-manager-a",
+        role="manager",
+        is_active=True,
+    )
+    agentos = AsyncMock()
+
+    with patch(
+        "kachu.line.webhook.push_line_messages",
+        new=AsyncMock(),
+    ) as push_mock:
+        await line_webhook_module._handle_event(
+            event={
+                "type": "postback",
+                "source": {"userId": "U-manager-a"},
+                "postback": {"data": "action=retry_run&run_id=run-1&tenant_id=tenant-a"},
+            },
+            repo=repo,
+            agentOS_client=agentos,
+            approval_bridge=AsyncMock(),
+            intent_router=AsyncMock(),
+            onboarding_flow=MagicMock(),
+            memory_manager=AsyncMock(),
+            settings=Settings(
+                APP_ENV="development",
+                DATABASE_URL="sqlite://",
+                LINE_CHANNEL_ACCESS_TOKEN="token",
+            ),
+            context_brief_manager=AsyncMock(),
+            business_consultant=AsyncMock(),
+        )
+
+    agentos.retry_run.assert_not_awaited()
+    push_mock.assert_awaited_once()
+    assert "只開放品牌 owner" in push_mock.await_args.kwargs["messages"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_notification_source_question_replies_from_last_owner_notification_context() -> None:
+    repo = MagicMock()
+    repo.get_active_membership_by_line_user_id.return_value = SimpleNamespace(
+        tenant_id="tenant-a",
+        line_user_id="U-owner-a",
+        role="owner",
+        is_active=True,
+    )
+    repo.get_active_edit_session.return_value = None
+    repo.get_shared_context.side_effect = [
+        None,
+        None,
+        None,
+        {
+            "kind": "line_faq_escalation",
+            "customer_line_id": "U_customer_123",
+            "reason": "知識庫中沒有針對顧客招呼語的專屬回覆資訊。",
+        },
+    ]
+
+    with patch(
+        "kachu.line.webhook.push_line_messages",
+        new=AsyncMock(),
+    ) as push_mock:
+        intent_router = AsyncMock()
+        business_consultant = AsyncMock()
+
+        await line_webhook_module._handle_event(
+            event={
+                "type": "message",
+                "source": {"userId": "U-owner-a"},
+                "message": {"id": "msg-origin-1", "type": "text", "text": "這是哪裡來的訊息？"},
+            },
+            repo=repo,
+            agentOS_client=AsyncMock(),
+            approval_bridge=AsyncMock(),
+            intent_router=intent_router,
+            onboarding_flow=MagicMock(is_in_onboarding=MagicMock(return_value=False)),
+            memory_manager=AsyncMock(),
+            settings=Settings(
+                APP_ENV="development",
+                DATABASE_URL="sqlite://",
+                LINE_CHANNEL_ACCESS_TOKEN="token",
+            ),
+            context_brief_manager=AsyncMock(),
+            business_consultant=business_consultant,
+        )
+
+    intent_router.plan_boss_message.assert_not_awaited()
+    business_consultant.build_reply.assert_not_awaited()
+    push_mock.assert_awaited_once()
+    reply_text = push_mock.await_args.kwargs["messages"][0]["text"]
+    assert "顧客 FAQ 的人工接手通知" in reply_text
+    assert "U_customer_123" in reply_text
+    assert "招呼語" in reply_text
 
 
 def test_pending_asset_reply_prioritizes_consult_over_brand_keyword() -> None:

@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from kachu.config import Settings
+from kachu.line.flex_builder import build_photo_content_flex
 from kachu.main import create_app
 
 
@@ -37,7 +38,6 @@ def settings() -> Settings:
     return Settings(
         LINE_CHANNEL_ACCESS_TOKEN="",
         LINE_CHANNEL_SECRET="",
-        LINE_BOSS_USER_ID="U_boss_001",
         AGENTOS_BASE_URL="http://agentos-mock",
         KACHU_BASE_URL="http://localhost:8001",
         DATABASE_URL="sqlite://",
@@ -81,7 +81,6 @@ def test_analyze_photo_degrades_on_recoverable_http_error() -> None:
         Settings(
             LINE_CHANNEL_ACCESS_TOKEN="",
             LINE_CHANNEL_SECRET="",
-            LINE_BOSS_USER_ID="U_boss_001",
             AGENTOS_BASE_URL="http://agentos-mock",
             KACHU_BASE_URL="http://localhost:8001",
             DATABASE_URL="sqlite://",
@@ -112,7 +111,6 @@ def test_analyze_photo_re_raises_unexpected_system_error() -> None:
         Settings(
             LINE_CHANNEL_ACCESS_TOKEN="",
             LINE_CHANNEL_SECRET="",
-            LINE_BOSS_USER_ID="U_boss_001",
             AGENTOS_BASE_URL="http://agentos-mock",
             KACHU_BASE_URL="http://localhost:8001",
             DATABASE_URL="sqlite://",
@@ -349,9 +347,29 @@ def test_notify_approval_stores_pending(client: TestClient) -> None:
     assert record is not None
     assert record.status == "pending"
     assert record.workflow_type == "kachu_photo_content"
-    assert json.loads(record.draft_content)["image_url"].endswith(
+    draft_content = json.loads(record.draft_content)
+    assert draft_content["selected_platforms"] == ["ig_fb", "google"]
+    assert draft_content["image_url"].endswith(
         "/tools/approval-photo/run-phase0-001"
     )
+
+
+def test_build_photo_content_flex_preserves_drafts_and_four_actions() -> None:
+    bubble = build_photo_content_flex(
+        run_id="run-photo-flex-001",
+        tenant_id="tenant-001",
+        drafts={
+            "ig_fb": "這是 IG/FB 草稿",
+            "google": "這是 Google 草稿",
+        },
+    )
+
+    body_contents = bubble["body"]["contents"]
+    assert body_contents[1]["text"] == "這是 IG/FB 草稿"
+    assert body_contents[4]["text"] == "這是 Google 草稿"
+
+    footer_actions = [item["action"]["label"] for item in bubble["footer"]["contents"]]
+    assert footer_actions == ["🚀 立即發布", "🗓️ 排程發布", "✏️ 我要修改", "❌ 先不用"]
 
 
 def test_approval_photo_preview_returns_image_from_workflow_payload(client: TestClient) -> None:
@@ -376,12 +394,31 @@ def test_approval_photo_preview_returns_image_from_workflow_payload(client: Test
     assert resp.content == image_bytes
 
 
+def test_approval_photo_preview_falls_back_to_pending_approval_source(client: TestClient) -> None:
+    repo = client.app.state.repository
+    image_bytes = b"fallback-image-bytes"
+    repo.create_pending_approval(
+        tenant_id="tenant-001",
+        agentos_run_id="run-phase0-photo-preview-fallback",
+        workflow_type="kachu_photo_content",
+        draft_content={
+            "approval_photo_source": "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode(),
+            "image_url": "https://app.kachu.tw/tools/approval-photo/run-phase0-photo-preview-fallback",
+        },
+    )
+
+    resp = client.get("/tools/approval-photo/run-phase0-photo-preview-fallback")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/jpeg"
+    assert resp.content == image_bytes
+
+
 def test_notify_approval_pushes_photo_preview_before_flex() -> None:
     app = create_app(
         Settings(
             LINE_CHANNEL_ACCESS_TOKEN="line-token",
             LINE_CHANNEL_SECRET="",
-            LINE_BOSS_USER_ID="U_boss_001",
             AGENTOS_BASE_URL="http://agentos-mock",
             KACHU_BASE_URL="https://app.kachu.tw",
             DATABASE_URL="sqlite://",
@@ -390,6 +427,11 @@ def test_notify_approval_pushes_photo_preview_before_flex() -> None:
     )
     client = TestClient(app)
     repo = client.app.state.repository
+    repo.create_tenant_membership(
+        tenant_id="tenant-001",
+        line_user_id="U_owner_001",
+        role="owner",
+    )
     repo.create_workflow_record(
         tenant_id="tenant-001",
         agentos_run_id="run-phase0-photo-push",
@@ -424,6 +466,11 @@ def test_notify_approval_pushes_photo_preview_before_flex() -> None:
     assert body["messages"][0]["type"] == "image"
     assert body["messages"][0]["originalContentUrl"].endswith("/tools/approval-photo/run-phase0-photo-push")
     assert body["messages"][1]["type"] == "flex"
+
+    pending = repo.get_pending_approval_by_run_id("run-phase0-photo-push")
+    assert pending is not None
+    draft_content = json.loads(pending.draft_content)
+    assert draft_content["approval_photo_source"].startswith("data:image/jpeg;base64,")
 
 
 def test_publish_content_stub(client: TestClient) -> None:

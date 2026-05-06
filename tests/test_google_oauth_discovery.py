@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
+import pytest
 
-from kachu.auth.oauth import _store_pending_state_memory
+from kachu.auth.oauth import _push_line_texts, _store_pending_state_memory
 from kachu.config import Settings
 from kachu.google.business_client import GoogleBusinessClient
 from kachu.main import create_app
@@ -97,11 +99,15 @@ def test_google_callback_persists_discovered_account_and_location_ids() -> None:
         KACHU_BASE_URL="http://localhost:8001",
         LINE_CHANNEL_ACCESS_TOKEN="line-token",
         LINE_CHANNEL_SECRET="",
-        LINE_BOSS_USER_ID="U_boss",
         AGENTOS_BASE_URL="http://agentos-mock",
     )
     app = create_app(settings)
     client = TestClient(app)
+    app.state.repository.create_tenant_membership(
+        tenant_id="tenant-google-oauth",
+        line_user_id="U-owner-google",
+        role="owner",
+    )
 
     _store_pending_state_memory(
         "state-123",
@@ -140,6 +146,7 @@ def test_google_callback_persists_discovered_account_and_location_ids() -> None:
     assert "Google 商家授權已完成" in response.text
     assert "內部驗證流程" in response.text
     push_mock.assert_awaited_once()
+    assert push_mock.await_args.kwargs["to"] == "U-owner-google"
     pushed_messages = push_mock.await_args.kwargs["messages"]
     assert any("目前渠道狀態" in message["text"] for message in pushed_messages)
 
@@ -149,6 +156,135 @@ def test_google_callback_persists_discovered_account_and_location_ids() -> None:
     credentials = json.loads(connector.credentials_encrypted)
     assert credentials["account_id"] == "accounts/123456789"
     assert credentials["location_id"] == "accounts/123456789/locations/987654321"
+    assert credentials["location_title"] == "鴻笙堂 陳老師"
+
+
+def test_google_callback_renders_location_selection_when_multiple_locations() -> None:
+    settings = Settings(
+        APP_ENV="development",
+        DATABASE_URL="sqlite://",
+        GOOGLE_OAUTH_CLIENT_ID="client-id",
+        GOOGLE_OAUTH_CLIENT_SECRET="client-secret",
+        KACHU_BASE_URL="http://localhost:8001",
+        LINE_CHANNEL_ACCESS_TOKEN="line-token",
+        LINE_CHANNEL_SECRET="",
+        AGENTOS_BASE_URL="http://agentos-mock",
+    )
+    app = create_app(settings)
+    client = TestClient(app)
+
+    _store_pending_state_memory(
+        "state-google-many",
+        {"tenant_id": "tenant-google-many", "platforms": ["gbp"]},
+        600,
+    )
+
+    token_response = MagicMock()
+    token_response.status_code = 200
+    token_response.json.return_value = {
+        "access_token": "oauth-token",
+        "refresh_token": "refresh-token",
+        "expires_in": 3600,
+        "scope": "https://www.googleapis.com/auth/business.manage",
+        "token_type": "Bearer",
+    }
+
+    discovery_client = MagicMock()
+    discovery_client.list_accounts.return_value = [
+        {"name": "accounts/123456789", "accountName": "Test Account"}
+    ]
+    discovery_client.list_locations.return_value = [
+        {"name": "accounts/123456789/locations/111", "title": "店家 A"},
+        {"name": "accounts/123456789/locations/222", "title": "店家 B"},
+    ]
+
+    with patch("httpx.AsyncClient.post", return_value=token_response), patch(
+        "kachu.google.business_client.GoogleBusinessClient.from_oauth_token",
+        return_value=discovery_client,
+    ), patch("kachu.auth.oauth.push_line_messages", new_callable=AsyncMock) as push_mock:
+        response = client.get(
+            "/auth/google/callback",
+            params={"code": "oauth-code", "state": "state-google-many"},
+        )
+
+    assert response.status_code == 200
+    assert "選擇要綁定的 Google 商家" in response.text
+    assert "店家 A" in response.text
+    assert "店家 B" in response.text
+    push_mock.assert_not_awaited()
+
+    repo = app.state.repository
+    connector = repo.get_connector_account("tenant-google-many", "google_business")
+    assert connector is None
+
+
+def test_google_select_location_persists_chosen_location() -> None:
+    settings = Settings(
+        APP_ENV="development",
+        DATABASE_URL="sqlite://",
+        GOOGLE_OAUTH_CLIENT_ID="client-id",
+        GOOGLE_OAUTH_CLIENT_SECRET="client-secret",
+        KACHU_BASE_URL="http://localhost:8001",
+        LINE_CHANNEL_ACCESS_TOKEN="line-token",
+        LINE_CHANNEL_SECRET="",
+        AGENTOS_BASE_URL="http://agentos-mock",
+    )
+    app = create_app(settings)
+    client = TestClient(app)
+    app.state.repository.create_tenant_membership(
+        tenant_id="tenant-google-many",
+        line_user_id="U-owner-google-many",
+        role="owner",
+    )
+
+    _store_pending_state_memory(
+        "google-selection-123",
+        {
+            "tenant_id": "tenant-google-many",
+            "platforms": ["gbp"],
+            "google_token_data": {
+                "access_token": "oauth-token",
+                "refresh_token": "refresh-token",
+                "expires_in": 3600,
+                "scope": "https://www.googleapis.com/auth/business.manage",
+                "token_type": "Bearer",
+            },
+            "google_locations": [
+                {
+                    "account_id": "accounts/123456789",
+                    "account_name": "Test Account",
+                    "location_id": "accounts/123456789/locations/222",
+                    "location_title": "店家 B",
+                    "store_code": "B-001",
+                }
+            ],
+        },
+        600,
+    )
+
+    with patch("kachu.auth.oauth.push_line_messages", new_callable=AsyncMock) as push_mock:
+        response = client.get(
+            "/auth/google/select-location",
+            params={
+                "selection_token": "google-selection-123",
+                "location_id": "accounts/123456789/locations/222",
+            },
+        )
+
+    assert response.status_code == 200
+    assert "Google 商家授權已完成" in response.text
+    assert "店家 B" in response.text
+    push_mock.assert_awaited_once()
+    pushed_messages = push_mock.await_args.kwargs["messages"]
+    assert any("店家 B" in message["text"] for message in pushed_messages)
+
+    repo = app.state.repository
+    connector = repo.get_connector_account("tenant-google-many", "google_business")
+    assert connector is not None
+    credentials = json.loads(connector.credentials_encrypted)
+    assert credentials["account_id"] == "accounts/123456789"
+    assert credentials["location_id"] == "accounts/123456789/locations/222"
+    assert credentials["location_title"] == "店家 B"
 
 
 def test_meta_callback_persists_ids_and_returns_success_page() -> None:
@@ -163,6 +299,11 @@ def test_meta_callback_persists_ids_and_returns_success_page() -> None:
     )
     app = create_app(settings)
     client = TestClient(app)
+    app.state.repository.create_tenant_membership(
+        tenant_id="tenant-meta-oauth",
+        line_user_id="U-owner-meta",
+        role="owner",
+    )
 
     _store_pending_state_memory(
         "state-meta-123",
@@ -210,6 +351,7 @@ def test_meta_callback_persists_ids_and_returns_success_page() -> None:
     assert response.status_code == 200
     assert "Meta 已連結成功" in response.text
     push_mock.assert_awaited_once()
+    assert push_mock.await_args.kwargs["to"] == "U-owner-meta"
     pushed_messages = push_mock.await_args.kwargs["messages"]
     assert any("目前渠道狀態" in message["text"] for message in pushed_messages)
 
@@ -382,6 +524,11 @@ def test_meta_select_page_persists_chosen_page() -> None:
     )
     app = create_app(settings)
     client = TestClient(app)
+    app.state.repository.create_tenant_membership(
+        tenant_id="tenant-meta-many",
+        line_user_id="U-owner-meta-many",
+        role="owner",
+    )
 
     _store_pending_state_memory(
         "selection-token-123",
@@ -410,6 +557,7 @@ def test_meta_select_page_persists_chosen_page() -> None:
     assert response.status_code == 200
     assert "粉專 B" in response.text
     push_mock.assert_awaited_once()
+    assert push_mock.await_args.kwargs["to"] == "U-owner-meta-many"
     pushed_messages = push_mock.await_args.kwargs["messages"]
     assert any("目前渠道狀態" in message["text"] for message in pushed_messages)
 
@@ -422,3 +570,38 @@ def test_meta_select_page_persists_chosen_page() -> None:
     assert credentials["fb_page_id"] == "fb-page-002"
     assert credentials["fb_page_name"] == "粉專 B"
     assert credentials["ig_user_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_oauth_push_line_texts_continues_after_single_recipient_failure() -> None:
+    settings = Settings(
+        APP_ENV="development",
+        DATABASE_URL="sqlite://",
+        LINE_CHANNEL_ACCESS_TOKEN="line-token",
+        LINE_CHANNEL_SECRET="",
+        AGENTOS_BASE_URL="http://agentos-mock",
+    )
+    app = create_app(settings)
+    repo = app.state.repository
+    repo.create_tenant_membership(
+        tenant_id="tenant-multi-owner",
+        line_user_id="U-owner-1",
+        role="owner",
+    )
+    repo.create_tenant_membership(
+        tenant_id="tenant-multi-owner",
+        line_user_id="U-manager-1",
+        role="manager",
+    )
+
+    failed_request = httpx.Request("POST", "https://api.line.me/v2/bot/message/push")
+
+    with patch(
+        "kachu.auth.oauth.push_line_messages",
+        new=AsyncMock(side_effect=[httpx.ConnectError("boom", request=failed_request), None]),
+    ) as push_mock:
+        await _push_line_texts(settings, repo, "tenant-multi-owner", ["OAuth 完成"])
+
+    assert push_mock.await_count == 2
+    assert push_mock.await_args_list[0].kwargs["to"] == "U-owner-1"
+    assert push_mock.await_args_list[1].kwargs["to"] == "U-manager-1"

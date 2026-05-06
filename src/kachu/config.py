@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     LINE_LOGIN_CHANNEL_ID: str = ""
     LINE_LOGIN_CHANNEL_SECRET: str = ""
     LINE_REDIRECT_URI: str = ""
-    LINE_BOSS_USER_ID: str = ""   # v2-specific single-tenant boss LINE user ID
+    LINE_BOSS_USER_ID: str = ""   # legacy/local-dev fallback only; production routing should use tenant memberships
     OAUTH_STATE_STORE_BACKEND: str = "auto"  # auto | redis | memory
     OAUTH_STATE_TTL_SECONDS: int = 600
 

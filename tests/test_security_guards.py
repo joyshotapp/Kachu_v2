@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from kachu.auth import oauth as oauth_module
 from kachu.config import Settings
 from kachu.main import create_app
+from kachu.persistence import db as db_module
 
 
 def test_create_app_rejects_missing_production_config() -> None:
@@ -33,7 +34,9 @@ def test_create_app_rejects_missing_production_config() -> None:
 
 
 def test_create_app_rejects_production_schema_autocreate_without_opt_in() -> None:
-    with pytest.raises(RuntimeError, match="Automatic schema creation is disabled in production"):
+    with patch("kachu.main.assert_schema_migrated") as assert_schema_migrated_mock, patch(
+        "kachu.main.init_db"
+    ) as init_db_mock:
         create_app(
             Settings(
                 APP_ENV="production",
@@ -46,6 +49,34 @@ def test_create_app_rejects_production_schema_autocreate_without_opt_in() -> Non
                 OPENAI_API_KEY="openai-key",
             )
         )
+    assert_schema_migrated_mock.assert_called_once()
+    assert init_db_mock.call_args.kwargs["create_schema"] is False
+
+
+def test_create_app_requires_migrations_when_production_schema_autocreate_disabled() -> None:
+    with patch(
+        "kachu.main.assert_schema_migrated",
+        side_effect=RuntimeError("Database schema is not ready for production startup"),
+    ):
+        with pytest.raises(RuntimeError, match="Database schema is not ready for production startup"):
+            create_app(
+                Settings(
+                    APP_ENV="production",
+                    DATABASE_URL="sqlite://",
+                    SECRET_KEY="secret",
+                    TOKEN_ENCRYPTION_KEY="encrypt",
+                    LINE_CHANNEL_ACCESS_TOKEN="token",
+                    LINE_CHANNEL_SECRET="secret",
+                    ADMIN_SERVICE_TOKEN="dashboard-token",
+                    OPENAI_API_KEY="openai-key",
+                )
+            )
+
+
+def test_project_root_discovery_falls_back_to_cwd_for_installed_package(monkeypatch) -> None:
+    monkeypatch.chdir("/Users/yuchuchen/Desktop/Kachu_v2")
+    with patch.object(db_module, "__file__", "/usr/local/lib/python3.12/site-packages/kachu/persistence/db.py"):
+        assert db_module._project_root() == db_module.Path("/Users/yuchuchen/Desktop/Kachu_v2")
 
 
 def test_create_app_requires_meta_secret_when_feature_enabled() -> None:

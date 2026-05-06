@@ -8,9 +8,11 @@ Tests for Phase 5:
 from __future__ import annotations
 
 import json
+import pathlib
+import tempfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -27,6 +29,7 @@ class TestProactiveMonitor:
         from kachu.proactive_monitor import ProactiveMonitorAgent
         repo = MagicMock()
         repo.list_active_tenant_ids.return_value = ["t1"]
+        repo.get_owner_line_user_ids.return_value = ["owner-t1"]
         repo.get_last_published_at.return_value = _utcnow() - timedelta(days=3)
         repo.get_pending_negative_reviews.return_value = 0
         repo.get_knowledge_last_updated_at.return_value = _utcnow() - timedelta(days=30)
@@ -37,7 +40,7 @@ class TestProactiveMonitor:
             setattr(repo, k, MagicMock(return_value=v))
         agentOS = MagicMock()
         settings = MagicMock()
-        settings.LINE_BOSS_USER_ID = "boss-1"
+        settings.LINE_BOSS_USER_ID = ""
         settings.LINE_CHANNEL_ACCESS_TOKEN = "token-1"
         settings.MAX_PUSH_PER_DAY = 3
         return ProactiveMonitorAgent(agentOS, repo, settings), repo
@@ -83,6 +86,18 @@ class TestProactiveMonitor:
         )
         result = agent._detect_nudge("t1")
         assert result == NUDGE_STALE_KNOWLEDGE
+
+    @pytest.mark.asyncio
+    async def test_scan_runs_knowledge_lifecycle_refresh_before_detection(self):
+        agent, repo = self._make_agent(
+            get_last_published_at=_utcnow() - timedelta(days=10),
+        )
+        repo.refresh_knowledge_lifecycle = MagicMock(return_value={"updated": 1, "summary": {}})
+
+        with patch("kachu.proactive_monitor.push_line_messages", new=AsyncMock()):
+            await agent.scan_and_nudge()
+
+        repo.refresh_knowledge_lifecycle.assert_called_once_with("t1", stale_after_days=60)
 
     @pytest.mark.asyncio
     async def test_scan_triggers_nudge(self):
@@ -146,6 +161,18 @@ class TestProactiveMonitor:
 
         push_mock.assert_not_called()
         repo.record_push.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_trigger_nudge_uses_tenant_owner_recipient(self):
+        from kachu.proactive_monitor import NUDGE_NO_POST
+
+        agent, repo = self._make_agent()
+        repo.get_owner_line_user_ids.return_value = ["owner-tenant-1"]
+        with patch("kachu.proactive_monitor.push_line_messages", new=AsyncMock()) as push_mock:
+            await agent._trigger_nudge("t1", NUDGE_NO_POST, "2026-04-27")
+
+        push_mock.assert_awaited_once()
+        assert push_mock.await_args.kwargs["to"] == "owner-tenant-1"
 
 
 # ── GoalParser ────────────────────────────────────────────────────────────────
@@ -222,6 +249,25 @@ class TestGoalParser:
         assert qr["items"][0]["action"]["type"] == "postback"
         assert "workflow=kachu_ga4_report" in qr["items"][0]["action"]["data"]
 
+    def test_build_quick_reply_items_preserve_meta_platform_selection(self):
+        from kachu.goal_parser import GoalParser
+
+        settings = MagicMock()
+        settings.GOOGLE_AI_API_KEY = ""
+        settings.OPENAI_API_KEY = ""
+        parser = GoalParser(settings)
+
+        qr = parser.build_line_quick_reply([
+            {
+                "label": "幫我寫一篇 IG/FB 貼文",
+                "intent": "google_post",
+                "topic": "內容行銷",
+                "selected_platforms": "ig_fb",
+            }
+        ])
+
+        assert "selected_platforms=ig_fb" in qr["items"][0]["action"]["data"]
+
 
 class TestBusinessConsultant:
     @pytest.mark.asyncio
@@ -265,9 +311,39 @@ class TestBusinessConsultant:
         repo.list_recent_conversations.assert_called_once_with(
             "t1",
             conversation_type=CONSULTATION_CONVERSATION_TYPE,
-            limit=10,
+            limit=24,
         )
         memory.retrieve_relevant_knowledge.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_build_reply_persists_consultation_summary_for_older_history(self):
+        from kachu.business_consultant import BusinessConsultant
+
+        repo = MagicMock()
+        repo.get_or_create_tenant.return_value = SimpleNamespace(name="好吃小館", industry_type="餐廳")
+        repo.get_active_knowledge_entries.return_value = []
+        repo.get_shared_context.return_value = {}
+        repo.list_recent_conversations.return_value = [
+            SimpleNamespace(role="owner", content=f"第{i}次想討論午餐策略", timestamp=i)
+            for i in range(12, 0, -1)
+        ]
+        memory = MagicMock()
+        memory.get_recent_episodes.return_value = []
+        memory.retrieve_relevant_knowledge = AsyncMock(return_value=[])
+        settings = MagicMock()
+        settings.GOOGLE_AI_API_KEY = ""
+        settings.OPENAI_API_KEY = ""
+        settings.LITELLM_MODEL = "gemini/test"
+
+        consultant = BusinessConsultant(repo, memory, settings)
+        await consultant.build_reply(tenant_id="t1", message="最近生意有點慢怎麼辦")
+
+        repo.save_shared_context.assert_called_once()
+        kwargs = repo.save_shared_context.call_args.kwargs
+        assert kwargs["tenant_id"] == "t1"
+        assert kwargs["context_type"] == "consultation_conversation_summary"
+        assert kwargs["content"]["conversation_count"] == 6
+        assert kwargs["content"]["summary"]
 
 
 class TestDeferredDispatchRetry:
@@ -430,6 +506,62 @@ class TestDeferredDispatchRetry:
         assert client.post.await_args.args[0] == "https://app.kachu.tw/tools/publish-google-post"
         assert client.post.await_args.kwargs["json"]["selected_platforms"] == ["ig_fb"]
         repo.update_scheduled_publish_status.assert_any_call("sp-1", status="publishing")
+
+    @pytest.mark.asyncio
+    async def test_scheduler_marks_photo_scheduled_publish_completed_from_nested_results(self):
+        from kachu.scheduler import KachuScheduler
+
+        repo = MagicMock()
+        repo.list_due_scheduled_publishes.return_value = [
+            SimpleNamespace(
+                id="sp-photo-1",
+                tenant_id="tenant-1",
+                source_run_id="run-photo-1",
+                workflow_type="kachu_photo_content",
+                draft_content=json.dumps({"ig_fb": "caption", "google": "google text", "image_url": "https://example.com/photo.jpg"}),
+                selected_platforms=json.dumps(["ig_fb", "google"]),
+            )
+        ]
+        settings = MagicMock()
+        settings.KACHU_BASE_URL = "https://app.kachu.tw"
+        settings.KACHU_INTERNAL_API_KEY = "internal-key"
+        settings.AGENTOS_API_KEY = ""
+        scheduler = KachuScheduler(AsyncMock(), repo, settings=settings)
+
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json.return_value = {
+            "status": "done",
+            "run_id": "run-photo-1",
+            "results": {
+                "google": {"status": "skipped", "reason": "credentials or text missing"},
+                "ig_fb": {"status": "done", "facebook": {"status": "published", "fb_post_id": "fb-post-1"}},
+            },
+        }
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=response)
+        client_cm = AsyncMock()
+        client_cm.__aenter__.return_value = client
+        client_cm.__aexit__.return_value = False
+
+        with patch("kachu.scheduler.httpx.AsyncClient", return_value=client_cm):
+            await scheduler._dispatch_scheduled_publishes()
+
+        repo.update_scheduled_publish_status.assert_any_call("sp-photo-1", status="publishing")
+        repo.update_scheduled_publish_status.assert_any_call(
+            "sp-photo-1",
+            status="published",
+            error_message=None,
+            published_at=ANY,
+        )
+        repo.save_audit_event.assert_any_call(
+            tenant_id="tenant-1",
+            agentos_run_id="run-photo-1",
+            workflow_type="kachu_photo_content",
+            event_type="scheduled_publish_completed",
+            source="scheduler",
+            payload={"scheduled_publish_id": "sp-photo-1", "result": response.json.return_value},
+        )
 
 
 # ── SharedContext repository ──────────────────────────────────────────────────
@@ -649,6 +781,38 @@ class TestContextBriefManager:
         assert all("那你覺得" not in item for item in briefs["brand_brief"]["document_highlights"])
         assert briefs["owner_brief"]["current_priorities"][0].startswith("這週先提升回購率")
 
+    @pytest.mark.asyncio
+    async def test_refresh_briefs_compresses_older_owner_history(self):
+        from kachu.context_brief_manager import ContextBriefManager
+
+        repo = self._make_repo()
+        tenant = repo.get_or_create_tenant("t1")
+        tenant.name = "好吃小館"
+        tenant.industry_type = "餐廳"
+        repo.save_tenant(tenant)
+        repo.update_onboarding_state("t1", "completed")
+
+        for index in range(12):
+            repo.save_conversation(
+                tenant_id="t1",
+                role="owner",
+                content=f"第{index}次在意午餐來客與套餐轉換",
+                conversation_type="command",
+            )
+
+        memory = MagicMock()
+        memory.get_preference_examples.side_effect = [[], []]
+        memory.get_recent_episodes.return_value = []
+
+        manager = ContextBriefManager(repo, memory)
+        briefs = await manager.refresh_briefs("t1", reason="test")
+
+        owner_history = repo.get_shared_context("t1", "owner_conversation_summary")
+        assert owner_history is not None
+        assert owner_history["conversation_count"] == 4
+        assert owner_history["summary"]
+        assert briefs["owner_brief"]["historical_summary"] == owner_history["summary"]
+
 
 class TestAutomationSettings:
     def _make_repo(self):
@@ -689,7 +853,6 @@ class TestAutomationSettingsDashboardApi:
                 Settings(
                     LINE_CHANNEL_ACCESS_TOKEN="",
                     LINE_CHANNEL_SECRET="",
-                    LINE_BOSS_USER_ID="boss-automation",
                     ADMIN_SERVICE_TOKEN="dashboard-token",
                     AGENTOS_BASE_URL="http://agentos-mock",
                     KACHU_BASE_URL="http://localhost:8001",
@@ -699,8 +862,9 @@ class TestAutomationSettingsDashboardApi:
         )
 
         headers = {"Authorization": "Bearer dashboard-token"}
+        tenant_id = "tenant-dashboard"
 
-        response = client.get("/dashboard/api/automation-settings", headers=headers)
+        response = client.get(f"/dashboard/api/automation-settings?tenant_id={tenant_id}", headers=headers)
         assert response.status_code == 200
         assert response.json()["ga_report_frequency"] == "weekly"
 
@@ -708,6 +872,7 @@ class TestAutomationSettingsDashboardApi:
             "/dashboard/api/automation-settings",
             headers=headers,
             json={
+            "tenant_id": tenant_id,
                 "timezone": "Asia/Tokyo",
                 "ga_report_enabled": True,
                 "ga_report_frequency": "daily",
@@ -741,7 +906,6 @@ class TestAutomationSettingsDashboardApi:
                 Settings(
                     LINE_CHANNEL_ACCESS_TOKEN="",
                     LINE_CHANNEL_SECRET="",
-                    LINE_BOSS_USER_ID="boss-automation",
                     ADMIN_SERVICE_TOKEN="dashboard-token",
                     AGENTOS_BASE_URL="http://agentos-mock",
                     KACHU_BASE_URL="http://localhost:8001",
@@ -752,6 +916,77 @@ class TestAutomationSettingsDashboardApi:
 
         response = client.get("/dashboard/api/automation-settings")
         assert response.status_code == 401
+
+    def test_dashboard_html_accepts_query_token_for_browser_bootstrap(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        client = TestClient(
+            create_app(
+                Settings(
+                    LINE_CHANNEL_ACCESS_TOKEN="",
+                    LINE_CHANNEL_SECRET="",
+                    ADMIN_SERVICE_TOKEN="dashboard-token",
+                    AGENTOS_BASE_URL="http://agentos-mock",
+                    KACHU_BASE_URL="http://localhost:8001",
+                    DATABASE_URL="sqlite://",
+                )
+            )
+        )
+
+        response = client.get("/dashboard?token=dashboard-token")
+        assert response.status_code == 200
+        assert "Kachu 管理後台" in response.text
+
+    def test_dashboard_api_rejects_query_token_without_bearer_header(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        client = TestClient(
+            create_app(
+                Settings(
+                    LINE_CHANNEL_ACCESS_TOKEN="",
+                    LINE_CHANNEL_SECRET="",
+                    ADMIN_SERVICE_TOKEN="dashboard-token",
+                    AGENTOS_BASE_URL="http://agentos-mock",
+                    KACHU_BASE_URL="http://localhost:8001",
+                    DATABASE_URL="sqlite://",
+                )
+            )
+        )
+
+        response = client.get("/dashboard/api/automation-settings?tenant_id=tenant-dashboard&token=dashboard-token")
+        assert response.status_code == 401
+
+    def test_dashboard_requires_tenant_id(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        client = TestClient(
+            create_app(
+                Settings(
+                    LINE_CHANNEL_ACCESS_TOKEN="",
+                    LINE_CHANNEL_SECRET="",
+                    ADMIN_SERVICE_TOKEN="dashboard-token",
+                    AGENTOS_BASE_URL="http://agentos-mock",
+                    KACHU_BASE_URL="http://localhost:8001",
+                    DATABASE_URL="sqlite://",
+                )
+            )
+        )
+
+        response = client.get(
+            "/dashboard/api/automation-settings",
+            headers={"Authorization": "Bearer dashboard-token"},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "tenant_id is required"
 
     def test_dashboard_rejects_invalid_timezone(self):
         from fastapi.testclient import TestClient
@@ -764,7 +999,6 @@ class TestAutomationSettingsDashboardApi:
                 Settings(
                     LINE_CHANNEL_ACCESS_TOKEN="",
                     LINE_CHANNEL_SECRET="",
-                    LINE_BOSS_USER_ID="boss-automation",
                     ADMIN_SERVICE_TOKEN="dashboard-token",
                     AGENTOS_BASE_URL="http://agentos-mock",
                     KACHU_BASE_URL="http://localhost:8001",
@@ -776,10 +1010,523 @@ class TestAutomationSettingsDashboardApi:
         response = client.put(
             "/dashboard/api/automation-settings",
             headers={"Authorization": "Bearer dashboard-token"},
-            json={"timezone": "Mars/Phobos"},
+            json={"tenant_id": "tenant-dashboard", "timezone": "Mars/Phobos"},
         )
         assert response.status_code == 400
         assert response.json()["detail"] == "Invalid timezone"
+
+    def test_dashboard_can_disconnect_connector(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        app = create_app(
+            Settings(
+                LINE_CHANNEL_ACCESS_TOKEN="",
+                LINE_CHANNEL_SECRET="",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
+                AGENTOS_BASE_URL="http://agentos-mock",
+                KACHU_BASE_URL="http://localhost:8001",
+                DATABASE_URL="sqlite://",
+            )
+        )
+        client = TestClient(app)
+        repo = app.state.repository
+        repo.save_connector_account(
+            tenant_id="tenant-dashboard",
+            platform="meta",
+            credentials_json='{"access_token":"meta-token"}',
+            account_label="Meta Page",
+        )
+
+        response = client.post(
+            "/dashboard/api/connectors/disconnect",
+            headers={"Authorization": "Bearer dashboard-token"},
+            json={"tenant_id": "tenant-dashboard", "platform": "meta"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "disconnected"
+        assert repo.get_connector_account("tenant-dashboard", "meta") is None
+        audit_events = repo.list_audit_events(tenant_id="tenant-dashboard", event_type="connector_disconnected")
+        assert len(audit_events) == 1
+
+    def test_dashboard_can_update_tenant_settings_and_read_health(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        app = create_app(
+            Settings(
+                LINE_CHANNEL_ACCESS_TOKEN="",
+                LINE_CHANNEL_SECRET="",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
+                AGENTOS_BASE_URL="http://agentos-mock",
+                KACHU_BASE_URL="http://localhost:8001",
+                DATABASE_URL="sqlite://",
+            )
+        )
+        client = TestClient(app)
+        repo = app.state.repository
+        headers = {"Authorization": "Bearer dashboard-token"}
+
+        tenant = repo.get_or_create_tenant("tenant-settings")
+        tenant.name = "Settings Tenant"
+        repo.save_tenant(tenant)
+        repo.create_tenant_membership(
+            tenant_id="tenant-settings",
+            line_user_id="U-owner-settings",
+            role="owner",
+        )
+        repo.save_connector_account(
+            tenant_id="tenant-settings",
+            platform="google_business",
+            credentials_json=json.dumps({"access_token": "google-token", "refresh_status": "healthy"}),
+            account_label="Google",
+        )
+        completed = repo.create_workflow_record(
+            tenant_id="tenant-settings",
+            agentos_run_id="run-health-ok",
+            agentos_task_id="task-health-ok",
+            workflow_type="photo_content",
+            trigger_source="dashboard",
+            trigger_payload={},
+        )
+        repo.update_workflow_record_status(completed.id, "completed")
+        failed = repo.create_workflow_record(
+            tenant_id="tenant-settings",
+            agentos_run_id="run-health-fail",
+            agentos_task_id="task-health-fail",
+            workflow_type="ga4_report",
+            trigger_source="dashboard",
+            trigger_payload={},
+        )
+        repo.update_workflow_record_status(failed.id, "failed")
+
+        settings_resp = client.get(
+            "/dashboard/api/tenants/settings?tenant_id=tenant-settings",
+            headers=headers,
+        )
+        assert settings_resp.status_code == 200
+        assert settings_resp.json()["plan"] == "trial"
+        assert settings_resp.json()["capabilities"]["ga4"]["allowed"] is True
+
+        updated = client.put(
+            "/dashboard/api/tenants/settings",
+            headers=headers,
+            json={
+                "tenant_id": "tenant-settings",
+                "plan": "starter",
+                "merchant_slug": "settings-merchant",
+                "ga4_enabled": True,
+                "meta_enabled": False,
+                "cross_channel_enabled": False,
+                "crm_enabled": False,
+            },
+        )
+        assert updated.status_code == 200
+        payload = updated.json()
+        assert payload["plan"] == "starter"
+        assert payload["merchant_slug"] == "settings-merchant"
+        assert payload["meta_enabled"] is False
+        assert payload["capabilities"]["cross_channel"]["allowed"] is False
+
+        health = client.get(
+            "/dashboard/api/tenants/health?tenant_id=tenant-settings",
+            headers=headers,
+        )
+        assert health.status_code == 200
+        body = health.json()
+        assert body["tenant"]["id"] == "tenant-settings"
+        assert body["tenant"]["merchant_slug"] == "settings-merchant"
+        assert body["alerts"]["recent_failures"] == 1
+        assert body["recent_activity"]["active_memberships"] == 1
+        assert body["connectors"][0]["platform"] == "google_business"
+
+    def test_dashboard_can_refresh_knowledge_lifecycle_and_update_status(self):
+        from datetime import datetime, timedelta, timezone
+
+        from fastapi.testclient import TestClient
+        from sqlmodel import Session
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+        from kachu.persistence.tables import KnowledgeEntryTable
+
+        app = create_app(
+            Settings(
+                LINE_CHANNEL_ACCESS_TOKEN="",
+                LINE_CHANNEL_SECRET="",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
+                AGENTOS_BASE_URL="http://agentos-mock",
+                KACHU_BASE_URL="http://localhost:8001",
+                DATABASE_URL="sqlite://",
+            )
+        )
+        client = TestClient(app)
+        repo = app.state.repository
+        headers = {"Authorization": "Bearer dashboard-token"}
+
+        stale_entry = repo.save_knowledge_entry(
+            tenant_id="tenant-dashboard",
+            category="product",
+            content="舊版活動文案",
+            source_type="manual",
+        )
+        active_entry = repo.save_knowledge_entry(
+            tenant_id="tenant-dashboard",
+            category="basic_info",
+            content="店名：Kachu",
+            source_type="manual",
+        )
+
+        with Session(repo._engine) as session:
+            row = session.get(KnowledgeEntryTable, stale_entry.id)
+            assert row is not None
+            row.updated_at = datetime.now(timezone.utc) - timedelta(days=75)
+            row.last_reviewed_at = datetime.now(timezone.utc) - timedelta(days=75)
+            session.add(row)
+            session.commit()
+
+        refreshed = client.post(
+            "/dashboard/api/knowledge/lifecycle/refresh",
+            headers=headers,
+            json={"tenant_id": "tenant-dashboard", "stale_after_days": 60},
+        )
+        assert refreshed.status_code == 200
+        assert refreshed.json()["updated"] == 1
+
+        listing = client.get(
+            "/dashboard/api/knowledge?tenant_id=tenant-dashboard&status=stale",
+            headers=headers,
+        )
+        assert listing.status_code == 200
+        body = listing.json()
+        assert len(body["entries"]) == 1
+        assert body["lifecycle"]["by_status"]["stale"] == 1
+
+        reactivated = client.post(
+            f"/dashboard/api/knowledge/{stale_entry.id}/status",
+            headers=headers,
+            json={"tenant_id": "tenant-dashboard", "status": "active"},
+        )
+        assert reactivated.status_code == 200
+        assert reactivated.json()["entry"]["status"] == "active"
+
+        conflicted = client.post(
+            f"/dashboard/api/knowledge/{active_entry.id}/status",
+            headers=headers,
+            json={"tenant_id": "tenant-dashboard", "status": "conflict", "conflict_with": stale_entry.id},
+        )
+        assert conflicted.status_code == 200
+        assert conflicted.json()["entry"]["status"] == "conflict"
+        assert conflicted.json()["entry"]["conflict_with"] == stale_entry.id
+
+    def test_dashboard_tenant_settings_can_create_missing_tenant(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        client = TestClient(
+            create_app(
+                Settings(
+                    LINE_CHANNEL_ACCESS_TOKEN="",
+                    LINE_CHANNEL_SECRET="",
+                    ADMIN_SERVICE_TOKEN="dashboard-token",
+                    AGENTOS_BASE_URL="http://agentos-mock",
+                    KACHU_BASE_URL="http://localhost:8001",
+                    DATABASE_URL="sqlite://",
+                )
+            )
+        )
+
+        response = client.get(
+            "/dashboard/api/tenants/settings?tenant_id=tenant-new",
+            headers={"Authorization": "Bearer dashboard-token"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["tenant_id"] == "tenant-new"
+        assert response.json()["plan"] == "trial"
+
+    def test_dashboard_can_force_refresh_google_connector(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        app = create_app(
+            Settings(
+                LINE_CHANNEL_ACCESS_TOKEN="",
+                LINE_CHANNEL_SECRET="",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
+                AGENTOS_BASE_URL="http://agentos-mock",
+                KACHU_BASE_URL="http://localhost:8001",
+                DATABASE_URL="sqlite://",
+                GOOGLE_OAUTH_CLIENT_ID="cid",
+                GOOGLE_OAUTH_CLIENT_SECRET="secret",
+            )
+        )
+        client = TestClient(app)
+        repo = app.state.repository
+        repo.save_connector_account(
+            tenant_id="tenant-refresh",
+            platform="google_business",
+            credentials_json=json.dumps(
+                {
+                    "access_token": "old-token",
+                    "refresh_token": "refresh-token",
+                    "account_id": "acct-1",
+                    "location_id": "loc-1",
+                    "expires_at": 1,
+                }
+            ),
+            account_label="Google",
+        )
+
+        with patch("kachu.tenant_runtime.httpx.post") as httpx_post:
+            response = MagicMock()
+            response.status_code = 200
+            response.json.return_value = {"access_token": "new-token", "expires_in": 3600}
+            httpx_post.return_value = response
+
+            refreshed = client.post(
+                "/dashboard/api/connectors/refresh",
+                headers={"Authorization": "Bearer dashboard-token"},
+                json={"tenant_id": "tenant-refresh", "platform": "google_business"},
+            )
+
+        assert refreshed.status_code == 200
+        assert refreshed.json()["status"] == "refreshed"
+        assert refreshed.json()["connector"]["refresh_status"] == "healthy"
+        saved = repo.get_connector_account("tenant-refresh", "google_business")
+        saved_creds = json.loads(saved.credentials_encrypted)
+        assert saved_creds["access_token"] == "new-token"
+        assert repo.list_audit_events(tenant_id="tenant-refresh", event_type="connector_refreshed")
+
+    def test_dashboard_connector_refresh_surfaces_failure(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        app = create_app(
+            Settings(
+                LINE_CHANNEL_ACCESS_TOKEN="",
+                LINE_CHANNEL_SECRET="",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
+                AGENTOS_BASE_URL="http://agentos-mock",
+                KACHU_BASE_URL="http://localhost:8001",
+                DATABASE_URL="sqlite://",
+                GOOGLE_OAUTH_CLIENT_ID="cid",
+                GOOGLE_OAUTH_CLIENT_SECRET="secret",
+            )
+        )
+        client = TestClient(app)
+        repo = app.state.repository
+        repo.save_connector_account(
+            tenant_id="tenant-refresh-fail",
+            platform="google_business",
+            credentials_json=json.dumps(
+                {
+                    "access_token": "stale-token",
+                    "refresh_token": "refresh-token",
+                    "account_id": "acct-1",
+                    "location_id": "loc-1",
+                    "expires_at": 1,
+                }
+            ),
+            account_label="Google",
+        )
+
+        with patch("kachu.tenant_runtime.httpx.post") as httpx_post:
+            response = MagicMock()
+            response.status_code = 400
+            response.text = "invalid_grant"
+            httpx_post.return_value = response
+
+            refreshed = client.post(
+                "/dashboard/api/connectors/refresh",
+                headers={"Authorization": "Bearer dashboard-token"},
+                json={"tenant_id": "tenant-refresh-fail", "platform": "google_business"},
+            )
+
+        assert refreshed.status_code == 400
+        assert "HTTP 400" in refreshed.json()["detail"]
+        saved = repo.get_connector_account("tenant-refresh-fail", "google_business")
+        saved_creds = json.loads(saved.credentials_encrypted)
+        assert saved_creds["refresh_status"] == "failed"
+        assert saved_creds["last_refresh_error"].startswith("HTTP 400")
+
+    def test_dashboard_can_deactivate_export_and_delete_tenant(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        app = create_app(
+            Settings(
+                LINE_CHANNEL_ACCESS_TOKEN="",
+                LINE_CHANNEL_SECRET="",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
+                AGENTOS_BASE_URL="http://agentos-mock",
+                KACHU_BASE_URL="http://localhost:8001",
+                DATABASE_URL="sqlite://",
+            )
+        )
+        client = TestClient(app)
+        repo = app.state.repository
+
+        tenant = repo.get_or_create_tenant("tenant-ops")
+        tenant.name = "Ops Tenant"
+        repo.save_tenant(tenant)
+        repo.create_tenant_membership(
+            tenant_id="tenant-ops",
+            line_user_id="U-owner-ops",
+            role="owner",
+        )
+        repo.save_connector_account(
+            tenant_id="tenant-ops",
+            platform="google_business",
+            credentials_json='{"access_token":"google-token"}',
+            account_label="Google",
+        )
+        repo.save_knowledge_entry(
+            tenant_id="tenant-ops",
+            category="basic_info",
+            content="店名：Ops Tenant",
+        )
+
+        deactivate_resp = client.post(
+            "/dashboard/api/tenants/deactivate",
+            headers={"Authorization": "Bearer dashboard-token"},
+            json={"tenant_id": "tenant-ops"},
+        )
+        assert deactivate_resp.status_code == 200
+        assert deactivate_resp.json()["status"] == "deactivated"
+        assert repo.get_tenant("tenant-ops").is_active is False
+        assert repo.list_active_memberships("tenant-ops") == []
+        assert repo.get_connector_account("tenant-ops", "google_business") is None
+
+        export_resp = client.get(
+            "/dashboard/api/tenants/export?tenant_id=tenant-ops",
+            headers={"Authorization": "Bearer dashboard-token"},
+        )
+        assert export_resp.status_code == 200
+        export_body = export_resp.json()
+        assert export_body["tenant"]["id"] == "tenant-ops"
+        assert export_body["tenant"]["is_active"] is False
+        assert len(export_body["knowledge_entries"]) == 1
+
+        delete_resp = client.post(
+            "/dashboard/api/tenants/delete",
+            headers={"Authorization": "Bearer dashboard-token"},
+            json={"tenant_id": "tenant-ops", "confirm_tenant_id": "tenant-ops"},
+        )
+        assert delete_resp.status_code == 200
+        assert delete_resp.json()["status"] == "deleted"
+        assert repo.get_tenant("tenant-ops") is None
+        assert repo.get_knowledge_entries("tenant-ops") == []
+
+    def test_dashboard_delete_tenant_requires_matching_confirmation(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        client = TestClient(
+            create_app(
+                Settings(
+                    LINE_CHANNEL_ACCESS_TOKEN="",
+                    LINE_CHANNEL_SECRET="",
+                    ADMIN_SERVICE_TOKEN="dashboard-token",
+                    AGENTOS_BASE_URL="http://agentos-mock",
+                    KACHU_BASE_URL="http://localhost:8001",
+                    DATABASE_URL="sqlite://",
+                )
+            )
+        )
+
+        response = client.post(
+            "/dashboard/api/tenants/delete",
+            headers={"Authorization": "Bearer dashboard-token"},
+            json={"tenant_id": "tenant-ops", "confirm_tenant_id": "different-tenant"},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "confirm_tenant_id must match tenant_id"
+
+    def test_dashboard_can_read_and_update_merchant_page_payload(self):
+        from fastapi.testclient import TestClient
+
+        from kachu.config import Settings
+        from kachu.main import create_app
+
+        app = create_app(
+            Settings(
+                LINE_CHANNEL_ACCESS_TOKEN="",
+                LINE_CHANNEL_SECRET="",
+                ADMIN_SERVICE_TOKEN="dashboard-token",
+                AGENTOS_BASE_URL="http://agentos-mock",
+                KACHU_BASE_URL="http://localhost:8001",
+                DATABASE_URL="sqlite://",
+            )
+        )
+        client = TestClient(app)
+        repo = app.state.repository
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            merchant_dir = pathlib.Path(temp_dir)
+            app.state.merchant_page_dir = merchant_dir
+            tenant = repo.get_or_create_tenant("tenant-dashboard")
+            tenant.name = "示範商家"
+            tenant.industry_type = "測試分類"
+            tenant.address = "台北市測試路 1 號"
+            repo.save_tenant(tenant)
+            repo.update_tenant_plan(
+                "tenant-dashboard",
+                plan="trial",
+                plan_expires_at=None,
+                merchant_slug="demo-merchant",
+            )
+
+            template = client.get(
+                "/dashboard/api/merchant-page/template?tenant_id=tenant-dashboard",
+                headers={"Authorization": "Bearer dashboard-token"},
+            )
+
+            assert template.status_code == 200
+            payload = template.json()["payload"]
+            assert payload["merchant_name"] == "示範商家"
+            assert payload["category"] == "測試分類"
+            assert payload["address"] == "台北市測試路 1 號"
+            assert payload["canonical_url"] == "http://localhost:8001/merchants/demo-merchant"
+
+            updated = client.put(
+                "/dashboard/api/merchant-page",
+                headers={"Authorization": "Bearer dashboard-token"},
+                json={
+                    "tenant_id": "tenant-dashboard",
+                    "payload": payload,
+                },
+            )
+
+            assert updated.status_code == 200
+            assert updated.json()["merchant_slug"] == "demo-merchant"
+            assert updated.json()["payload"]["merchant_name"] == "示範商家"
+            assert (merchant_dir / "demo-merchant.json").exists()
+
+            loaded = client.get(
+                "/dashboard/api/merchant-page?tenant_id=tenant-dashboard",
+                headers={"Authorization": "Bearer dashboard-token"},
+            )
+
+            assert loaded.status_code == 200
+            assert loaded.json()["public_url"] == "http://localhost:8001/merchants/demo-merchant"
+            audit_events = repo.list_audit_events(tenant_id="tenant-dashboard", event_type="merchant_page_updated")
+            assert len(audit_events) == 1
 
 
 # ── compute_and_save_approval_profile ────────────────────────────────────────

@@ -39,7 +39,7 @@ dev = [
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
-kachu = ["static/*"]
+kachu = ["static/*", "static/**/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

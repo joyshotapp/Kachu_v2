@@ -8,6 +8,7 @@ import httpx
 from .conversation_context import (
     CONSULTATION_CONVERSATION_TYPE,
     CONSULTATION_KNOWLEDGE_CATEGORIES,
+    build_conversation_digest,
 )
 from .goal_parser import GoalParser
 from .industry_playbook import build_industry_context
@@ -18,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 class BusinessConsultant:
     """Builds a contextual consultant-style reply for boss free-form messages."""
+
+    CONSULTATION_FETCH_LIMIT = 24
+    CONSULTATION_RECENT_LIMIT = 6
 
     def __init__(self, repo, memory, settings) -> None:
         self._repo = repo
@@ -35,6 +39,7 @@ class BusinessConsultant:
         calendar_ctx = self._repo.get_shared_context(tenant_id, "monthly_content_calendar") or {}
         brand_brief = self._repo.get_shared_context(tenant_id, "brand_brief") or {}
         owner_brief = self._repo.get_shared_context(tenant_id, "owner_brief") or {}
+        consultation_summary = self._repo.get_shared_context(tenant_id, "consultation_conversation_summary") or {}
         industry_context = build_industry_context(tenant.industry_type)
         actions = await self._goal_parser.parse(message)
         relevant_entries = await self._memory.retrieve_relevant_knowledge(
@@ -43,9 +48,21 @@ class BusinessConsultant:
             top_k=6,
             categories=list(CONSULTATION_KNOWLEDGE_CATEGORIES),
         )
-        recent_convs = self._repo.list_recent_conversations(
-            tenant_id, conversation_type=CONSULTATION_CONVERSATION_TYPE, limit=10
+        conversation_pool = self._repo.list_recent_conversations(
+            tenant_id,
+            conversation_type=CONSULTATION_CONVERSATION_TYPE,
+            limit=self.CONSULTATION_FETCH_LIMIT,
         )
+        recent_convs = conversation_pool[: self.CONSULTATION_RECENT_LIMIT]
+        older_convs = sorted(
+            conversation_pool[self.CONSULTATION_RECENT_LIMIT :],
+            key=lambda message: message.timestamp,
+        )
+        if older_convs or consultation_summary:
+            consultation_summary = self._refresh_consultation_summary(
+                tenant_id=tenant_id,
+                messages=older_convs,
+            )
 
         key_facts = [
             item["content"]
@@ -70,6 +87,7 @@ class BusinessConsultant:
             calendar_ctx=calendar_ctx,
             brand_brief=brand_brief,
             owner_brief=owner_brief,
+            consultation_summary=consultation_summary,
             recent_episodes=recent_episodes,
             conversation_history=recent_convs,
         )
@@ -95,6 +113,7 @@ class BusinessConsultant:
         calendar_ctx: dict[str, Any],
         brand_brief: dict[str, Any],
         owner_brief: dict[str, Any],
+        consultation_summary: dict[str, Any],
         recent_episodes: list[dict[str, Any]],
         conversation_history: list,
     ) -> str:
@@ -111,6 +130,7 @@ class BusinessConsultant:
         ga4_titles = "、".join(item.get("title", "") for item in ga4_ctx.get("recommendations", [])[:2] if item.get("title"))
         brand_summary = brand_brief.get("summary", "")
         owner_priority = "、".join(owner_brief.get("current_priorities", [])[:2])
+        older_consultation_summary = consultation_summary.get("summary", "")
         relevant_summary = "；".join(item[:120] for item in relevant_knowledge[:3])
         episode_summary = "；".join(
             f"{item.get('workflow_type', '')}:{item.get('outcome', '')}"
@@ -147,6 +167,7 @@ class BusinessConsultant:
                     f"已知重點：{'；'.join(key_facts) or '尚未建立完整品牌知識'}\n"
                     f"本題最相關知識：{relevant_summary or '暫無'}\n"
                     f"老闆近期優先事項：{owner_priority or '暫無'}\n"
+                    f"較早對話摘要：{older_consultation_summary or '暫無'}\n"
                     f"行業顧問焦點：{consultant_focus}\n"
                     f"GA4建議：{ga4_titles or '暫無'}｜月曆主題：{calendar_hint or '暫無'}\n"
                     f"近期工作流結果：{episode_summary or '暫無'}\n"
@@ -177,5 +198,23 @@ class BusinessConsultant:
             parts.append(next_market_event + "。")
         if owner_priority:
             parts.append(f"我會先對齊你最近在意的 {owner_priority}。")
+        if older_consultation_summary:
+            parts.append(f"我也會延續你前面提過的 {older_consultation_summary[:40]}。")
         parts.append("你可以直接點下面的建議，我幫你接著做。")
         return "\n".join(parts)
+
+    def _refresh_consultation_summary(self, *, tenant_id: str, messages: list) -> dict[str, Any]:
+        owner_messages = [message for message in messages if getattr(message, "role", "") in {"owner", "boss"}]
+        items = build_conversation_digest(owner_messages, max_items=4, max_length=88)
+        payload = {
+            "summary": "；".join(items[:3]),
+            "items": items,
+            "conversation_count": len(owner_messages),
+        }
+        self._repo.save_shared_context(
+            tenant_id=tenant_id,
+            context_type="consultation_conversation_summary",
+            content=payload,
+            ttl_hours=30 * 24,
+        )
+        return payload

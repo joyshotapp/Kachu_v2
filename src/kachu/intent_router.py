@@ -13,6 +13,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .agentOS_client import AgentOSClient
 from .goal_parser import GoalParser
+from .line.flex_builder import build_google_post_flex, build_meta_post_flex
+from .line.push import push_line_messages, resolve_tenant_line_recipients, text_message
 from .models import AgentOSTaskRequest, BossRouteDecision, BossRouteMode, Intent
 from .persistence import KachuRepository
 
@@ -53,6 +55,58 @@ def _build_business_profile_update_idempotency_key(
     trigger_date = datetime.now(timezone.utc).date().isoformat()
     return f"{tenant_id}:business_profile_update:{trigger_date}:{message_hash}"
 
+
+def _build_google_post_idempotency_key(
+    *,
+    tenant_id: str,
+    trigger_source: str,
+    topic: str,
+    selected_platforms: list[str],
+    line_message_id: str = "",
+    line_event_ts: str = "",
+) -> str | None:
+    if line_message_id:
+        return f"{tenant_id}:google_post:{trigger_source}:{line_message_id}"
+    if line_event_ts:
+        return f"{tenant_id}:google_post:{trigger_source}:{line_event_ts}"
+    if trigger_source not in {"line", "line_cta"}:
+        return None
+
+    message_hash = hashlib.sha1(
+        f"{_normalize_message_for_idempotency(topic)}|{','.join(selected_platforms)}".encode("utf-8")
+    ).hexdigest()[:16]
+    trigger_date = datetime.now(timezone.utc).date().isoformat()
+    return f"{tenant_id}:google_post:{trigger_source}:{trigger_date}:{message_hash}"
+
+
+def _normalize_selected_platforms(raw_value: Any) -> list[str]:
+    if isinstance(raw_value, str):
+        candidates = [part.strip() for part in raw_value.split(",")]
+    elif isinstance(raw_value, (list, tuple, set)):
+        candidates = [str(part).strip() for part in raw_value]
+    else:
+        candidates = []
+
+    normalized: list[str] = []
+    for candidate in candidates:
+        if candidate in {"ig_fb", "google"} and candidate not in normalized:
+            normalized.append(candidate)
+    return normalized
+
+
+def _resolve_google_post_platforms(trigger_payload: dict[str, Any]) -> list[str]:
+    explicit_platforms = _normalize_selected_platforms(trigger_payload.get("selected_platforms"))
+    if explicit_platforms:
+        return explicit_platforms
+
+    combined_text = " ".join(
+        str(part or "")
+        for part in (trigger_payload.get("message"), trigger_payload.get("topic"))
+    ).lower()
+    if any(cue in combined_text for cue in _META_ONLY_POST_CUES):
+        return ["ig_fb"]
+    return ["google"]
+
 # ── Keyword shortcuts (fast path, before LLM) ────────────────────────────────
 
 _BUSINESS_PROFILE_UPDATE_KW = frozenset([
@@ -66,6 +120,10 @@ _KNOWLEDGE_UPDATE_KW = frozenset([
 _GOOGLE_POST_KW = frozenset([
     "寫一篇", "發一篇", "幫我寫", "幫我發", "寫個", "發個", "寫動態", "發動態",
     "商家動態", "活動公告", "限時優惠",
+])
+_META_ONLY_POST_CUES = frozenset([
+    "ig/fb", "ig fb", "ig、fb", "ig 與 fb", "ig和fb", "ig跟fb",
+    "instagram", "facebook", "ig", "fb", "meta",
 ])
 _GA4_KW = frozenset([
     "報告", "流量", "數據", "統計", "生意怎樣", "業績", "訪客", "點擊",
@@ -475,11 +533,15 @@ class IntentRouter:
         trigger_payload: dict[str, Any],
     ) -> None:
         topic = trigger_payload.get("topic", trigger_payload.get("message", ""))
+        selected_platforms = _resolve_google_post_platforms(trigger_payload)
+        line_message_id = str(trigger_payload.get("line_message_id", "")).strip()
+        line_event_ts = str(trigger_payload.get("line_event_ts", "")).strip()
         hints = self._resolve_policy_hints(tenant_id)
         workflow_input: dict[str, Any] = {
             "tenant_id": tenant_id,
             "topic": topic,
             "trigger_source": "boss_request",
+            "selected_platforms": selected_platforms,
         }
         workflow_input.update(hints.to_workflow_input_patch())
         task_request = AgentOSTaskRequest(
@@ -488,13 +550,21 @@ class IntentRouter:
             objective=f"Generate Google Business post: {topic[:80]}",
             risk_level="medium",
             workflow_input=workflow_input,
+            idempotency_key=_build_google_post_idempotency_key(
+                tenant_id=tenant_id,
+                trigger_source=trigger_source,
+                topic=topic,
+                selected_platforms=selected_platforms,
+                line_message_id=line_message_id,
+                line_event_ts=line_event_ts,
+            ),
         )
         await self._create_and_run(
             task_request=task_request,
             workflow_type="google_post",
             tenant_id=tenant_id,
             trigger_source=trigger_source,
-            trigger_payload=trigger_payload,
+            trigger_payload={**trigger_payload, "selected_platforms": selected_platforms},
         )
 
     async def _dispatch_ga4_report(
@@ -606,13 +676,19 @@ class IntentRouter:
                 )
         except (httpx.HTTPError, Exception) as exc:
             logger.error("_dispatch_meta_insights failed for tenant=%s: %s", tenant_id, exc)
-            if getattr(settings, "LINE_BOSS_USER_ID", "") and getattr(settings, "LINE_CHANNEL_ACCESS_TOKEN", ""):
+            if getattr(settings, "LINE_CHANNEL_ACCESS_TOKEN", ""):
+                recipient_line_ids = resolve_tenant_line_recipients(
+                    repo=self._repo,
+                    settings=settings,
+                    tenant_id=tenant_id,
+                )
                 try:
-                    await push_line_messages(
-                        to=settings.LINE_BOSS_USER_ID,
-                        messages=[text_message("抱歉，暫時無法取得 Facebook 成效，請稍後再試。")],
-                        access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
-                    )
+                    for recipient_line_id in recipient_line_ids:
+                        await push_line_messages(
+                            to=recipient_line_id,
+                            messages=[text_message("抱歉，暫時無法取得 Facebook 成效，請稍後再試。")],
+                            access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+                        )
                 except httpx.HTTPError:
                     pass
 
@@ -657,6 +733,85 @@ class IntentRouter:
             return PolicyHints()
         return self._policy_resolver.resolve(tenant_id)
 
+    async def _correct_google_post_pending_approval(
+        self,
+        *,
+        run_id: str,
+        tenant_id: str,
+        trigger_payload: dict[str, Any],
+    ) -> None:
+        selected_platforms = _normalize_selected_platforms(trigger_payload.get("selected_platforms"))
+        if not selected_platforms:
+            return
+
+        pending = self._repo.get_pending_approval_by_run_id(run_id)
+        if pending is None or getattr(pending, "status", "") != "pending":
+            return
+
+        try:
+            draft_content = json.loads(pending.draft_content or "{}")
+        except (TypeError, json.JSONDecodeError):
+            draft_content = {}
+
+        patch: dict[str, Any] = {}
+        current_platforms = _normalize_selected_platforms(draft_content.get("selected_platforms"))
+        if current_platforms != selected_platforms:
+            patch["selected_platforms"] = selected_platforms
+
+        post_text = str(draft_content.get("post_text") or "").strip()
+        if selected_platforms == ["ig_fb"] and post_text and not draft_content.get("ig_fb"):
+            patch["ig_fb"] = post_text
+        if selected_platforms == ["google"] and post_text and not draft_content.get("google"):
+            patch["google"] = post_text
+
+        if not patch:
+            return
+
+        self._repo.update_approval_draft_content(run_id, patch)
+        draft_content.update(patch)
+        self._repo.save_audit_event(
+            tenant_id=tenant_id,
+            agentos_run_id=run_id,
+            workflow_type="google_post",
+            event_type="approval_corrected",
+            source="intent_router",
+            payload={"selected_platforms": selected_platforms},
+        )
+
+        access_token = getattr(self._settings, "LINE_CHANNEL_ACCESS_TOKEN", "") if self._settings else ""
+        if not access_token:
+            return
+
+        recipient_line_ids = resolve_tenant_line_recipients(
+            repo=self._repo,
+            settings=self._settings,
+            tenant_id=tenant_id,
+        )
+        if not recipient_line_ids:
+            return
+
+        post_text_for_card = str(draft_content.get("ig_fb") or draft_content.get("post_text") or "")
+        if selected_platforms == ["ig_fb"]:
+            flex_content = build_meta_post_flex(run_id=run_id, tenant_id=tenant_id, post_text=post_text_for_card)
+        else:
+            flex_content = build_google_post_flex(run_id=run_id, tenant_id=tenant_id, post_text=post_text_for_card)
+
+        for recipient_line_id in recipient_line_ids:
+            await push_line_messages(
+                to=recipient_line_id,
+                messages=[{
+                    "type": "flex",
+                    "altText": "新任務草稿準備好了，請確認",
+                    "contents": flex_content,
+                }],
+                access_token=access_token,
+            )
+            self._repo.record_push(
+                tenant_id=tenant_id,
+                recipient_line_id=recipient_line_id,
+                message_type="approval",
+            )
+
     async def _create_and_run(
         self,
         *,
@@ -680,6 +835,12 @@ class IntentRouter:
                 trigger_source=trigger_source,
                 trigger_payload=trigger_payload,
             )
+            if workflow_type == "google_post":
+                await self._correct_google_post_pending_approval(
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    trigger_payload=trigger_payload,
+                )
             logger.info(
                 "Workflow dispatched: type=%s task_id=%s run_id=%s status=%s",
                 workflow_type,

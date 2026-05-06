@@ -113,6 +113,7 @@ class OnboardingFlow:
         intent_router: "IntentRouter | None" = None,
         memory_manager: "MemoryManager | None" = None,
         context_brief_manager: "ContextBriefManager | None" = None,
+        post_task_review=None,
     ) -> None:
         self._repo = repo
         self._settings = settings
@@ -124,6 +125,7 @@ class OnboardingFlow:
             settings,
             memory_manager=memory_manager,
             context_brief_manager=context_brief_manager,
+            post_task_review=post_task_review,
         )
 
     # ── Public interface ──────────────────────────────────────────────────────

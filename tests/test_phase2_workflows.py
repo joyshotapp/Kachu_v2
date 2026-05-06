@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -48,7 +48,6 @@ def test_settings():
     return Settings(
         LINE_CHANNEL_ACCESS_TOKEN="",
         LINE_CHANNEL_SECRET="",
-        LINE_BOSS_USER_ID="U_boss_phase2",
         AGENTOS_BASE_URL="http://agentos-mock",
         KACHU_BASE_URL="http://localhost:8001",
         DATABASE_URL="sqlite://",
@@ -196,6 +195,80 @@ async def test_business_profile_update_dispatch_uses_line_message_id_as_idempote
 
     task_request = agentos.create_task.await_args.args[0]
     assert task_request.idempotency_key == "T001:business_profile_update:line:msg-biz-1"
+
+
+@pytest.mark.asyncio
+async def test_google_post_dispatch_uses_ig_fb_platform_for_meta_request():
+    agentos = MagicMock()
+    agentos.create_task = AsyncMock(return_value=SimpleNamespace(task={"id": "task-1"}))
+    agentos.run_task = AsyncMock(return_value=SimpleNamespace(run={"id": "run-1", "status": "running"}))
+    repo = MagicMock()
+    router = IntentRouter(
+        agentOS_client=agentos,
+        repository=repo,
+        settings=None,
+    )
+
+    await router._dispatch_google_post(
+        tenant_id="T001",
+        trigger_source="line_cta",
+        trigger_payload={
+            "message": "內容行銷",
+            "line_event_ts": "1714895904000",
+            "selected_platforms": ["ig_fb"],
+        },
+    )
+
+    task_request = agentos.create_task.await_args.args[0]
+    assert task_request.workflow_input["selected_platforms"] == ["ig_fb"]
+    assert task_request.idempotency_key == "T001:google_post:line_cta:1714895904000"
+
+
+@pytest.mark.asyncio
+async def test_create_and_run_corrects_google_post_pending_approval_to_meta() -> None:
+    agentos = MagicMock()
+    agentos.create_task = AsyncMock(return_value=SimpleNamespace(task={"id": "task-1"}))
+    agentos.run_task = AsyncMock(return_value=SimpleNamespace(run={"id": "run-1", "status": "waiting_approval"}))
+
+    pending = SimpleNamespace(status="pending", draft_content=json.dumps({"post_text": "Meta only draft", "selected_platforms": ["google"]}))
+    repo = MagicMock()
+    repo.get_pending_approval_by_run_id.return_value = pending
+    settings = MagicMock()
+    settings.LINE_CHANNEL_ACCESS_TOKEN = "line-token"
+
+    router = IntentRouter(
+        agentOS_client=agentos,
+        repository=repo,
+        settings=settings,
+    )
+
+    with patch("kachu.intent_router.resolve_tenant_line_recipients", return_value=["U-owner"]), patch(
+        "kachu.intent_router.push_line_messages",
+        new=AsyncMock(),
+    ) as push_mock:
+        await router._create_and_run(
+            task_request=AgentOSTaskRequest(
+                tenant_id="T001",
+                domain="kachu_google_post",
+                objective="Generate Meta post",
+                risk_level="medium",
+                workflow_input={"tenant_id": "T001", "selected_platforms": ["ig_fb"]},
+            ),
+            workflow_type="google_post",
+            tenant_id="T001",
+            trigger_source="line_cta",
+            trigger_payload={
+                "message": "內容行銷",
+                "selected_platforms": ["ig_fb"],
+            },
+        )
+
+    repo.update_approval_draft_content.assert_called_once_with(
+        "run-1",
+        {"selected_platforms": ["ig_fb"], "ig_fb": "Meta only draft"},
+    )
+    push_mock.assert_awaited_once()
+    assert push_mock.await_args.kwargs["messages"][0]["contents"]["header"]["contents"][0]["text"] == "📣 Meta 排程發文草稿"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -498,6 +571,18 @@ class TestGooglePostTools:
         assert data["selected_platforms"] == ["ig_fb"]
         assert data["ig_fb"] == data["post_text"]
 
+    def test_generate_google_post_blocks_disabled_meta_capability(self, client, tenant_id):
+        client.app.state.repository.update_tenant_feature_flags(tenant_id, meta_enabled=False)
+
+        resp = client.post("/tools/generate-google-post", json={
+            "tenant_id": tenant_id,
+            "topic": "本週調理提醒",
+            "selected_platforms": ["ig_fb"],
+        })
+
+        assert resp.status_code == 403
+        assert "Meta publishing is disabled" in resp.json()["detail"]
+
     def test_generate_google_post_with_context(self, client, tenant_id):
         resp = client.post("/tools/generate-google-post", json={
             "tenant_id": tenant_id,
@@ -545,6 +630,41 @@ class TestGooglePostTools:
         data = resp.json()
         assert data["results"]["ig_fb"]["status"] == "skipped_no_credentials"
 
+    def test_publish_google_post_recovers_meta_platform_from_pending_approval(self, client, tenant_id, repo):
+        repo.create_pending_approval(
+            tenant_id=tenant_id,
+            agentos_run_id="run-gp-003b",
+            workflow_type="kachu_google_post",
+            draft_content={
+                "post_text": "Meta 排程文案",
+                "selected_platforms": ["ig_fb"],
+                "ig_fb": "Meta 排程文案",
+            },
+        )
+
+        resp = client.post("/tools/publish-google-post", json={
+            "tenant_id": tenant_id,
+            "run_id": "run-gp-003b",
+            "post_text": "",
+        })
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["results"]["ig_fb"]["status"] == "skipped_no_credentials"
+
+    def test_publish_content_blocks_cross_channel_when_flag_disabled(self, client, tenant_id):
+        client.app.state.repository.update_tenant_feature_flags(tenant_id, cross_channel_enabled=False)
+
+        resp = client.post("/tools/publish-content", json={
+            "tenant_id": tenant_id,
+            "run_id": "run-gp-cross-channel",
+            "selected_platforms": ["google", "ig_fb"],
+            "drafts": {"google": "Google 文案", "ig_fb": "Meta 文案"},
+        })
+
+        assert resp.status_code == 403
+        assert "cross-channel publishing is disabled" in resp.json()["detail"]
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # GA4 Report tools
@@ -561,6 +681,22 @@ class TestGA4ReportTools:
         assert resp.status_code == 200
         data = resp.json()
         assert data["totals"]["sessions"] == 0
+
+    def test_fetch_ga4_data_blocks_expired_plan(self, client, tenant_id):
+        client.app.state.repository.update_tenant_plan(
+            tenant_id,
+            plan="starter",
+            plan_expires_at=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+
+        resp = client.post("/tools/fetch-ga4-data", json={
+            "tenant_id": tenant_id,
+            "period": "7daysAgo",
+            "run_id": "run-ga4-expired",
+        })
+
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "Tenant plan has expired"
 
     def test_generate_ga4_insights_stub(self, client, tenant_id):
         resp = client.post("/tools/generate-ga4-insights", json={
@@ -600,6 +736,183 @@ class TestGA4ReportTools:
         # No LINE credentials → skipped
         assert data["status"] == "skipped"
         assert "insights" in data
+
+    def test_send_ga4_report_uses_membership_recipient_without_legacy_boss(self, repo):
+        settings = Settings(
+            LINE_CHANNEL_ACCESS_TOKEN="line-token",
+            LINE_CHANNEL_SECRET="",
+            LINE_BOSS_USER_ID="",
+            AGENTOS_BASE_URL="http://agentos-mock",
+            KACHU_BASE_URL="http://localhost:8001",
+            DATABASE_URL="sqlite://",
+            GOOGLE_AI_API_KEY="",
+            OPENAI_API_KEY="",
+            MAX_PUSH_PER_DAY=3,
+        )
+        engine = create_db_engine(settings.DATABASE_URL)
+        init_db(engine)
+        app = create_app(settings, _engine=engine)
+        client = TestClient(app)
+        app_repo = app.state.repository
+        app_repo.create_tenant_membership(
+            tenant_id="tenant-ga4",
+            line_user_id="U_owner_ga4",
+            role="owner",
+        )
+
+        with patch("kachu.tools.router.push_line_messages", new=AsyncMock()) as push_mock:
+            resp = client.post("/tools/send-ga4-report", json={
+                "tenant_id": "tenant-ga4",
+                "run_id": "run-ga4-membership-001",
+                "insights": {
+                    "insights": {
+                        "summary": "本週 150 位使用者",
+                        "highlights": ["工作階段：150", "頁面瀏覽：400"],
+                        "actions": ["更新商家資訊"],
+                    }
+                },
+            })
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "sent"
+        assert push_mock.await_args.kwargs["to"] == "U_owner_ga4"
+
+    def test_notify_approval_uses_membership_recipient_without_legacy_boss(self):
+        settings = Settings(
+            LINE_CHANNEL_ACCESS_TOKEN="line-token",
+            LINE_CHANNEL_SECRET="",
+            LINE_BOSS_USER_ID="",
+            AGENTOS_BASE_URL="http://agentos-mock",
+            KACHU_BASE_URL="https://app.kachu.tw",
+            DATABASE_URL="sqlite://",
+            GOOGLE_AI_API_KEY="",
+        )
+        app = create_app(settings)
+        client = TestClient(app)
+        repo = client.app.state.repository
+        repo.create_tenant_membership(
+            tenant_id="tenant-approval",
+            line_user_id="U_owner_approval",
+            role="owner",
+        )
+
+        response = httpx.Response(200, request=httpx.Request("POST", "https://api.line.me/v2/bot/message/push"))
+
+        with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)) as post_mock:
+            resp = client.post(
+                "/tools/notify-approval",
+                json={
+                    "tenant_id": "tenant-approval",
+                    "run_id": "run-membership-approval-001",
+                    "workflow": "kachu_google_post",
+                    "drafts": {
+                        "post_text": "測試草稿",
+                    },
+                },
+            )
+
+        assert resp.status_code == 200
+        body = json.loads(post_mock.await_args.kwargs["content"].decode())
+        assert body["to"] == "U_owner_approval"
+
+    def test_notify_approval_enriches_google_post_meta_only_from_workflow_run(self):
+        settings = Settings(
+            LINE_CHANNEL_ACCESS_TOKEN="line-token",
+            LINE_CHANNEL_SECRET="",
+            LINE_BOSS_USER_ID="",
+            AGENTOS_BASE_URL="http://agentos-mock",
+            KACHU_BASE_URL="https://app.kachu.tw",
+            DATABASE_URL="sqlite://",
+            GOOGLE_AI_API_KEY="",
+        )
+        app = create_app(settings)
+        client = TestClient(app)
+        repo = client.app.state.repository
+        repo.create_tenant_membership(
+            tenant_id="tenant-meta-approval",
+            line_user_id="U_owner_meta_approval",
+            role="owner",
+        )
+        repo.create_workflow_record(
+            tenant_id="tenant-meta-approval",
+            agentos_run_id="run-meta-approval-001",
+            agentos_task_id="task-meta-approval-001",
+            workflow_type="google_post",
+            trigger_source="line",
+            trigger_payload={
+                "message": "幫我寫一篇 IG/FB 貼文",
+                "selected_platforms": ["ig_fb"],
+            },
+        )
+
+        response = httpx.Response(200, request=httpx.Request("POST", "https://api.line.me/v2/bot/message/push"))
+
+        with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)) as post_mock:
+            resp = client.post(
+                "/tools/notify-approval",
+                json={
+                    "tenant_id": "tenant-meta-approval",
+                    "run_id": "run-meta-approval-001",
+                    "workflow": "kachu_google_post",
+                    "drafts": {
+                        "post_text": "這是一篇 FB 草稿",
+                    },
+                },
+            )
+
+        assert resp.status_code == 200
+        push_body = json.loads(post_mock.await_args.kwargs["content"].decode())
+        assert push_body["messages"][0]["contents"]["header"]["contents"][0]["text"] == "📣 Meta 排程發文草稿"
+
+        pending = repo.get_pending_approval_by_run_id("run-meta-approval-001")
+        assert pending is not None
+        draft_content = json.loads(pending.draft_content)
+        assert draft_content["selected_platforms"] == ["ig_fb"]
+        assert draft_content["ig_fb"] == "這是一篇 FB 草稿"
+
+    def test_send_or_escalate_saves_last_owner_notification_context(self):
+        settings = Settings(
+            LINE_CHANNEL_ACCESS_TOKEN="line-token",
+            LINE_CHANNEL_SECRET="",
+            LINE_BOSS_USER_ID="",
+            AGENTOS_BASE_URL="http://agentos-mock",
+            KACHU_BASE_URL="http://localhost:8001",
+            DATABASE_URL="sqlite://",
+            GOOGLE_AI_API_KEY="",
+            OPENAI_API_KEY="",
+            MAX_PUSH_PER_DAY=3,
+        )
+        app = create_app(settings)
+        client = TestClient(app)
+        repo = client.app.state.repository
+        repo.create_tenant_membership(
+            tenant_id="tenant-escalation",
+            line_user_id="U_owner_escalation",
+            role="owner",
+        )
+
+        with patch("kachu.tools.router.push_line_messages", new=AsyncMock()) as push_mock:
+            resp = client.post(
+                "/tools/send-or-escalate",
+                json={
+                    "tenant_id": "tenant-escalation",
+                    "customer_line_id": "U_customer_123",
+                    "answer": {
+                        "should_escalate": True,
+                        "response_text": "",
+                        "escalate_reason": "知識庫中沒有針對顧客招呼語的專屬回覆資訊。",
+                    },
+                },
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["action"] == "escalated"
+        assert push_mock.await_count == 2
+        context = repo.get_shared_context("tenant-escalation", "last_owner_notification")
+        assert context is not None
+        assert context["kind"] == "line_faq_escalation"
+        assert context["customer_line_id"] == "U_customer_123"
+        assert "招呼語" in context["reason"]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -662,7 +975,6 @@ class TestGoogleOAuth:
         settings = Settings(
             LINE_CHANNEL_ACCESS_TOKEN="",
             LINE_CHANNEL_SECRET="",
-            LINE_BOSS_USER_ID="U_boss_phase2",
             AGENTOS_BASE_URL="http://agentos-mock",
             KACHU_BASE_URL="http://localhost:8001",
             DATABASE_URL="sqlite://",
@@ -706,8 +1018,15 @@ class TestGoogleOAuth:
         repo.save_connector_account(
             tenant_id=tenant_id,
             platform="google_business",
-            credentials_json=json.dumps({"access_token": "google-token"}),
-            account_label="Google Business",
+            credentials_json=json.dumps(
+                {
+                    "access_token": "google-token",
+                    "account_id": "accounts/123456789",
+                    "location_id": "accounts/123456789/locations/987654321",
+                    "location_title": "Google 店家",
+                }
+            ),
+            account_label="Google Business Profile (Google 店家)",
         )
 
         resp = client.get(f"/auth/status/{tenant_id}")
@@ -719,6 +1038,7 @@ class TestGoogleOAuth:
         assert readiness["channels"]["facebook"]["label"] == "示範粉專"
         assert readiness["channels"]["instagram"]["status"] == "needs_business_link"
         assert readiness["channels"]["google_business"]["connected"] is True
+        assert readiness["channels"]["google_business"]["label"] == "Google 店家"
         assert "Facebook" in readiness["next_step"]
 
 

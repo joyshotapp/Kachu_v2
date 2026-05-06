@@ -18,7 +18,6 @@ def settings() -> Settings:
     return Settings(
         LINE_CHANNEL_ACCESS_TOKEN="",
         LINE_CHANNEL_SECRET="",
-        LINE_BOSS_USER_ID="U_boss",
         AGENTOS_BASE_URL="http://agentos-mock",
         KACHU_BASE_URL="http://localhost:8001",
         DATABASE_URL="sqlite://",

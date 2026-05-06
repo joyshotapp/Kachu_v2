@@ -199,12 +199,9 @@ class MetaClient:
 
         if metric_names is None:
             metric_names = [
-                "page_impressions",
-                "page_impressions_unique",
-                "page_engaged_users",
                 "page_post_engagements",
-                "page_fan_adds",
                 "page_views_total",
+                "page_actions_post_reactions_total",
             ]
 
         params: dict[str, Any] = {
@@ -248,11 +245,9 @@ class MetaClient:
         """
         if metric_names is None:
             metric_names = [
-                "post_impressions",
-                "post_impressions_unique",
                 "post_engagements",
                 "post_clicks",
-                "post_reactions_by_type_total",
+                "post_reactions_like_total",
             ]
 
         params: dict[str, Any] = {

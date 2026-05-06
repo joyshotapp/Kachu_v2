@@ -4,6 +4,7 @@ from typing import Any
 
 from .conversation_context import (
     COMMAND_CONVERSATION_TYPE,
+    build_conversation_digest,
     extract_brand_name_candidates,
     extract_document_contact_facts,
     extract_document_offer_facts,
@@ -41,6 +42,9 @@ def _looks_like_execution_command(text: str) -> bool:
 class ContextBriefManager:
     """Builds durable owner/brand briefs from ongoing tenant context."""
 
+    OWNER_CONVERSATION_FETCH_LIMIT = 24
+    OWNER_CONVERSATION_RECENT_LIMIT = 8
+
     def __init__(self, repo, memory) -> None:
         self._repo = repo
         self._memory = memory
@@ -56,23 +60,29 @@ class ContextBriefManager:
         entries = self._repo.get_active_knowledge_entries(tenant_id)
         if onboarding_complete:
             tenant = self._reconcile_brand_identity(tenant=tenant, entries=entries)
-        owner_messages = self._repo.list_recent_conversations(
+        owner_command_messages = self._repo.list_recent_conversations(
             tenant_id,
             role="owner",
             conversation_type=COMMAND_CONVERSATION_TYPE,
-            limit=8,
+            limit=self.OWNER_CONVERSATION_FETCH_LIMIT,
         )
         onboarding_messages = self._repo.list_recent_conversations(
             tenant_id,
             role="boss",
             conversation_type="onboarding",
-            limit=8,
+            limit=self.OWNER_CONVERSATION_FETCH_LIMIT,
         )
-        owner_messages = sorted(
-            [*owner_messages, *onboarding_messages],
+        owner_message_pool = sorted(
+            [*owner_command_messages, *onboarding_messages],
             key=lambda message: message.timestamp,
             reverse=True,
-        )[:8]
+        )[: self.OWNER_CONVERSATION_FETCH_LIMIT]
+        owner_messages = owner_message_pool[: self.OWNER_CONVERSATION_RECENT_LIMIT]
+        older_owner_messages = sorted(
+            owner_message_pool[self.OWNER_CONVERSATION_RECENT_LIMIT :],
+            key=lambda message: message.timestamp,
+        )
+        owner_history_summary = self._build_owner_history_summary(older_owner_messages)
         industry_context = build_industry_context(tenant.industry_type)
         ig_preferences = self._memory.get_preference_examples(tenant_id, "ig_fb", limit=2)
         google_preferences = self._memory.get_preference_examples(tenant_id, "google", limit=2)
@@ -90,6 +100,7 @@ class ContextBriefManager:
             ig_preferences=ig_preferences,
             google_preferences=google_preferences,
             episodes=episodes,
+            conversation_summary=owner_history_summary,
             reason=reason,
         )
 
@@ -106,7 +117,26 @@ class ContextBriefManager:
             content=owner_brief,
             ttl_hours=30 * 24,
         )
+        self._repo.save_shared_context(
+            tenant_id=tenant_id,
+            context_type="owner_conversation_summary",
+            content=owner_history_summary,
+            ttl_hours=30 * 24,
+        )
         return {"brand_brief": brand_brief, "owner_brief": owner_brief}
+
+    def _build_owner_history_summary(self, messages: list[Any]) -> dict[str, Any]:
+        items = build_conversation_digest(
+            messages,
+            max_items=4,
+            max_length=88,
+            skip_predicate=_looks_like_execution_command,
+        )
+        return {
+            "summary": "；".join(items[:3]),
+            "items": items,
+            "conversation_count": len(messages),
+        }
 
     def _reconcile_brand_identity(self, *, tenant, entries: list[Any]):
         basic_info_entries = [entry for entry in entries if entry.category == "basic_info"]
@@ -261,11 +291,18 @@ class ContextBriefManager:
         ig_preferences: list[dict[str, Any]],
         google_preferences: list[dict[str, Any]],
         episodes: list[dict[str, Any]],
+        conversation_summary: dict[str, Any],
         reason: str,
     ) -> dict[str, Any]:
         messages = [msg.content.strip() for msg in recent_messages if msg.content.strip()]
         stable_topics = [text for text in messages if not _looks_like_execution_command(text)]
         recent_topics = (stable_topics or messages)[:4]
+        historical_summary = str(conversation_summary.get("summary", "") or "").strip()
+        historical_topics = [
+            str(item).strip()
+            for item in conversation_summary.get("items", [])
+            if str(item).strip()
+        ][:4]
         preference_notes = [item.get("notes", "") for item in [*ig_preferences, *google_preferences] if item.get("notes")][:4]
         edited_examples = [
             item.get("edited", "")[:280]
@@ -279,11 +316,17 @@ class ContextBriefManager:
         if any(item.get("outcome") == "modified" for item in episodes):
             decision_style = "會先看草稿，再依細節親自微調"
 
+        summary_parts = ["；".join(recent_topics[:2])]
+        if historical_summary:
+            summary_parts.append(f"較早脈絡：{historical_summary}")
+
         return {
-            "summary": "；".join(recent_topics[:2]) or "近期尚無新的老闆偏好訊號",
+            "summary": "；".join(part for part in summary_parts if part) or "近期尚無新的老闆偏好訊號",
             "communication_style": communication_style,
             "decision_style": decision_style,
-            "current_priorities": recent_topics,
+            "current_priorities": recent_topics or historical_topics,
+            "historical_summary": historical_summary,
+            "historical_topics": historical_topics,
             "preference_notes": preference_notes,
             "edited_examples": edited_examples,
             "last_refresh_reason": reason,

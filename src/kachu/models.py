@@ -120,6 +120,7 @@ class NotifyApprovalRequest(BaseModel):
     run_id: str
     workflow: str
     drafts: dict[str, Any]
+    selected_platforms: list[str] | None = None
 
 
 class PublishContentRequest(BaseModel):

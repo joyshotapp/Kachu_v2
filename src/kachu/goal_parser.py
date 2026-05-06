@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
@@ -46,7 +47,12 @@ _DOMAIN_ACTIONS: dict[str, list[dict[str, str]]] = {
         {"label": "更新知識庫中的常見問答", "intent": "knowledge_update", "topic": "FAQ更新"},
     ],
     "content": [
-        {"label": "幫我寫一篇 IG/FB 貼文", "intent": "google_post", "topic": "內容行銷"},
+        {
+            "label": "幫我寫一篇 IG/FB 貼文",
+            "intent": "google_post",
+            "topic": "內容行銷",
+            "selected_platforms": "ig_fb",
+        },
         {"label": "發一篇 Google 商家動態", "intent": "google_post", "topic": ""},
     ],
     "knowledge": [
@@ -60,6 +66,18 @@ _DOMAIN_ACTIONS: dict[str, list[dict[str, str]]] = {
 }
 
 _DEFAULT_DOMAIN = "content"
+
+
+def _build_postback_data(action: dict[str, str]) -> str:
+    payload = {
+        "action": "trigger_workflow",
+        "workflow": _INTENT_TO_WORKFLOW.get(action["intent"], ""),
+        "intent": action["intent"],
+        "topic": action["topic"],
+    }
+    if action.get("selected_platforms"):
+        payload["selected_platforms"] = action["selected_platforms"]
+    return urlencode(payload)
 
 _CLASSIFY_PROMPT = """\
 老闆說了：「{message}」
@@ -104,12 +122,7 @@ class GoalParser:
                 "action": {
                     "type": "postback",
                     "label": a["label"][:20],
-                    "data": (
-                        f"action=trigger_workflow"
-                        f"&workflow={_INTENT_TO_WORKFLOW.get(a['intent'], '')}"
-                        f"&intent={a['intent']}"
-                        f"&topic={a['topic']}"
-                    ),
+                    "data": _build_postback_data(a),
                     "displayText": a["label"],
                 },
             }

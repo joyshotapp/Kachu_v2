@@ -136,6 +136,40 @@ def summarize_document_highlight(text: str, *, max_length: int = 120) -> str:
     return compact[: max_length - 1].rstrip() + "…"
 
 
+def summarize_conversation_highlight(text: str, *, max_length: int = 90) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max_length - 1].rstrip() + "…"
+
+
+def build_conversation_digest(
+    messages: list,
+    *,
+    max_items: int = 4,
+    max_length: int = 90,
+    skip_predicate=None,
+) -> list[str]:
+    results: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        text = summarize_conversation_highlight(getattr(message, "content", ""), max_length=max_length)
+        raw = " ".join(str(getattr(message, "content", "") or "").split()).strip()
+        if not text or not raw:
+            continue
+        if skip_predicate is not None and skip_predicate(raw):
+            continue
+        if raw in seen:
+            continue
+        seen.add(raw)
+        results.append(text)
+        if len(results) >= max_items:
+            break
+    return results
+
+
 def _append_unique_fact(results: list[str], seen: set[str], fact: str, *, max_items: int) -> bool:
     cleaned = " ".join(str(fact or "").split()).strip().strip("，,。；;")
     if not cleaned or cleaned in seen:

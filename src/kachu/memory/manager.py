@@ -104,7 +104,9 @@ class MemoryManager:
                 }
             )
 
-        return rank_entries(query_embedding, entry_dicts, top_k=top_k)
+        ranked = rank_entries(query_embedding, entry_dicts, top_k=top_k)
+        self._repo.mark_knowledge_entries_retrieved([entry["id"] for entry in ranked])
+        return ranked
 
     # ── Layer 3: Preference Memory ────────────────────────────────────────────
 

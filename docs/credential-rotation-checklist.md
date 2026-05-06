@@ -74,7 +74,11 @@
 
 ### ✅ KEY-06 — `LINE_BOSS_USER_ID`
 
-這不是 secret，是你自己的 LINE user ID（老闆帳號）。
+這不是 secret，而且在多租戶 production 也不是正式 routing 依據。
+
+只在以下情境才需要填：
+1. 本機 smoke test
+2. 舊版單租戶 fallback 驗證
 
 取得方式：
 1. 啟動服務後，用你的個人 LINE 帳號傳訊息給 bot
@@ -203,7 +207,7 @@ Select-String -Path .env.prod -Pattern "REPLACE_WITH"
 | KEY-03 | `POSTGRES_PASSWORD` + `DATABASE_URL` | ⬜ |
 | KEY-04 | `LINE_CHANNEL_ACCESS_TOKEN` | ⬜ |
 | KEY-05 | `LINE_CHANNEL_SECRET` | ⬜ |
-| KEY-06 | `LINE_BOSS_USER_ID` | ⬜ |
+| KEY-06 | `LINE_BOSS_USER_ID`（legacy/dev only） | ⬜ |
 | KEY-07 | `GOOGLE_AI_API_KEY` | ⬜ |
 | KEY-08 | `OPENAI_API_KEY` | ⬜ |
 | KEY-09 | `GOOGLE_OAUTH_CLIENT_SECRET` | ⬜ |

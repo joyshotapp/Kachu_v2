@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import pathlib
 import secrets
@@ -11,7 +12,13 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+from ..merchant_pages import build_merchant_page_template, load_merchant_page_payload, normalize_merchant_slug, save_merchant_page_payload
 from ..persistence import KachuRepository
+from ..tenant_runtime import (
+    connector_refresh_state,
+    evaluate_tenant_capability,
+    refresh_google_connector_credentials,
+)
 
 
 def _require_dashboard_access(
@@ -28,7 +35,12 @@ def _require_dashboard_access(
         raise HTTPException(status_code=503, detail="Dashboard auth not configured")
 
     scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not secrets.compare_digest(token.strip(), expected_token):
+    header_token = token.strip() if scheme.lower() == "bearer" else ""
+    allow_query_token = request.method == "GET" and request.url.path.rstrip("/") == "/dashboard"
+    query_token = request.query_params.get("token", "").strip() if allow_query_token else ""
+    presented_token = header_token or query_token
+
+    if not presented_token or not secrets.compare_digest(presented_token, expected_token):
         raise HTTPException(status_code=401, detail="Invalid dashboard authorization")
 
 
@@ -59,15 +71,11 @@ def _repo(request: Request) -> KachuRepository:
 
 
 def _tid(request: Request, tenant_id: str | None) -> str | None:
-    """If tenant_id not provided in query, fall back to configured boss user ID."""
-    if tenant_id:
-        return tenant_id
-    settings = getattr(request.app.state, "settings", None)
-    if settings:
-        boss_id = getattr(settings, "LINE_BOSS_USER_ID", None)
-        if boss_id:
-            return boss_id
-    return None
+    """Require explicit tenant_id for dashboard API operations."""
+    normalized_tenant_id = (tenant_id or "").strip()
+    if normalized_tenant_id:
+        return normalized_tenant_id
+    raise HTTPException(status_code=400, detail="tenant_id is required")
 
 
 def _run_to_dict(r: Any) -> dict:
@@ -105,6 +113,16 @@ def _approval_to_dict(a: Any) -> dict:
 
 
 def _knowledge_to_dict(e: Any) -> dict:
+    timestamps = [
+        _normalize_dashboard_datetime(getattr(e, "updated_at", None)),
+        _normalize_dashboard_datetime(getattr(e, "last_retrieved_at", None)),
+        _normalize_dashboard_datetime(getattr(e, "last_reviewed_at", None)),
+    ]
+    timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
+    activity_at = max(timestamps) if timestamps else None
+    activity_age_days = None
+    if activity_at is not None:
+        activity_age_days = max(int((datetime.now(timezone.utc) - activity_at).total_seconds() // 86400), 0)
     return {
         "id": e.id,
         "tenant_id": e.tenant_id,
@@ -113,8 +131,12 @@ def _knowledge_to_dict(e: Any) -> dict:
         "source_type": e.source_type,
         "source_id": e.source_id,
         "status": e.status,
+        "conflict_with": e.conflict_with,
         "created_at": e.created_at.isoformat() if e.created_at else None,
         "updated_at": e.updated_at.isoformat() if e.updated_at else None,
+        "last_retrieved_at": e.last_retrieved_at.isoformat() if e.last_retrieved_at else None,
+        "last_reviewed_at": e.last_reviewed_at.isoformat() if e.last_reviewed_at else None,
+        "activity_age_days": activity_age_days,
     }
 
 
@@ -148,7 +170,9 @@ def _connector_to_dict(c: Any) -> dict:
         creds = json.loads(c.credentials_encrypted)
         has_token = bool(creds.get("access_token") or creds.get("token"))
     except (json.JSONDecodeError, TypeError, AttributeError):
+        creds = {}
         has_token = bool(c.credentials_encrypted)
+    refresh_info = connector_refresh_state(c)
     return {
         "id": c.id,
         "tenant_id": c.tenant_id,
@@ -156,6 +180,12 @@ def _connector_to_dict(c: Any) -> dict:
         "account_label": c.account_label,
         "is_active": c.is_active,
         "has_token": has_token,
+        "has_refresh_token": refresh_info["has_refresh_token"],
+        "can_refresh": refresh_info["can_refresh"],
+        "expires_at": refresh_info["expires_at"],
+        "refresh_status": refresh_info["refresh_status"],
+        "refresh_error": refresh_info["refresh_error"],
+        "refresh_failed_at": refresh_info["refresh_failed_at"],
         "last_refreshed_at": c.last_refreshed_at.isoformat() if c.last_refreshed_at else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
     }
@@ -168,6 +198,23 @@ def _safe_json(val: str | None) -> Any:
         return json.loads(val)
     except (json.JSONDecodeError, TypeError):
         return {"raw": val}
+
+
+def _merchant_page_dir(request: Request) -> pathlib.Path:
+    return getattr(request.app.state, "merchant_page_dir", _STATIC_DIR / "merchant_pages")
+
+
+def _merchant_page_base_url(request: Request) -> str:
+    settings = getattr(request.app.state, "settings", None)
+    return (getattr(settings, "KACHU_BASE_URL", "") or "").strip().rstrip("/")
+
+
+def _normalize_dashboard_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _normalize_timezone(value: str | None, *, default: str = "Asia/Taipei", strict: bool = False) -> str:
@@ -205,6 +252,58 @@ def _normalize_day(value: int, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return min(max(day, 1), 28)
+
+
+def _normalize_plan(value: str | None) -> str:
+    normalized = (value or "trial").strip().lower() or "trial"
+    return normalized if normalized in {"trial", "starter", "growth", "pro"} else "trial"
+
+
+def _normalize_optional_merchant_slug(value: str | None) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        return ""
+    return normalize_merchant_slug(normalized)
+
+
+def _resolve_merchant_slug(repo: KachuRepository, tenant_id: str, merchant_slug: str | None) -> str:
+    normalized = (merchant_slug or "").strip()
+    if normalized:
+        return normalize_merchant_slug(normalized)
+
+    tenant = repo.get_or_create_tenant(tenant_id)
+    configured_slug = (getattr(tenant, "merchant_slug", "") or "").strip()
+    if configured_slug:
+        return normalize_merchant_slug(configured_slug)
+    raise HTTPException(status_code=400, detail="merchant_slug is required")
+
+
+def _tenant_settings_to_dict(repo: KachuRepository, tenant: Any, flags: Any) -> dict[str, Any]:
+    capabilities = {}
+    for capability in ("ga4", "meta", "cross_channel", "crm"):
+        decision = evaluate_tenant_capability(repo, tenant.id, capability)
+        capabilities[capability] = {
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+            "plan": decision.plan,
+            "plan_status": decision.plan_status,
+        }
+    plan_status = evaluate_tenant_capability(repo, tenant.id).plan_status
+    return {
+        "tenant_id": tenant.id,
+        "tenant_name": tenant.name,
+        "plan": tenant.plan,
+        "plan_expires_at": tenant.plan_expires_at.isoformat() if tenant.plan_expires_at else None,
+        "merchant_slug": getattr(tenant, "merchant_slug", "") or "",
+        "plan_status": plan_status,
+        "is_active": tenant.is_active,
+        "ga4_enabled": bool(getattr(flags, "ga4_enabled", True)),
+        "meta_enabled": bool(getattr(flags, "meta_enabled", True)),
+        "cross_channel_enabled": bool(getattr(flags, "cross_channel_enabled", True)),
+        "crm_enabled": bool(getattr(flags, "crm_enabled", False)),
+        "capabilities": capabilities,
+        "updated_at": getattr(flags, "updated_at", None).isoformat() if getattr(flags, "updated_at", None) else None,
+    }
 
 
 def _automation_settings_to_dict(row: Any, tenant: Any) -> dict[str, Any]:
@@ -294,6 +393,17 @@ class KnowledgeUpdateRequest(BaseModel):
     category: str | None = None
 
 
+class KnowledgeLifecycleRefreshRequest(BaseModel):
+    tenant_id: str | None = None
+    stale_after_days: int = 60
+
+
+class KnowledgeStatusUpdateRequest(BaseModel):
+    tenant_id: str | None = None
+    status: str
+    conflict_with: str | None = None
+
+
 class AutomationSettingsUpdateRequest(BaseModel):
     tenant_id: str | None = None
     timezone: str = "Asia/Taipei"
@@ -316,21 +426,70 @@ class AutomationSettingsUpdateRequest(BaseModel):
     content_calendar_hour: int = 9
 
 
+class ConnectorDisconnectRequest(BaseModel):
+    tenant_id: str | None = None
+    platform: str
+
+
+class ConnectorRefreshRequest(BaseModel):
+    tenant_id: str | None = None
+    platform: str
+
+
+class TenantDeactivateRequest(BaseModel):
+    tenant_id: str | None = None
+
+
+class TenantDeleteRequest(BaseModel):
+    tenant_id: str | None = None
+    confirm_tenant_id: str
+
+
+class TenantSettingsUpdateRequest(BaseModel):
+    tenant_id: str | None = None
+    plan: str = "trial"
+    plan_expires_at: datetime | None = None
+    merchant_slug: str | None = None
+    ga4_enabled: bool = True
+    meta_enabled: bool = True
+    cross_channel_enabled: bool = True
+    crm_enabled: bool = False
+
+
+class MerchantPageUpdateRequest(BaseModel):
+    tenant_id: str | None = None
+    merchant_slug: str | None = None
+    payload: dict[str, Any]
+
+
 @dashboard_router.get("/api/knowledge")
 def api_knowledge(
     request: Request,
     tenant_id: str | None = None,
     category: str | None = None,
     status: str | None = None,
+    stale_after_days: int = 60,
 ) -> dict:
     repo = _repo(request)
     tid = _tid(request, tenant_id)
-    if not tid:
-        return {"entries": []}
-    entries = repo.get_knowledge_entries(tid, category=category)
-    if status:
-        entries = [e for e in entries if e.status == status]
-    return {"entries": [_knowledge_to_dict(e) for e in entries]}
+    entries = repo.get_knowledge_entries(tid, category=category, status=status)
+    return {
+        "entries": [_knowledge_to_dict(e) for e in entries],
+        "lifecycle": repo.get_knowledge_lifecycle_summary(tid, stale_after_days=stale_after_days),
+    }
+
+
+@dashboard_router.post("/api/knowledge/lifecycle/refresh")
+def api_knowledge_refresh_lifecycle(
+    body: KnowledgeLifecycleRefreshRequest,
+    request: Request,
+) -> dict:
+    repo = _repo(request)
+    tid = _tid(request, body.tenant_id)
+    return repo.refresh_knowledge_lifecycle(
+        tid,
+        stale_after_days=body.stale_after_days,
+    )
 
 
 @dashboard_router.post("/api/knowledge", status_code=201)
@@ -371,12 +530,116 @@ def api_knowledge_update(
     return _knowledge_to_dict(entry)
 
 
+@dashboard_router.post("/api/knowledge/{entry_id}/status")
+def api_knowledge_update_status(
+    entry_id: str,
+    body: KnowledgeStatusUpdateRequest,
+    request: Request,
+) -> dict:
+    repo = _repo(request)
+    tid = _tid(request, body.tenant_id)
+    existing_entry = repo.get_knowledge_entry(entry_id)
+    if existing_entry is None or existing_entry.tenant_id != tid:
+        raise HTTPException(status_code=404, detail="Entry not found")
+
+    try:
+        entry = repo.update_knowledge_entry_status(
+            entry_id,
+            status=body.status,
+            conflict_with=body.conflict_with,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Entry not found")
+
+    return {
+        "entry": _knowledge_to_dict(entry),
+        "lifecycle": repo.get_knowledge_lifecycle_summary(tid),
+    }
+
+
 @dashboard_router.delete("/api/knowledge/{entry_id}", status_code=204)
 def api_knowledge_delete(entry_id: str, request: Request) -> Response:
     repo = _repo(request)
     if not repo.delete_knowledge_entry(entry_id):
         raise HTTPException(status_code=404, detail="Entry not found")
     return Response(status_code=204)
+
+
+@dashboard_router.get("/api/merchant-page")
+def api_merchant_page(
+    request: Request,
+    tenant_id: str | None = None,
+    merchant_slug: str | None = None,
+) -> dict[str, Any]:
+    repo = _repo(request)
+    tid = _tid(request, tenant_id)
+    normalized_slug = _resolve_merchant_slug(repo, tid, merchant_slug)
+    try:
+        payload = load_merchant_page_payload(_merchant_page_dir(request), normalized_slug)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Merchant page not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "merchant_slug": normalized_slug,
+        "payload": payload,
+        "public_url": payload.get("canonical_url") or f"/merchants/{normalized_slug}",
+    }
+
+
+@dashboard_router.get("/api/merchant-page/template")
+def api_merchant_page_template(
+    request: Request,
+    tenant_id: str | None = None,
+    merchant_slug: str | None = None,
+) -> dict[str, Any]:
+    repo = _repo(request)
+    tid = _tid(request, tenant_id)
+    normalized_slug = _resolve_merchant_slug(repo, tid, merchant_slug)
+    tenant = repo.get_or_create_tenant(tid)
+    payload = build_merchant_page_template(
+        normalized_slug,
+        base_url=_merchant_page_base_url(request),
+        tenant_name=getattr(tenant, "name", ""),
+        industry_type=getattr(tenant, "industry_type", ""),
+        address=getattr(tenant, "address", ""),
+    )
+    return {
+        "merchant_slug": normalized_slug,
+        "payload": payload,
+        "public_url": payload.get("canonical_url") or f"/merchants/{normalized_slug}",
+    }
+
+
+@dashboard_router.put("/api/merchant-page")
+def api_update_merchant_page(body: MerchantPageUpdateRequest, request: Request) -> dict[str, Any]:
+    repo = _repo(request)
+    tid = (body.tenant_id or "").strip() or _tid(request, None)
+    try:
+        normalized_slug = _resolve_merchant_slug(repo, tid, body.merchant_slug)
+        payload = save_merchant_page_payload(
+            _merchant_page_dir(request),
+            normalized_slug,
+            body.payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    repo.save_audit_event(
+        tenant_id=tid,
+        event_type="merchant_page_updated",
+        source="dashboard",
+        actor_id="dashboard_admin",
+        payload={"merchant_slug": normalized_slug, "canonical_url": payload.get("canonical_url")},
+    )
+    return {
+        "merchant_slug": normalized_slug,
+        "payload": payload,
+        "public_url": payload.get("canonical_url") or f"/merchants/{normalized_slug}",
+    }
 
 
 # ── API: Automation Settings ────────────────────────────────────────────────
@@ -521,6 +784,166 @@ def api_connectors(request: Request, tenant_id: str | None = None) -> dict:
             "created_at": None,
         })
     return {"connectors": connectors}
+
+
+@dashboard_router.post("/api/connectors/disconnect")
+def api_disconnect_connector(body: ConnectorDisconnectRequest, request: Request) -> dict:
+    repo = _repo(request)
+    tid = (body.tenant_id or "").strip() or _tid(request, None)
+    platform = (body.platform or "").strip()
+    if not platform:
+        raise HTTPException(status_code=400, detail="platform is required")
+
+    disconnected = repo.disconnect_connector_account(tenant_id=tid, platform=platform)
+    if disconnected is None:
+        raise HTTPException(status_code=404, detail="Connector not found")
+
+    repo.save_audit_event(
+        tenant_id=tid,
+        event_type="connector_disconnected",
+        source="dashboard",
+        actor_id="dashboard_admin",
+        payload={"platform": platform},
+    )
+    return {
+        "status": "disconnected",
+        "connector": _connector_to_dict(disconnected),
+    }
+
+
+@dashboard_router.post("/api/connectors/refresh")
+def api_refresh_connector(body: ConnectorRefreshRequest, request: Request) -> dict:
+    repo = _repo(request)
+    settings = getattr(request.app.state, "settings", None)
+    tid = (body.tenant_id or "").strip() or _tid(request, None)
+    platform = (body.platform or "").strip()
+    if not platform:
+        raise HTTPException(status_code=400, detail="platform is required")
+    try:
+        refreshed, _, did_refresh = refresh_google_connector_credentials(
+            repo,
+            settings,
+            tenant_id=tid,
+            platform=platform,
+            force=True,
+            source="dashboard",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "refreshed" if did_refresh else "already_fresh",
+        "connector": _connector_to_dict(refreshed),
+    }
+
+
+@dashboard_router.get("/api/tenants/settings")
+def api_tenant_settings(request: Request, tenant_id: str | None = None) -> dict:
+    repo = _repo(request)
+    tid = _tid(request, tenant_id)
+    tenant = repo.get_or_create_tenant(tid)
+    flags = repo.get_or_create_tenant_feature_flags(tid)
+    return _tenant_settings_to_dict(repo, tenant, flags)
+
+
+@dashboard_router.put("/api/tenants/settings")
+def api_update_tenant_settings(body: TenantSettingsUpdateRequest, request: Request) -> dict:
+    repo = _repo(request)
+    tid = (body.tenant_id or "").strip() or _tid(request, None)
+    normalized_merchant_slug = _normalize_optional_merchant_slug(body.merchant_slug)
+    tenant = repo.update_tenant_plan(
+        tid,
+        plan=_normalize_plan(body.plan),
+        plan_expires_at=body.plan_expires_at,
+        merchant_slug=normalized_merchant_slug,
+    )
+    flags = repo.update_tenant_feature_flags(
+        tid,
+        ga4_enabled=body.ga4_enabled,
+        meta_enabled=body.meta_enabled,
+        cross_channel_enabled=body.cross_channel_enabled,
+        crm_enabled=body.crm_enabled,
+    )
+    repo.save_audit_event(
+        tenant_id=tid,
+        event_type="tenant_settings_updated",
+        source="dashboard",
+        actor_id="dashboard_admin",
+        payload={
+            "plan": tenant.plan,
+            "plan_expires_at": tenant.plan_expires_at.isoformat() if tenant.plan_expires_at else None,
+            "merchant_slug": tenant.merchant_slug,
+            "feature_flags": {
+                "ga4_enabled": flags.ga4_enabled,
+                "meta_enabled": flags.meta_enabled,
+                "cross_channel_enabled": flags.cross_channel_enabled,
+                "crm_enabled": flags.crm_enabled,
+            },
+        },
+    )
+    return _tenant_settings_to_dict(repo, tenant, flags)
+
+
+@dashboard_router.get("/api/tenants/health")
+def api_tenant_health(request: Request, tenant_id: str | None = None) -> dict:
+    repo = _repo(request)
+    tid = _tid(request, tenant_id)
+    snapshot = repo.get_tenant_health_snapshot(tid)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    return snapshot
+
+
+@dashboard_router.post("/api/tenants/deactivate")
+def api_deactivate_tenant(body: TenantDeactivateRequest, request: Request) -> dict:
+    repo = _repo(request)
+    tid = (body.tenant_id or "").strip() or _tid(request, None)
+    tenant = repo.deactivate_tenant(tid)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    repo.save_audit_event(
+        tenant_id=tid,
+        event_type="tenant_deactivated",
+        source="dashboard",
+        actor_id="dashboard_admin",
+        payload={"tenant_id": tid},
+    )
+    return {
+        "status": "deactivated",
+        "tenant": {
+            "id": tenant.id,
+            "is_active": tenant.is_active,
+            "updated_at": tenant.updated_at.isoformat() if tenant.updated_at else None,
+        },
+    }
+
+
+@dashboard_router.get("/api/tenants/export")
+def api_export_tenant(request: Request, tenant_id: str | None = None) -> dict:
+    repo = _repo(request)
+    tid = _tid(request, tenant_id)
+    exported = repo.export_tenant_bundle(tid)
+    if exported is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    return exported
+
+
+@dashboard_router.post("/api/tenants/delete")
+def api_delete_tenant(body: TenantDeleteRequest, request: Request) -> dict:
+    repo = _repo(request)
+    tid = (body.tenant_id or "").strip() or _tid(request, None)
+    if body.confirm_tenant_id.strip() != tid:
+        raise HTTPException(status_code=400, detail="confirm_tenant_id must match tenant_id")
+
+    deleted_counts = repo.delete_tenant_bundle(tid)
+    if deleted_counts is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    return {
+        "status": "deleted",
+        "tenant_id": tid,
+        "deleted_counts": deleted_counts,
+    }
 
 
 # ── API: Push Log ─────────────────────────────────────────────────────────────

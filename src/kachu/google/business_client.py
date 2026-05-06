@@ -181,3 +181,42 @@ class GoogleBusinessClient:
             content=json.dumps(body, ensure_ascii=False).encode(),
         )
         return resp.json()
+
+    # ── Location metadata ────────────────────────────────────────────────────
+
+    def patch_location_website(
+        self,
+        account_id: str,
+        location_id: str,
+        website_uri: str,
+    ) -> dict[str, Any]:
+        """Update the websiteUri field of a GBP location.
+
+        Uses the Business Information API PATCH endpoint with updateMask=websiteUri.
+        This is typically used to point the GBP listing at the Kachu merchant page
+        (e.g. https://kachu.tw/merchants/{slug}) for tenants without their own website.
+
+        Requires the ``business.manage`` OAuth scope.
+        """
+        location_name = self._location_parent(account_id, location_id)
+        url = f"{_BUSINESS_INFO_BASE}/{location_name}"
+        body = {"websiteUri": website_uri}
+        resp = self._request(
+            "PATCH",
+            url,
+            params={"updateMask": "websiteUri"},
+            content=json.dumps(body, ensure_ascii=False).encode(),
+        )
+        return resp.json()
+
+    def get_location(
+        self,
+        account_id: str,
+        location_id: str,
+        read_mask: str = "name,title,websiteUri,phoneNumbers,regularHours,address",
+    ) -> dict[str, Any]:
+        """Fetch a single location's metadata from the Business Information API."""
+        location_name = self._location_parent(account_id, location_id)
+        url = f"{_BUSINESS_INFO_BASE}/{location_name}"
+        resp = self._request("GET", url, params={"readMask": read_mask})
+        return resp.json()

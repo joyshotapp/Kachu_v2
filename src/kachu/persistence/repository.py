@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import Engine
 from sqlmodel import Session, select
@@ -13,13 +13,19 @@ from .tables import (
     ConversationTable,
     DeferredDispatchTable,
     EditSessionTable,
+    KnowledgeChunkTable,
+    KnowledgeDocumentTable,
     KnowledgeEntryTable,
     OnboardingStateTable,
     PushLogTable,
+    RetrievalFeedbackTable,
     ScheduledPublishTable,
     SharedContextTable,
     TenantApprovalProfileTable,
     TenantAutomationSettingsTable,
+    TenantFeatureFlagTable,
+    TenantLlmBudgetTable,
+    TenantMembershipTable,
     TenantTable,
     WorkflowRunTable,
     # Backward-compat aliases
@@ -39,6 +45,77 @@ def _normalize_google_location(value: str) -> str:
     return text
 
 
+def _serialize_export_value(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_serialize_export_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _serialize_export_value(item) for key, item in value.items()}
+    return value
+
+
+def _serialize_model(model: object) -> dict:
+    if hasattr(model, "model_dump"):
+        return _serialize_export_value(model.model_dump())
+    return {
+        key: _serialize_export_value(value)
+        for key, value in vars(model).items()
+        if not key.startswith("_")
+    }
+
+
+def _load_connector_credentials(account: ConnectorAccountTable | None) -> dict[str, object]:
+    if account is None or not getattr(account, "credentials_encrypted", ""):
+        return {}
+    try:
+        payload = json.loads(account.credentials_encrypted)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+_KNOWLEDGE_VALID_STATUSES = {"active", "stale", "conflict", "superseded", "archived"}
+_KNOWLEDGE_AUTO_STALE_EXCLUDED_CATEGORIES = {"basic_info", "core_value", "preference", "episode"}
+
+
+def _knowledge_reference_at(entry: KnowledgeEntryTable) -> datetime:
+    candidates = [
+        _normalize_utc_datetime(entry.updated_at),
+        _normalize_utc_datetime(getattr(entry, "last_retrieved_at", None)),
+        _normalize_utc_datetime(getattr(entry, "last_reviewed_at", None)),
+    ]
+    timestamps = [timestamp for timestamp in candidates if timestamp is not None]
+    return max(timestamps) if timestamps else datetime.now(timezone.utc)
+
+
+def _normalize_utc_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _knowledge_is_auto_stale_candidate(
+    entry: KnowledgeEntryTable,
+    *,
+    cutoff: datetime,
+) -> bool:
+    if entry.status != "active":
+        return False
+    if entry.category in _KNOWLEDGE_AUTO_STALE_EXCLUDED_CATEGORIES:
+        return False
+    return _knowledge_reference_at(entry) <= cutoff
+
+
+def _knowledge_status_counts(entries: list[KnowledgeEntryTable]) -> dict[str, int]:
+    counts = {status: 0 for status in _KNOWLEDGE_VALID_STATUSES}
+    for entry in entries:
+        counts[entry.status] = counts.get(entry.status, 0) + 1
+    return counts
+
+
 class KachuRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -52,7 +129,7 @@ class KachuRepository:
                 tenant = TenantTable(id=tenant_id)
                 session.add(tenant)
                 session.commit()
-                session.refresh(tenant)
+                tenant = session.get(TenantTable, tenant_id) or tenant
             return tenant
 
     def save_tenant(self, tenant: TenantTable) -> TenantTable:
@@ -62,6 +139,21 @@ class KachuRepository:
             session.commit()
             session.refresh(tenant)
             return tenant
+
+    def update_tenant_plan(
+        self,
+        tenant_id: str,
+        *,
+        plan: str,
+        plan_expires_at: datetime | None,
+        merchant_slug: str | None = None,
+    ) -> TenantTable:
+        tenant = self.get_or_create_tenant(tenant_id)
+        tenant.plan = str(plan or "trial").strip().lower() or "trial"
+        tenant.plan_expires_at = plan_expires_at
+        if merchant_slug is not None:
+            tenant.merchant_slug = str(merchant_slug or "").strip()
+        return self.save_tenant(tenant)
 
     def list_active_tenant_ids(self) -> list[str]:
         """Return IDs of all tenants with is_active=True."""
@@ -74,6 +166,231 @@ class KachuRepository:
     def get_tenant(self, tenant_id: str) -> TenantTable | None:
         with Session(self._engine) as session:
             return session.get(TenantTable, tenant_id)
+
+    def create_tenant_membership(
+        self,
+        *,
+        tenant_id: str,
+        line_user_id: str,
+        role: str = "owner",
+        display_name: str = "",
+    ) -> TenantMembershipTable:
+        normalized_line_user_id = str(line_user_id).strip()
+        if not normalized_line_user_id:
+            raise ValueError("line_user_id is required")
+
+        normalized_role = str(role or "owner").strip().lower() or "owner"
+        if normalized_role not in {"owner", "manager"}:
+            raise ValueError("role must be one of: owner, manager")
+
+        normalized_display_name = str(display_name or "").strip()
+        self.get_or_create_tenant(tenant_id)
+
+        with Session(self._engine) as session:
+            conflict_stmt = (
+                select(TenantMembershipTable)
+                .where(TenantMembershipTable.line_user_id == normalized_line_user_id)
+                .where(TenantMembershipTable.is_active == True)  # noqa: E712
+                .where(TenantMembershipTable.tenant_id != tenant_id)
+            )
+            conflict = session.exec(conflict_stmt).first()
+            if conflict is not None:
+                raise ValueError("line_user_id is already bound to another active tenant")
+
+            existing_stmt = (
+                select(TenantMembershipTable)
+                .where(TenantMembershipTable.tenant_id == tenant_id)
+                .where(TenantMembershipTable.line_user_id == normalized_line_user_id)
+            )
+            existing = session.exec(existing_stmt).first()
+            if existing is not None:
+                existing.role = normalized_role
+                existing.display_name = normalized_display_name
+                existing.is_active = True
+                existing.updated_at = datetime.now(timezone.utc)
+                session.add(existing)
+                session.commit()
+                session.refresh(existing)
+                return existing
+
+            membership = TenantMembershipTable(
+                tenant_id=tenant_id,
+                line_user_id=normalized_line_user_id,
+                role=normalized_role,
+                display_name=normalized_display_name,
+            )
+            session.add(membership)
+            session.commit()
+            session.refresh(membership)
+            return membership
+
+    def get_active_membership_by_line_user_id(self, line_user_id: str) -> TenantMembershipTable | None:
+        normalized_line_user_id = str(line_user_id).strip()
+        if not normalized_line_user_id:
+            return None
+        with Session(self._engine) as session:
+            stmt = (
+                select(TenantMembershipTable)
+                .where(TenantMembershipTable.line_user_id == normalized_line_user_id)
+                .where(TenantMembershipTable.is_active == True)  # noqa: E712
+            )
+            return session.exec(stmt).first()
+
+    def list_active_memberships(self, tenant_id: str) -> list[TenantMembershipTable]:
+        with Session(self._engine) as session:
+            stmt = (
+                select(TenantMembershipTable)
+                .where(TenantMembershipTable.tenant_id == tenant_id)
+                .where(TenantMembershipTable.is_active == True)  # noqa: E712
+                .order_by(TenantMembershipTable.created_at.asc())
+            )
+            return list(session.exec(stmt).all())
+
+    def get_owner_line_user_ids(self, tenant_id: str) -> list[str]:
+        with Session(self._engine) as session:
+            stmt = (
+                select(TenantMembershipTable)
+                .where(TenantMembershipTable.tenant_id == tenant_id)
+                .where(TenantMembershipTable.is_active == True)  # noqa: E712
+                .where(TenantMembershipTable.role == "owner")
+                .order_by(TenantMembershipTable.created_at.asc())
+            )
+            return [row.line_user_id for row in session.exec(stmt).all() if row.line_user_id]
+
+    def get_notification_line_user_ids(self, tenant_id: str) -> list[str]:
+        with Session(self._engine) as session:
+            stmt = (
+                select(TenantMembershipTable)
+                .where(TenantMembershipTable.tenant_id == tenant_id)
+                .where(TenantMembershipTable.is_active == True)  # noqa: E712
+                .where(TenantMembershipTable.role.in_(["owner", "manager"]))
+                .order_by(TenantMembershipTable.created_at.asc())
+            )
+            recipients: list[str] = []
+            for row in session.exec(stmt).all():
+                normalized_line_user_id = str(row.line_user_id or "").strip()
+                if normalized_line_user_id and normalized_line_user_id not in recipients:
+                    recipients.append(normalized_line_user_id)
+            return recipients
+
+    def deactivate_tenant_membership(self, membership_id: str) -> TenantMembershipTable | None:
+        with Session(self._engine) as session:
+            membership = session.get(TenantMembershipTable, membership_id)
+            if membership is None:
+                return None
+            membership.is_active = False
+            membership.updated_at = datetime.now(timezone.utc)
+            session.add(membership)
+            session.commit()
+            session.refresh(membership)
+            return membership
+
+    def deactivate_tenant(self, tenant_id: str) -> TenantTable | None:
+        with Session(self._engine) as session:
+            tenant = session.get(TenantTable, tenant_id)
+            if tenant is None:
+                return None
+
+            tenant.is_active = False
+            tenant.updated_at = datetime.now(timezone.utc)
+            session.add(tenant)
+
+            membership_stmt = (
+                select(TenantMembershipTable)
+                .where(TenantMembershipTable.tenant_id == tenant_id)
+                .where(TenantMembershipTable.is_active == True)  # noqa: E712
+            )
+            for membership in session.exec(membership_stmt).all():
+                membership.is_active = False
+                membership.updated_at = datetime.now(timezone.utc)
+                session.add(membership)
+
+            connector_stmt = (
+                select(ConnectorAccountTable)
+                .where(ConnectorAccountTable.tenant_id == tenant_id)
+                .where(ConnectorAccountTable.is_active == True)  # noqa: E712
+            )
+            for connector in session.exec(connector_stmt).all():
+                connector.is_active = False
+                connector.updated_at = datetime.now(timezone.utc)
+                session.add(connector)
+
+            session.commit()
+            session.refresh(tenant)
+            return tenant
+
+    def export_tenant_bundle(self, tenant_id: str) -> dict | None:
+        with Session(self._engine) as session:
+            tenant = session.get(TenantTable, tenant_id)
+            if tenant is None:
+                return None
+
+            def _all(model):
+                return list(session.exec(select(model).where(model.tenant_id == tenant_id)).all())
+
+            return {
+                "tenant": _serialize_model(tenant),
+                "memberships": [_serialize_model(row) for row in _all(TenantMembershipTable)],
+                "connectors": [_serialize_model(row) for row in _all(ConnectorAccountTable)],
+                "workflow_runs": [_serialize_model(row) for row in _all(WorkflowRunTable)],
+                "approval_tasks": [_serialize_model(row) for row in _all(ApprovalTaskTable)],
+                "scheduled_publishes": [_serialize_model(row) for row in _all(ScheduledPublishTable)],
+                "knowledge_entries": [_serialize_model(row) for row in _all(KnowledgeEntryTable)],
+                "knowledge_documents": [_serialize_model(row) for row in _all(KnowledgeDocumentTable)],
+                "knowledge_chunks": [_serialize_model(row) for row in _all(KnowledgeChunkTable)],
+                "conversations": [_serialize_model(row) for row in _all(ConversationTable)],
+                "onboarding_states": [_serialize_model(row) for row in _all(OnboardingStateTable)],
+                "shared_contexts": [_serialize_model(row) for row in _all(SharedContextTable)],
+                "deferred_dispatches": [_serialize_model(row) for row in _all(DeferredDispatchTable)],
+                "push_logs": [_serialize_model(row) for row in _all(PushLogTable)],
+                "audit_events": [_serialize_model(row) for row in _all(AuditEventTable)],
+                "approval_profile": [_serialize_model(row) for row in _all(TenantApprovalProfileTable)],
+                "automation_settings": [_serialize_model(row) for row in _all(TenantAutomationSettingsTable)],
+                "feature_flags": [_serialize_model(row) for row in _all(TenantFeatureFlagTable)],
+                "llm_budgets": [_serialize_model(row) for row in _all(TenantLlmBudgetTable)],
+                "retrieval_feedback": [_serialize_model(row) for row in _all(RetrievalFeedbackTable)],
+                "edit_sessions": [_serialize_model(row) for row in _all(EditSessionTable)],
+            }
+
+    def delete_tenant_bundle(self, tenant_id: str) -> dict[str, int] | None:
+        with Session(self._engine) as session:
+            tenant = session.get(TenantTable, tenant_id)
+            if tenant is None:
+                return None
+
+            counts: dict[str, int] = {}
+            tenant_scoped_models = [
+                DeferredDispatchTable,
+                SharedContextTable,
+                AuditEventTable,
+                PushLogTable,
+                EditSessionTable,
+                RetrievalFeedbackTable,
+                TenantLlmBudgetTable,
+                TenantFeatureFlagTable,
+                TenantAutomationSettingsTable,
+                TenantApprovalProfileTable,
+                KnowledgeChunkTable,
+                KnowledgeDocumentTable,
+                KnowledgeEntryTable,
+                ScheduledPublishTable,
+                ApprovalTaskTable,
+                WorkflowRunTable,
+                ConnectorAccountTable,
+                ConversationTable,
+                OnboardingStateTable,
+                TenantMembershipTable,
+            ]
+            for model in tenant_scoped_models:
+                rows = list(session.exec(select(model).where(model.tenant_id == tenant_id)).all())
+                counts[model.__name__] = len(rows)
+                for row in rows:
+                    session.delete(row)
+
+            counts["TenantTable"] = 1
+            session.delete(tenant)
+            session.commit()
+            return counts
 
     # ── WorkflowRun (v1-aligned; backward-compat aliases kept below) ──────────
 
@@ -283,6 +600,18 @@ class KachuRepository:
         with Session(self._engine) as session:
             return session.get(ScheduledPublishTable, scheduled_publish_id)
 
+    def get_latest_scheduled_publish_by_source_run_id(
+        self,
+        source_run_id: str,
+    ) -> ScheduledPublishTable | None:
+        with Session(self._engine) as session:
+            stmt = (
+                select(ScheduledPublishTable)
+                .where(ScheduledPublishTable.source_run_id == source_run_id)
+                .order_by(ScheduledPublishTable.created_at.desc())
+            )
+            return session.exec(stmt).first()
+
     def list_due_scheduled_publishes(
         self,
         *,
@@ -340,6 +669,7 @@ class KachuRepository:
             content=content,
             source_type=source_type,
             source_id=source_id,
+            last_reviewed_at=datetime.now(timezone.utc),
         )
         with Session(self._engine) as session:
             session.add(entry)
@@ -351,12 +681,30 @@ class KachuRepository:
         self,
         tenant_id: str,
         category: str | None = None,
+        status: str | None = None,
     ) -> list[KnowledgeEntryTable]:
         with Session(self._engine) as session:
-            stmt = select(KnowledgeEntryTable).where(KnowledgeEntryTable.tenant_id == tenant_id)
+            stmt = (
+                select(KnowledgeEntryTable)
+                .where(KnowledgeEntryTable.tenant_id == tenant_id)
+                .order_by(KnowledgeEntryTable.updated_at.desc(), KnowledgeEntryTable.created_at.desc())
+            )
             if category:
                 stmt = stmt.where(KnowledgeEntryTable.category == category)
+            if status:
+                stmt = stmt.where(KnowledgeEntryTable.status == status)
             return list(session.exec(stmt).all())
+
+    def list_knowledge_entries(
+        self,
+        tenant_id: str,
+        *,
+        category: str | None = None,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[KnowledgeEntryTable]:
+        entries = self.get_knowledge_entries(tenant_id, category=category, status=status)
+        return entries[:limit]
 
     def get_active_knowledge_entries(
         self,
@@ -379,6 +727,102 @@ class KachuRepository:
             if limit is not None:
                 stmt = stmt.limit(limit)
             return list(session.exec(stmt).all())
+
+    def mark_knowledge_entries_retrieved(self, entry_ids: list[str]) -> int:
+        normalized_entry_ids = [entry_id for entry_id in entry_ids if str(entry_id or "").strip()]
+        if not normalized_entry_ids:
+            return 0
+
+        with Session(self._engine) as session:
+            stmt = select(KnowledgeEntryTable).where(KnowledgeEntryTable.id.in_(normalized_entry_ids))
+            entries = list(session.exec(stmt).all())
+            if not entries:
+                return 0
+
+            retrieved_at = datetime.now(timezone.utc)
+            for entry in entries:
+                entry.last_retrieved_at = retrieved_at
+                session.add(entry)
+            session.commit()
+            return len(entries)
+
+    def update_knowledge_entry_status(
+        self,
+        entry_id: str,
+        *,
+        status: str,
+        conflict_with: str | None = None,
+    ) -> KnowledgeEntryTable | None:
+        normalized_status = (status or "").strip().lower()
+        if normalized_status not in _KNOWLEDGE_VALID_STATUSES:
+            raise ValueError(f"Unsupported knowledge status: {status}")
+
+        with Session(self._engine) as session:
+            entry = session.get(KnowledgeEntryTable, entry_id)
+            if entry is None:
+                return None
+
+            entry.status = normalized_status
+            entry.conflict_with = (conflict_with or "").strip() or None
+            entry.last_reviewed_at = datetime.now(timezone.utc)
+            session.add(entry)
+            session.commit()
+            session.refresh(entry)
+            return entry
+
+    def get_knowledge_lifecycle_summary(
+        self,
+        tenant_id: str,
+        *,
+        stale_after_days: int = 60,
+    ) -> dict[str, object]:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(int(stale_after_days), 1))
+        with Session(self._engine) as session:
+            stmt = select(KnowledgeEntryTable).where(KnowledgeEntryTable.tenant_id == tenant_id)
+            entries = list(session.exec(stmt).all())
+
+        counts = _knowledge_status_counts(entries)
+        stale_candidates = sum(
+            1 for entry in entries if _knowledge_is_auto_stale_candidate(entry, cutoff=cutoff)
+        )
+        return {
+            "total": len(entries),
+            "stale_after_days": max(int(stale_after_days), 1),
+            "by_status": counts,
+            "stale_candidates": stale_candidates,
+        }
+
+    def refresh_knowledge_lifecycle(
+        self,
+        tenant_id: str,
+        *,
+        stale_after_days: int = 60,
+    ) -> dict[str, object]:
+        stale_after_days = max(int(stale_after_days), 1)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=stale_after_days)
+        reviewed_at = datetime.now(timezone.utc)
+
+        with Session(self._engine) as session:
+            stmt = select(KnowledgeEntryTable).where(KnowledgeEntryTable.tenant_id == tenant_id)
+            entries = list(session.exec(stmt).all())
+            touched = 0
+            for entry in entries:
+                if not _knowledge_is_auto_stale_candidate(entry, cutoff=cutoff):
+                    continue
+                entry.status = "stale"
+                entry.last_reviewed_at = reviewed_at
+                session.add(entry)
+                touched += 1
+            session.commit()
+
+        summary = self.get_knowledge_lifecycle_summary(
+            tenant_id,
+            stale_after_days=stale_after_days,
+        )
+        return {
+            "updated": touched,
+            "summary": summary,
+        }
 
     # ── Conversation ──────────────────────────────────────────────────────────
 
@@ -653,6 +1097,7 @@ class KachuRepository:
         platform: str,
         credentials_json: str,
         account_label: str = "",
+        touch_refreshed_at: bool = True,
     ) -> "ConnectorAccountTable":
         """Upsert a connector account (one active per tenant+platform)."""
         with Session(self._engine) as session:
@@ -666,7 +1111,8 @@ class KachuRepository:
             if existing:
                 existing.credentials_encrypted = credentials_json
                 existing.account_label = account_label
-                existing.last_refreshed_at = datetime.now(timezone.utc)
+                if touch_refreshed_at:
+                    existing.last_refreshed_at = datetime.now(timezone.utc)
                 existing.updated_at = datetime.now(timezone.utc)
                 session.add(existing)
                 session.commit()
@@ -677,12 +1123,43 @@ class KachuRepository:
                 platform=platform,
                 account_label=account_label,
                 credentials_encrypted=credentials_json,
-                last_refreshed_at=datetime.now(timezone.utc),
+                last_refreshed_at=datetime.now(timezone.utc) if touch_refreshed_at else None,
             )
             session.add(record)
             session.commit()
             session.refresh(record)
             return record
+
+    def update_connector_account(
+        self,
+        *,
+        tenant_id: str,
+        platform: str,
+        credentials_json: str | None = None,
+        account_label: str | None = None,
+        touch_refreshed_at: bool = False,
+    ) -> ConnectorAccountTable | None:
+        with Session(self._engine) as session:
+            stmt = (
+                select(ConnectorAccountTable)
+                .where(ConnectorAccountTable.tenant_id == tenant_id)
+                .where(ConnectorAccountTable.platform == platform)
+                .where(ConnectorAccountTable.is_active == True)  # noqa: E712
+            )
+            account = session.exec(stmt).first()
+            if account is None:
+                return None
+            if credentials_json is not None:
+                account.credentials_encrypted = credentials_json
+            if account_label is not None:
+                account.account_label = account_label
+            if touch_refreshed_at:
+                account.last_refreshed_at = datetime.now(timezone.utc)
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            return account
 
     def get_connector_account(
         self, tenant_id: str, platform: str
@@ -695,6 +1172,70 @@ class KachuRepository:
                 .where(ConnectorAccountTable.is_active == True)  # noqa: E712
             )
             return session.exec(stmt).first()
+
+    def list_connector_accounts(
+        self,
+        tenant_id: str,
+        *,
+        include_inactive: bool = True,
+    ) -> list[ConnectorAccountTable]:
+        with Session(self._engine) as session:
+            stmt = select(ConnectorAccountTable).where(ConnectorAccountTable.tenant_id == tenant_id)
+            if not include_inactive:
+                stmt = stmt.where(ConnectorAccountTable.is_active == True)  # noqa: E712
+            stmt = stmt.order_by(ConnectorAccountTable.created_at.asc())
+            return list(session.exec(stmt).all())
+
+    def disconnect_connector_account(
+        self,
+        *,
+        tenant_id: str,
+        platform: str,
+    ) -> ConnectorAccountTable | None:
+        with Session(self._engine) as session:
+            stmt = (
+                select(ConnectorAccountTable)
+                .where(ConnectorAccountTable.tenant_id == tenant_id)
+                .where(ConnectorAccountTable.platform == platform)
+                .where(ConnectorAccountTable.is_active == True)  # noqa: E712
+            )
+            account = session.exec(stmt).first()
+            if account is None:
+                return None
+            account.is_active = False
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            return account
+
+    def get_tenant_feature_flags(self, tenant_id: str) -> TenantFeatureFlagTable | None:
+        with Session(self._engine) as session:
+            return session.get(TenantFeatureFlagTable, tenant_id)
+
+    def get_or_create_tenant_feature_flags(self, tenant_id: str) -> TenantFeatureFlagTable:
+        with Session(self._engine) as session:
+            flags = session.get(TenantFeatureFlagTable, tenant_id)
+            if flags is None:
+                flags = TenantFeatureFlagTable(tenant_id=tenant_id)
+                session.add(flags)
+                session.commit()
+                session.refresh(flags)
+            return flags
+
+    def update_tenant_feature_flags(self, tenant_id: str, **updates) -> TenantFeatureFlagTable:
+        with Session(self._engine) as session:
+            flags = session.get(TenantFeatureFlagTable, tenant_id)
+            if flags is None:
+                flags = TenantFeatureFlagTable(tenant_id=tenant_id)
+            for key, value in updates.items():
+                if hasattr(flags, key):
+                    setattr(flags, key, bool(value))
+            flags.updated_at = datetime.now(timezone.utc)
+            session.add(flags)
+            session.commit()
+            session.refresh(flags)
+            return flags
 
     def find_tenant_ids_by_google_location(self, location_name: str) -> list[str]:
         target = _normalize_google_location(location_name)
@@ -731,13 +1272,7 @@ class KachuRepository:
 
     def mark_knowledge_entry_superseded(self, entry_id: str) -> None:
         """Mark a single knowledge entry as superseded (no replacement created)."""
-        with Session(self._engine) as session:
-            entry = session.get(KnowledgeEntryTable, entry_id)
-            if entry:
-                entry.status = "superseded"
-                entry.updated_at = datetime.now(timezone.utc)
-                session.add(entry)
-                session.commit()
+        self.update_knowledge_entry_status(entry_id, status="superseded")
 
     def supersede_knowledge_entry(
         self,
@@ -946,6 +1481,134 @@ class KachuRepository:
             stmt = stmt.limit(limit)
             return list(session.exec(stmt).all())
 
+    def get_tenant_health_snapshot(self, tenant_id: str) -> dict | None:
+        tenant = self.get_tenant(tenant_id)
+        if tenant is None:
+            return None
+
+        feature_flags = self.get_or_create_tenant_feature_flags(tenant_id)
+        now = datetime.now(timezone.utc)
+        lower = now - timedelta(hours=24)
+
+        with Session(self._engine) as session:
+            connector_rows = list(
+                session.exec(
+                    select(ConnectorAccountTable)
+                    .where(ConnectorAccountTable.tenant_id == tenant_id)
+                    .order_by(ConnectorAccountTable.created_at.asc())
+                ).all()
+            )
+            workflow_rows = list(
+                session.exec(
+                    select(WorkflowRunTable)
+                    .where(WorkflowRunTable.tenant_id == tenant_id)
+                    .where(WorkflowRunTable.created_at >= lower)
+                    .order_by(WorkflowRunTable.created_at.desc())
+                ).all()
+            )
+            recent_failures = list(
+                session.exec(
+                    select(WorkflowRunTable)
+                    .where(WorkflowRunTable.tenant_id == tenant_id)
+                    .where(WorkflowRunTable.status == "failed")
+                    .order_by(WorkflowRunTable.created_at.desc())
+                    .limit(5)
+                ).all()
+            )
+            pending_approvals = session.exec(
+                select(ApprovalTaskTable)
+                .where(ApprovalTaskTable.tenant_id == tenant_id)
+                .where(ApprovalTaskTable.status == "pending")
+            ).all()
+            active_knowledge = session.exec(
+                select(KnowledgeEntryTable)
+                .where(KnowledgeEntryTable.tenant_id == tenant_id)
+                .where(KnowledgeEntryTable.status == "active")
+            ).all()
+            memberships = session.exec(
+                select(TenantMembershipTable)
+                .where(TenantMembershipTable.tenant_id == tenant_id)
+                .where(TenantMembershipTable.is_active == True)  # noqa: E712
+            ).all()
+            budget = session.exec(
+                select(TenantLlmBudgetTable).where(TenantLlmBudgetTable.tenant_id == tenant_id)
+            ).first()
+
+        connector_alerts = 0
+        connector_summaries: list[dict[str, object]] = []
+        for connector in connector_rows:
+            creds = _load_connector_credentials(connector)
+            refresh_error = str(creds.get("last_refresh_error", "") or "").strip()
+            refresh_status = str(creds.get("refresh_status", "healthy") or "healthy").strip()
+            can_refresh = connector.platform in {"google_business", "ga4"} and bool(creds.get("refresh_token"))
+            if refresh_error or (connector.is_active and not creds.get("access_token")):
+                connector_alerts += 1
+            connector_summaries.append(
+                {
+                    "platform": connector.platform,
+                    "is_active": connector.is_active,
+                    "account_label": connector.account_label,
+                    "last_refreshed_at": connector.last_refreshed_at.isoformat() if connector.last_refreshed_at else None,
+                    "refresh_status": refresh_status,
+                    "refresh_error": refresh_error or None,
+                    "can_refresh": can_refresh,
+                }
+            )
+
+        last_successful_run = next((row for row in workflow_rows if row.status == "completed"), None)
+        last_failed_run = next((row for row in workflow_rows if row.status == "failed"), None)
+        plan_status = "active"
+        plan_expires_at = tenant.plan_expires_at
+        if plan_expires_at and plan_expires_at.tzinfo is None:
+            plan_expires_at = plan_expires_at.replace(tzinfo=timezone.utc)
+        elif plan_expires_at:
+            plan_expires_at = plan_expires_at.astimezone(timezone.utc)
+        if plan_expires_at and plan_expires_at <= now:
+            plan_status = "expired"
+        elif plan_expires_at:
+            plan_status = "scheduled_expiry"
+
+        return {
+            "tenant": {
+                "id": tenant.id,
+                "name": tenant.name,
+                "plan": tenant.plan,
+                "plan_expires_at": tenant.plan_expires_at.isoformat() if tenant.plan_expires_at else None,
+                "merchant_slug": tenant.merchant_slug,
+                "plan_status": plan_status,
+                "is_active": tenant.is_active,
+                "timezone": tenant.timezone,
+            },
+            "feature_flags": _serialize_model(feature_flags),
+            "connectors": connector_summaries,
+            "alerts": {
+                "connector_alerts": connector_alerts,
+                "recent_failures": len(recent_failures),
+            },
+            "recent_activity": {
+                "runs_last_24h": len(workflow_rows),
+                "failed_runs_last_24h": sum(1 for row in workflow_rows if row.status == "failed"),
+                "pending_approvals": len(pending_approvals),
+                "active_knowledge_entries": len(active_knowledge),
+                "active_memberships": len(memberships),
+                "last_successful_run_at": last_successful_run.created_at.isoformat() if last_successful_run else None,
+                "last_failed_run_at": last_failed_run.created_at.isoformat() if last_failed_run else None,
+            },
+            "recent_failures": [
+                {
+                    "workflow_type": row.workflow_type,
+                    "error_message": row.error_message,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                }
+                for row in recent_failures
+            ],
+            "llm_budget": {
+                "enabled": bool(getattr(budget, "enabled", False)) if budget else None,
+                "monthly_budget_usd": getattr(budget, "monthly_budget_usd", None) if budget else None,
+                "last_synced_at": budget.last_synced_at.isoformat() if budget and budget.last_synced_at else None,
+            },
+        }
+
     def has_recent_audit_event(
         self,
         *,
@@ -1009,6 +1672,9 @@ class KachuRepository:
             if category:
                 entry.category = category
             entry.updated_at = datetime.now(timezone.utc)
+            entry.status = "active"
+            entry.conflict_with = None
+            entry.last_reviewed_at = datetime.now(timezone.utc)
             session.add(entry)
             session.commit()
             session.refresh(entry)
@@ -1051,6 +1717,20 @@ class KachuRepository:
                 kb_stmt = kb_stmt.where(KnowledgeEntryTable.tenant_id == tenant_id)
             knowledge_entries = session.exec(kb_stmt).one() or 0
 
+            stale_kb_stmt = select(func.count(KnowledgeEntryTable.id)).where(
+                KnowledgeEntryTable.status == "stale"
+            )
+            if tenant_id:
+                stale_kb_stmt = stale_kb_stmt.where(KnowledgeEntryTable.tenant_id == tenant_id)
+            stale_knowledge_entries = session.exec(stale_kb_stmt).one() or 0
+
+            conflict_kb_stmt = select(func.count(KnowledgeEntryTable.id)).where(
+                KnowledgeEntryTable.status == "conflict"
+            )
+            if tenant_id:
+                conflict_kb_stmt = conflict_kb_stmt.where(KnowledgeEntryTable.tenant_id == tenant_id)
+            conflict_knowledge_entries = session.exec(conflict_kb_stmt).one() or 0
+
             # Today's pushes
             push_stmt = select(func.count(PushLogTable.id)).where(
                 PushLogTable.pushed_at >= today_start
@@ -1073,6 +1753,8 @@ class KachuRepository:
             "active_runs": active_runs,
             "pending_approvals": pending_approvals,
             "knowledge_entries": knowledge_entries,
+            "stale_knowledge_entries": stale_knowledge_entries,
+            "conflict_knowledge_entries": conflict_knowledge_entries,
             "today_pushes": today_pushes,
             "runs_by_type": type_counts,
         }

@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - handled gracefully at runtime
         pass
 
 from ..config import Settings, get_settings
-from ..line.push import push_line_messages, text_message
+from ..line.push import push_line_messages, resolve_tenant_line_recipients, text_message
 from ..persistence import KachuRepository
 
 logger = logging.getLogger(__name__)
@@ -66,14 +66,27 @@ def _load_connector_credentials(account: Any) -> dict[str, Any]:
         return {}
 
 
+def _google_business_is_ready(account: Any) -> bool:
+    creds = _load_connector_credentials(account)
+    return bool(
+        account
+        and getattr(account, "is_active", False)
+        and str(creds.get("account_id", "")).strip()
+        and str(creds.get("location_id", "")).strip()
+    )
+
+
 def _build_phase0_readiness(repo: KachuRepository, tenant_id: str) -> dict[str, Any]:
     meta_account = repo.get_connector_account(tenant_id, "meta")
     google_account = repo.get_connector_account(tenant_id, "google_business")
     meta_creds = _load_connector_credentials(meta_account)
+    google_creds = _load_connector_credentials(google_account)
 
     fb_ready = bool(meta_account and meta_account.is_active and meta_creds.get("fb_page_id"))
     ig_ready = bool(meta_account and meta_account.is_active and meta_creds.get("ig_user_id"))
-    google_ready = bool(google_account and google_account.is_active)
+    google_ready = _google_business_is_ready(google_account)
+    google_authorized = bool(google_account and google_account.is_active)
+    google_location_title = str(google_creds.get("location_title", "")).strip()
 
     channels = {
         "facebook": {
@@ -96,14 +109,24 @@ def _build_phase0_readiness(repo: KachuRepository, tenant_id: str) -> dict[str, 
         },
         "google_business": {
             "connected": google_ready,
-            "status": "ready" if google_ready else "pending_connection",
-            "label": getattr(google_account, "account_label", "") or None,
-            "note": "Google 商家渠道已完成授權" if google_ready else "尚未完成 Google 商家連結",
+            "status": "ready" if google_ready else ("pending_selection" if google_authorized else "pending_connection"),
+            "label": google_location_title or getattr(google_account, "account_label", "") or None,
+            "note": (
+                f"已完成授權並綁定商家位置：{google_location_title}"
+                if google_ready and google_location_title
+                else "已完成授權並綁定商家位置"
+                if google_ready
+                else "已完成 Google 授權，但尚未選定商家位置"
+                if google_authorized
+                else "尚未完成 Google 商家連結"
+            ),
         },
     }
 
     ready_channels = [name for name, item in channels.items() if item["connected"]]
-    if fb_ready and not ig_ready:
+    if google_authorized and not google_ready:
+        next_step = "Google 授權已完成，但還要先選定要綁定的商家位置，之後 Kachu 才能真的對那間店發文與處理評論。"
+    elif fb_ready and not ig_ready:
         next_step = "你現在可以先從 Facebook 開始；如果之後要連動 Instagram，再補上 IG 商業帳號連結即可。"
     elif ready_channels:
         channel_names = {
@@ -313,6 +336,13 @@ def _build_meta_connected_line_texts(repo: KachuRepository, tenant_id: str, *, p
     return messages
 
 
+def _build_google_business_account_label(*, location_title: str = "") -> str:
+    title = location_title.strip()
+    if not title:
+        return "Google Business Profile"
+    return f"Google Business Profile ({title})"
+
+
 def _render_meta_page_selection_page(*, selection_token: str, pages: list[dict[str, str]]) -> HTMLResponse:
     page_cards = "".join(
         (
@@ -410,6 +440,131 @@ def _render_meta_page_selection_page(*, selection_token: str, pages: list[dict[s
     return HTMLResponse(content=html)
 
 
+def _normalize_google_location_choices(accounts: list[dict[str, Any]], client: Any) -> list[dict[str, str]]:
+    normalized_locations: list[dict[str, str]] = []
+    seen_location_ids: set[str] = set()
+
+    for account in accounts:
+        account_id = str(account.get("name", "")).strip()
+        if not account_id:
+            continue
+        account_name = str(account.get("accountName", "")).strip() or account_id.rsplit("/", 1)[-1]
+        locations = client.list_locations(account_id)
+        for location in locations:
+            location_id = str(location.get("name", "")).strip()
+            if not location_id or location_id in seen_location_ids:
+                continue
+            seen_location_ids.add(location_id)
+            store_code = str(location.get("storeCode", "")).strip()
+            location_title = str(location.get("title", "")).strip() or store_code or location_id.rsplit("/", 1)[-1]
+            normalized_locations.append(
+                {
+                    "account_id": account_id,
+                    "account_name": account_name,
+                    "location_id": location_id,
+                    "location_title": location_title,
+                    "store_code": store_code,
+                }
+            )
+
+    return normalized_locations
+
+
+def _render_google_location_selection_page(*, selection_token: str, locations: list[dict[str, str]]) -> HTMLResponse:
+    location_cards = "".join(
+        (
+            '<a class="page-card" href="/auth/google/select-location?'
+            + urlencode({"selection_token": selection_token, "location_id": location["location_id"]})
+            + '">'
+            + f'<div class="page-name">{escape(location["location_title"])}</div>'
+            + f'<div class="page-meta">商家帳號：{escape(location["account_name"])}</div>'
+            + f'<div class="page-meta">Location ID: {escape(location["location_id"])}</div>'
+            + (
+                f'<div class="page-status ready">Store Code: {escape(location["store_code"])}</div>'
+                if location.get("store_code")
+                else '<div class="page-status ready">已可綁定到這個商家位置</div>'
+            )
+            + "</a>"
+        )
+        for location in locations
+    )
+    html = f"""<!DOCTYPE html>
+<html lang=\"zh-Hant\">
+    <head>
+        <meta charset=\"UTF-8\" />
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+        <title>選擇要綁定的 Google 商家</title>
+        <style>
+            :root {{
+                color-scheme: light;
+                --bg: #f7f2e8;
+                --card: #fffdf8;
+                --ink: #2d241b;
+                --muted: #74685a;
+                --accent: #1f7a5a;
+                --border: #e6dac9;
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{
+                margin: 0;
+                min-height: 100vh;
+                display: grid;
+                place-items: center;
+                padding: 24px;
+                background: radial-gradient(circle at top, #fff7ea 0%, var(--bg) 60%, #efe4d3 100%);
+                color: var(--ink);
+                font-family: \"Noto Sans TC\", \"PingFang TC\", sans-serif;
+            }}
+            .card {{
+                width: min(100%, 720px);
+                padding: 32px 28px;
+                border: 1px solid var(--border);
+                border-radius: 24px;
+                background: var(--card);
+                box-shadow: 0 20px 60px rgba(73, 54, 34, 0.10);
+            }}
+            .eyebrow {{
+                display: inline-block;
+                margin-bottom: 12px;
+                padding: 6px 10px;
+                border-radius: 999px;
+                background: #eaf5ef;
+                color: var(--accent);
+                font-size: 13px;
+                font-weight: 700;
+            }}
+            h1 {{ margin: 0 0 12px; font-size: 28px; line-height: 1.25; }}
+            p {{ margin: 0 0 12px; color: var(--muted); font-size: 16px; line-height: 1.7; }}
+            .page-list {{ display: grid; gap: 12px; margin-top: 20px; }}
+            .page-card {{
+                display: block;
+                padding: 16px 18px;
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                background: #fff;
+                color: inherit;
+                text-decoration: none;
+            }}
+            .page-card:hover {{ border-color: var(--accent); box-shadow: 0 10px 24px rgba(31, 122, 90, 0.10); }}
+            .page-name {{ font-size: 18px; font-weight: 700; margin-bottom: 6px; }}
+            .page-meta {{ color: var(--muted); font-size: 14px; margin-bottom: 8px; }}
+            .page-status {{ font-size: 14px; font-weight: 700; color: var(--accent); }}
+        </style>
+    </head>
+    <body>
+        <main class=\"card\">
+            <div class=\"eyebrow\">Kachu Google 商家授權</div>
+            <h1>選擇要綁定的 Google 商家</h1>
+            <p>你這個 Google 帳號底下有多個商家位置。請選擇這次要交給 Kachu 使用的那一間。</p>
+            <p>選定之後，Kachu 才會把發文與評論操作綁到正確的商家資料。</p>
+            <div class=\"page-list\">{location_cards}</div>
+        </main>
+    </body>
+</html>
+"""
+    return HTMLResponse(content=html)
+
+
 def _render_oauth_success_page(*, title: str, paragraphs: list[str]) -> HTMLResponse:
         paragraph_html = "".join(f"<p>{escape(paragraph)}</p>" for paragraph in paragraphs)
         html = f"""<!DOCTYPE html>
@@ -475,21 +630,43 @@ def _render_oauth_success_page(*, title: str, paragraphs: list[str]) -> HTMLResp
         return HTMLResponse(content=html)
 
 
-async def _push_line_texts(settings: Settings, tenant_id: str, texts: list[str]) -> None:
-        if not tenant_id or not settings.LINE_CHANNEL_ACCESS_TOKEN or not texts:
-                return
+async def _push_line_texts(settings: Settings, repo: KachuRepository, tenant_id: str, texts: list[str]) -> None:
+    if not tenant_id or not settings.LINE_CHANNEL_ACCESS_TOKEN or not texts:
+        return
 
+    recipient_line_ids = resolve_tenant_line_recipients(
+        repo=repo,
+        settings=settings,
+        tenant_id=tenant_id,
+    )
+    if not recipient_line_ids:
+        logger.info("Skipping OAuth completion LINE push for tenant=%s because no recipients were resolved", tenant_id)
+        return
+
+    for recipient_line_id in recipient_line_ids:
         try:
-                await push_line_messages(
-                        to=tenant_id,
-                        messages=[text_message(text) for text in texts],
-                        access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
-                )
+            await push_line_messages(
+                to=recipient_line_id,
+                messages=[text_message(text) for text in texts],
+                access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+            )
         except httpx.HTTPError as exc:
-                logger.warning("Failed to push OAuth completion message to LINE for tenant=%s: %s", tenant_id, exc)
+            logger.warning(
+                "Failed to push OAuth completion message to LINE for tenant=%s recipient=%s: %s",
+                tenant_id,
+                recipient_line_id,
+                exc,
+            )
 
 
-def _build_google_connected_line_texts(settings: Settings, repo: KachuRepository, tenant_id: str, platforms: list[str]) -> list[str]:
+def _build_google_connected_line_texts(
+    settings: Settings,
+    repo: KachuRepository,
+    tenant_id: str,
+    platforms: list[str],
+    *,
+    location_title: str = "",
+) -> list[str]:
     if "google_business" in platforms and "ga4" in platforms:
         summary = "Google 授權已完成。"
     elif "google_business" in platforms:
@@ -499,7 +676,10 @@ def _build_google_connected_line_texts(settings: Settings, repo: KachuRepository
 
     messages = [summary]
     if "google_business" in platforms:
-        messages[0] += "\n\nKachu 已經收到你的 Google 授權。Google 商家功能仍在開發端審批流程中，正式開放後才會提供給使用者。"
+        if location_title.strip():
+            messages[0] += f"\n\nKachu 已經收到你的 Google 授權，目前綁定的商家是：{location_title.strip()}。Google 商家功能仍在開發端審批流程中，正式開放後才會提供給使用者。"
+        else:
+            messages[0] += "\n\nKachu 已經收到你的 Google 授權。Google 商家功能仍在開發端審批流程中，正式開放後才會提供給使用者。"
         messages.append(
             "在正式開放前，這次授權會保留作為內部驗證資料。若之後要進一步驗證 Facebook / Instagram，會再由內部測試流程另行安排。"
         )
@@ -516,6 +696,7 @@ def _build_google_connector_credentials(
     *,
     account_id: str = "",
     location_id: str = "",
+    location_title: str = "",
 ) -> str:
     return json.dumps(
         {
@@ -527,6 +708,7 @@ def _build_google_connector_credentials(
             "token_type": token_data.get("token_type", "Bearer"),
             "account_id": account_id,
             "location_id": location_id,
+            "location_title": location_title,
         },
         ensure_ascii=False,
     )
@@ -540,6 +722,7 @@ def _save_google_business_connector(
     account_label: str,
     account_id: str = "",
     location_id: str = "",
+    location_title: str = "",
 ) -> None:
     repo.save_connector_account(
         tenant_id=tenant_id,
@@ -548,6 +731,7 @@ def _save_google_business_connector(
             token_data,
             account_id=account_id,
             location_id=location_id,
+            location_title=location_title,
         ),
         account_label=account_label,
     )
@@ -588,6 +772,7 @@ def _backfill_google_business_connector(
             account_label=account_label,
             account_id=account_id,
             location_id=location_id,
+            location_title=str(locations[0].get("title", "")).strip(),
         )
         logger.info(
             "GBP discovery backfill completed for tenant=%s account_id=%s location_id=%s",
@@ -824,23 +1009,7 @@ async def google_callback(
 
     repo: KachuRepository = _repo(request)
     saved_platforms = []
-
-    if "gbp" in platforms:
-        account_label = "Google Business Profile"
-        _save_google_business_connector(
-            repo,
-            tenant_id=tenant_id,
-            token_data=token_data,
-            account_label=account_label,
-        )
-        background_tasks.add_task(
-            _backfill_google_business_connector,
-            repo,
-            tenant_id=tenant_id,
-            token_data=token_data,
-            account_label=account_label,
-        )
-        saved_platforms.append("google_business")
+    google_location_title = ""
 
     credentials_json = json.dumps(
         {
@@ -862,13 +1031,85 @@ async def google_callback(
         )
         saved_platforms.append("ga4")
 
+    if "gbp" in platforms:
+        account_label = "Google Business Profile"
+        google_locations: list[dict[str, str]] = []
+
+        if access_token:
+            try:
+                from ..google import GoogleBusinessClient
+
+                discovery_client = GoogleBusinessClient.from_oauth_token(access_token)
+                google_locations = _normalize_google_location_choices(
+                    discovery_client.list_accounts(),
+                    discovery_client,
+                )
+            except Exception as exc:
+                logger.warning("GBP account/location discovery failed during callback for tenant=%s: %s", tenant_id, exc)
+
+        if len(google_locations) > 1:
+            selection_token = secrets.token_urlsafe(32)
+            try:
+                await _store_pending_state(
+                    settings,
+                    selection_token,
+                    {
+                        "tenant_id": tenant_id,
+                        "platforms": platforms,
+                        "google_token_data": token_data,
+                        "google_locations": google_locations,
+                    },
+                )
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            logger.info("GBP selection required for tenant=%s locations=%s", tenant_id, len(google_locations))
+            return _render_google_location_selection_page(
+                selection_token=selection_token,
+                locations=google_locations,
+            )
+
+        if len(google_locations) == 1:
+            selected_location = google_locations[0]
+            google_location_title = selected_location.get("location_title", "")
+            _save_google_business_connector(
+                repo,
+                tenant_id=tenant_id,
+                token_data=token_data,
+                account_label=_build_google_business_account_label(location_title=google_location_title),
+                account_id=selected_location.get("account_id", ""),
+                location_id=selected_location.get("location_id", ""),
+                location_title=google_location_title,
+            )
+        else:
+            _save_google_business_connector(
+                repo,
+                tenant_id=tenant_id,
+                token_data=token_data,
+                account_label=account_label,
+            )
+            background_tasks.add_task(
+                _backfill_google_business_connector,
+                repo,
+                tenant_id=tenant_id,
+                token_data=token_data,
+                account_label=account_label,
+            )
+        saved_platforms.append("google_business")
+
     logger.info("OAuth tokens saved for tenant=%s platforms=%s", tenant_id, saved_platforms)
 
     background_tasks.add_task(
         _push_line_texts,
         settings,
+        repo,
         tenant_id,
-        _build_google_connected_line_texts(settings, repo, tenant_id, saved_platforms),
+        _build_google_connected_line_texts(
+            settings,
+            repo,
+            tenant_id,
+            saved_platforms,
+            location_title=google_location_title,
+        ),
     )
 
     title = "Google 授權已完成"
@@ -882,11 +1123,84 @@ async def google_callback(
     ]
     if "google_business" in saved_platforms:
         paragraphs.append("這次授權屬於內部驗證流程，用來確認 Google 串接鏈路正常。")
+        if google_location_title:
+            paragraphs.append(f"這次綁定的 Google 商家是：{google_location_title}。")
         paragraphs.append("Google 商家功能仍待開發端審批完成後，才會正式開放給使用者。")
     elif "ga4" in saved_platforms:
         paragraphs.append("這次授權屬於內部驗證流程。GA4 功能正式開放後，才會提供給使用者。")
 
     return _render_oauth_success_page(title=title, paragraphs=paragraphs)
+
+
+@router.get("/google/select-location")
+async def google_select_location(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    selection_token: str = Query(...),
+    location_id: str = Query(...),
+    settings: Settings = Depends(_settings),
+) -> HTMLResponse:
+    try:
+        selection_data = await _pop_pending_state(settings, selection_token)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if selection_data is None:
+        raise HTTPException(status_code=400, detail="Google 商家選擇已過期或無效")
+
+    tenant_id = str(selection_data.get("tenant_id", "")).strip()
+    platforms = [str(item).strip() for item in selection_data.get("platforms", []) if str(item).strip()]
+    token_data = selection_data.get("google_token_data") or {}
+    locations = selection_data.get("google_locations") or []
+    selected_location = next(
+        (item for item in locations if str(item.get("location_id", "")).strip() == location_id.strip()),
+        None,
+    )
+    if not tenant_id or not token_data or not selected_location:
+        raise HTTPException(status_code=400, detail="Selected Google Business location is invalid")
+
+    repo: KachuRepository = _repo(request)
+    google_location_title = str(selected_location.get("location_title", "")).strip()
+    _save_google_business_connector(
+        repo,
+        tenant_id=tenant_id,
+        token_data=token_data,
+        account_label=_build_google_business_account_label(location_title=google_location_title),
+        account_id=str(selected_location.get("account_id", "")).strip(),
+        location_id=str(selected_location.get("location_id", "")).strip(),
+        location_title=google_location_title,
+    )
+    logger.info(
+        "GBP location selected for tenant=%s account_id=%s location_id=%s",
+        tenant_id,
+        selected_location.get("account_id", ""),
+        selected_location.get("location_id", ""),
+    )
+
+    saved_platforms = ["google_business"]
+    if "ga4" in platforms and repo.get_connector_account(tenant_id, "ga4") is not None:
+        saved_platforms.append("ga4")
+
+    background_tasks.add_task(
+        _push_line_texts,
+        settings,
+        repo,
+        tenant_id,
+        _build_google_connected_line_texts(
+            settings,
+            repo,
+            tenant_id,
+            saved_platforms,
+            location_title=google_location_title,
+        ),
+    )
+
+    paragraphs = [
+        "Kachu 已經收到授權，不需要登入任何 Kachu 後台。",
+        f"這次綁定的 Google 商家是：{google_location_title or 'Google 商家位置'}。",
+        "這次授權屬於內部驗證流程，用來確認 Google 串接鏈路正常。",
+        "Google 商家功能仍待開發端審批完成後，才會正式開放給使用者。",
+    ]
+    return _render_oauth_success_page(title="Google 商家授權已完成", paragraphs=paragraphs)
 
 
 @router.get("/status/{tenant_id}")
@@ -1054,6 +1368,7 @@ async def meta_callback(
         background_tasks.add_task(
             _push_line_texts,
             settings,
+            repo,
             tenant_id,
             _build_meta_connected_line_texts(
                 repo,
@@ -1138,6 +1453,7 @@ async def meta_select_page(
     background_tasks.add_task(
         _push_line_texts,
         settings,
+        repo,
         tenant_id,
         _build_meta_connected_line_texts(
             repo,

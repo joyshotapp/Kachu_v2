@@ -38,7 +38,7 @@ from ..line.flex_builder import (
     build_post_performance_flex,
     build_review_reply_flex,
 )
-from ..line.push import push_line_messages, text_message
+from ..line.push import push_line_messages, resolve_tenant_line_recipients, text_message
 from ..llm import analyze_image_bytes, analyze_image_url, generate_text
 from ..models import (
     AnalyzePhotoRequest,
@@ -81,12 +81,21 @@ from ..models import (
 )
 from ..memory import MemoryManager
 from ..persistence import KachuRepository
+from ..tenant_runtime import evaluate_tenant_capability, load_connector_credentials, refresh_google_connector_credentials
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 
 _BUSINESS_PROFILE_STATE_CONTEXT = "business_profile_state_override"
+_LAST_OWNER_NOTIFICATION_CONTEXT = "last_owner_notification"
+
+
+def _assert_tenant_runtime_ready(repo: KachuRepository, tenant_id: str, capability: str | None = None) -> None:
+    repo.get_or_create_tenant(tenant_id)
+    decision = evaluate_tenant_capability(repo, tenant_id, capability)
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=decision.reason)
 
 
 def _dedupe_texts(items: list[str], *, limit: int | None = None) -> list[str]:
@@ -123,7 +132,11 @@ def _query_focus(query: str) -> str:
 
 
 def _strip_json_fence(raw: str) -> str:
-    """Remove optional ```json ... ``` code fence from LLM output."""
+    """Remove optional ```json ... ``` code fence from LLM output.
+
+    Also handles cases where LLM wraps JSON with prose before/after by
+    extracting the first {...} or [...] block found in the output.
+    """
     text = raw.strip()
     if text.startswith("```json"):
         text = text[7:]
@@ -131,7 +144,17 @@ def _strip_json_fence(raw: str) -> str:
         text = text[3:]
     if text.endswith("```"):
         text = text[:-3]
-    return text.strip()
+    text = text.strip()
+
+    # If still not a valid JSON start, try to extract the first {...} block
+    if text and text[0] not in ("{", "["):
+        start = text.find("{")
+        if start == -1:
+            start = text.find("[")
+        if start != -1:
+            text = text[start:]
+
+    return text
 
 
 def _degraded_photo_analysis(
@@ -183,15 +206,42 @@ def _get_photo_preview_source(repo: KachuRepository, run_id: str) -> str:
         return ""
 
     record = repo.get_workflow_record_by_run_id(run_id)
-    if record is None or not record.trigger_payload:
-        return ""
+    trigger_payload_raw = getattr(record, "trigger_payload", None)
+    if isinstance(trigger_payload_raw, (str, bytes, bytearray)) and trigger_payload_raw:
+        try:
+            trigger_payload = json.loads(trigger_payload_raw)
+        except json.JSONDecodeError:
+            trigger_payload = {}
 
-    try:
-        trigger_payload = json.loads(record.trigger_payload)
-    except json.JSONDecodeError:
-        return ""
+        photo_url = str(trigger_payload.get("photo_url", "")).strip()
+        if photo_url:
+            return photo_url
 
-    return str(trigger_payload.get("photo_url", "")).strip()
+    pending = repo.get_pending_approval_by_run_id(run_id)
+    if pending is not None:
+        pending_draft_raw = getattr(pending, "draft_content", None)
+        try:
+            draft_content = json.loads(pending_draft_raw or "{}") if isinstance(pending_draft_raw, (str, bytes, bytearray)) else {}
+        except json.JSONDecodeError:
+            draft_content = {}
+
+        photo_url = str(draft_content.get("approval_photo_source", "")).strip()
+        if photo_url:
+            return photo_url
+
+    scheduled_publish = repo.get_latest_scheduled_publish_by_source_run_id(run_id)
+    if scheduled_publish is not None:
+        scheduled_draft_raw = getattr(scheduled_publish, "draft_content", None)
+        try:
+            draft_content = json.loads(scheduled_draft_raw or "{}") if isinstance(scheduled_draft_raw, (str, bytes, bytearray)) else {}
+        except json.JSONDecodeError:
+            draft_content = {}
+
+        photo_url = str(draft_content.get("approval_photo_source", "")).strip()
+        if photo_url:
+            return photo_url
+
+    return ""
 
 
 def _build_approval_photo_preview_url(base_url: str, run_id: str) -> str:
@@ -334,56 +384,31 @@ def _get_gbp_creds(repo: KachuRepository, tenant_id: str, settings) -> "tuple | 
     1. Per-tenant OAuth token stored in connector_account table (SaaS path).
     2. Service account + env var IDs (single-tenant / legacy fallback).
     """
-    import time
     from ..google import GoogleBusinessClient
 
     # ── Path 1: per-tenant OAuth token from DB ────────────────────────────────
     account = repo.get_connector_account(tenant_id, "google_business")
     if account and account.credentials_encrypted:
         try:
-            creds = json.loads(account.credentials_encrypted)
+            _, creds, _ = refresh_google_connector_credentials(
+                repo,
+                settings,
+                tenant_id=tenant_id,
+                platform="google_business",
+                force=False,
+                source="tool_auto_refresh",
+            )
+        except ValueError as exc:
+            logger.warning("GBP token refresh error: %s", exc)
+            creds = load_connector_credentials(account)
+        try:
             access_token = creds.get("access_token", "")
             account_id = creds.get("account_id", "")
             location_id = creds.get("location_id", "")
 
-            # ── Refresh if expired (5-minute buffer) ──────────────────────────
-            expires_at = creds.get("expires_at", 0)
-            refresh_token = creds.get("refresh_token", "")
-            if expires_at and refresh_token and time.time() > expires_at - 300:
-                try:
-                    resp = httpx.post(
-                        "https://oauth2.googleapis.com/token",
-                        data={
-                            "client_id": getattr(settings, "GOOGLE_OAUTH_CLIENT_ID", ""),
-                            "client_secret": getattr(settings, "GOOGLE_OAUTH_CLIENT_SECRET", ""),
-                            "refresh_token": refresh_token,
-                            "grant_type": "refresh_token",
-                        },
-                        timeout=10,
-                    )
-                    if resp.status_code == 200:
-                        new_data = resp.json()
-                        creds["access_token"] = new_data["access_token"]
-                        creds["expires_at"] = int(time.time()) + int(new_data.get("expires_in", 3600))
-                        if new_data.get("refresh_token"):
-                            creds["refresh_token"] = new_data["refresh_token"]
-                        repo.save_connector_account(
-                            tenant_id=tenant_id,
-                            platform="google_business",
-                            credentials_json=json.dumps(creds),
-                        )
-                        access_token = creds["access_token"]
-                    else:
-                        logger.warning(
-                            "GBP token refresh failed (HTTP %s): %s",
-                            resp.status_code, resp.text[:200],
-                        )
-                except Exception as exc:
-                    logger.warning("GBP token refresh error: %s", exc)
-
             if access_token and account_id and location_id:
                 return GoogleBusinessClient.from_oauth_token(access_token), account_id, location_id
-        except (json.JSONDecodeError, KeyError):
+        except KeyError:
             pass
 
     # ── Path 2: service account + env vars (single-tenant fallback) ───────────
@@ -802,9 +827,13 @@ async def generate_drafts(body: GenerateDraftsRequest, request: Request) -> dict
             google_prompt += f"\n【品牌資料摘要】{document_hint}"
     if owner_brief:
         owner_focus = "、".join(owner_brief.get("current_priorities", [])[:2])
+        owner_history = str(owner_brief.get("historical_summary", "") or "").strip()
         if owner_focus:
             ig_prompt += f"\n【老闆近期在意】{owner_focus}"
             google_prompt += f"\n【老闆近期在意】{owner_focus}"
+        if owner_history:
+            ig_prompt += f"\n【較早老闆脈絡】{owner_history}"
+            google_prompt += f"\n【較早老闆脈絡】{owner_history}"
 
     # ── Inject preference few-shot examples ───────────────────────────────────
     memory = _memory(request)
@@ -896,10 +925,64 @@ async def notify_approval(body: NotifyApprovalRequest, request: Request) -> dict
     repo = _repo(request)
     settings = request.app.state.settings
 
+    def _normalize_selected_platforms(raw_value: Any) -> list[str]:
+        if isinstance(raw_value, str):
+            candidates = [part.strip() for part in raw_value.split(",")]
+        elif isinstance(raw_value, (list, tuple, set)):
+            candidates = [str(part).strip() for part in raw_value]
+        else:
+            candidates = []
+
+        normalized: list[str] = []
+        for candidate in candidates:
+            if candidate in {"ig_fb", "google"} and candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
+    def _resolve_notify_selected_platforms(draft_content: dict[str, Any]) -> list[str]:
+        explicit = _normalize_selected_platforms(body.selected_platforms)
+        if explicit:
+            return explicit
+
+        embedded = _normalize_selected_platforms(draft_content.get("selected_platforms"))
+        if embedded:
+            return embedded
+
+        workflow_record = repo.get_workflow_record_by_run_id(body.run_id)
+        if workflow_record:
+            for raw_blob in (workflow_record.input_data, workflow_record.trigger_payload):
+                if not raw_blob:
+                    continue
+                try:
+                    payload = json.loads(raw_blob)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                resolved = _normalize_selected_platforms(payload.get("selected_platforms"))
+                if resolved:
+                    return resolved
+
+        draft_keys = {key for key in draft_content.keys() if key in {"ig_fb", "google"}}
+        if draft_keys == {"ig_fb"}:
+            return ["ig_fb"]
+        if draft_keys == {"google"}:
+            return ["google"]
+        if body.workflow in ("kachu_photo_content", "photo_content"):
+            return ["ig_fb", "google"]
+        return ["google"]
+
     # Store pending approval in DB
     expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
     # For photo_content workflows, include image_url so publish-content can post a photo
     draft_content: dict[str, Any] = dict(body.drafts)
+    selected_platforms = _resolve_notify_selected_platforms(draft_content)
+    if selected_platforms:
+        draft_content["selected_platforms"] = selected_platforms
+    if body.workflow in ("kachu_google_post", "google_post"):
+        if "ig_fb" in selected_platforms and "google" not in selected_platforms:
+            if not draft_content.get("ig_fb") and draft_content.get("post_text"):
+                draft_content["ig_fb"] = draft_content["post_text"]
+        elif "google" in selected_platforms and draft_content.get("post_text") and not draft_content.get("google"):
+            draft_content["google"] = draft_content["post_text"]
     if body.workflow in ("kachu_photo_content", "photo_content") and body.run_id and not draft_content.get("image_url"):
         # The local workflow record may not exist yet when AgentOS first asks for approval.
         # Persist the stable preview URL now so later scheduled publishes still have an image.
@@ -907,6 +990,10 @@ async def notify_approval(body: NotifyApprovalRequest, request: Request) -> dict
             settings.KACHU_BASE_URL,
             body.run_id,
         )
+    if body.workflow in ("kachu_photo_content", "photo_content") and body.run_id and not draft_content.get("approval_photo_source"):
+        photo_source = _get_photo_preview_source(repo, body.run_id)
+        if photo_source:
+            draft_content["approval_photo_source"] = photo_source
     approval_record = repo.create_pending_approval(
         tenant_id=body.tenant_id,
         agentos_run_id=body.run_id,
@@ -924,8 +1011,12 @@ async def notify_approval(body: NotifyApprovalRequest, request: Request) -> dict
     )
 
     # Push LINE Flex Message — check rate limit first
-    boss_user_id = settings.LINE_BOSS_USER_ID
-    if boss_user_id and settings.LINE_CHANNEL_ACCESS_TOKEN:
+    recipient_line_ids = resolve_tenant_line_recipients(
+        repo=repo,
+        settings=settings,
+        tenant_id=body.tenant_id,
+    )
+    if recipient_line_ids and settings.LINE_CHANNEL_ACCESS_TOKEN:
         # Check daily push limit and quiet hours
         tenant = repo.get_or_create_tenant(body.tenant_id)
         if repo.can_push(
@@ -943,27 +1034,30 @@ async def notify_approval(body: NotifyApprovalRequest, request: Request) -> dict
                             settings.KACHU_BASE_URL,
                             body.run_id,
                         )
-                await _push_flex_to_boss(
-                    run_id=body.run_id,
-                    tenant_id=body.tenant_id,
-                    workflow=body.workflow,
-                    drafts=body.drafts,
-                    boss_user_id=boss_user_id,
-                    channel_access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
-                    photo_preview_url=photo_preview_url,
-                )
-                repo.record_push(
-                    tenant_id=body.tenant_id,
-                    recipient_line_id=boss_user_id,
-                    message_type="approval",
-                )
+                delivered_recipients: list[str] = []
+                for recipient_line_id in recipient_line_ids:
+                    await _push_flex_to_boss(
+                        run_id=body.run_id,
+                        tenant_id=body.tenant_id,
+                        workflow=body.workflow,
+                        drafts=draft_content,
+                        boss_user_id=recipient_line_id,
+                        channel_access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+                        photo_preview_url=photo_preview_url,
+                    )
+                    repo.record_push(
+                        tenant_id=body.tenant_id,
+                        recipient_line_id=recipient_line_id,
+                        message_type="approval",
+                    )
+                    delivered_recipients.append(recipient_line_id)
                 repo.save_audit_event(
                     tenant_id=body.tenant_id,
                     agentos_run_id=body.run_id,
                     workflow_type=body.workflow,
                     event_type="push_sent",
                     source="notify_approval",
-                    payload={"message_type": "approval", "recipient_line_id": boss_user_id},
+                    payload={"message_type": "approval", "recipient_line_ids": delivered_recipients},
                 )
             except httpx.HTTPError as exc:
                 logger.error("Failed to push LINE Flex notification: %s", exc)
@@ -1112,6 +1206,11 @@ async def publish_content(body: PublishContentRequest, request: Request) -> dict
     """Publish to connected platforms. Supports Google Business Profile and Meta (IG/FB)."""
     repo = _repo(request)
     settings = _settings(request)
+    _assert_tenant_runtime_ready(repo, body.tenant_id)
+    if len(set(body.selected_platforms or [])) > 1:
+        _assert_tenant_runtime_ready(repo, body.tenant_id, "cross_channel")
+    if "ig_fb" in (body.selected_platforms or []):
+        _assert_tenant_runtime_ready(repo, body.tenant_id, "meta")
     results: dict[str, Any] = {}
     repo.save_audit_event(
         tenant_id=body.tenant_id,
@@ -1233,6 +1332,65 @@ async def publish_content(body: PublishContentRequest, request: Request) -> dict
         source="publish_content",
         payload={"results": results},
     )
+
+    published_platforms: list[str] = []
+    if results.get("google", {}).get("status") == "published":
+        published_platforms.append("Google 商家")
+    ig_fb_result = results.get("ig_fb", {})
+    if isinstance(ig_fb_result, dict):
+        if ig_fb_result.get("facebook", {}).get("status") == "published":
+            published_platforms.append("Facebook")
+        if ig_fb_result.get("instagram", {}).get("status") == "published":
+            published_platforms.append("Instagram")
+
+    if published_platforms and settings.LINE_CHANNEL_ACCESS_TOKEN:
+        confirmation_sent = repo.has_recent_audit_event(
+            tenant_id=body.tenant_id,
+            workflow_type="photo_content",
+            event_type="push_sent",
+            source="publish_content",
+            since=datetime.now(timezone.utc) - timedelta(hours=24),
+            payload_subset={"message_type": "publish_confirmation", "run_id": body.run_id},
+        )
+        if not confirmation_sent:
+            recipient_line_ids = resolve_tenant_line_recipients(
+                repo=repo,
+                settings=settings,
+                tenant_id=body.tenant_id,
+            )
+            if recipient_line_ids:
+                confirmation_text = f"✅ 已發布到{'、'.join(published_platforms)}"
+                try:
+                    for recipient_line_id in recipient_line_ids:
+                        await push_line_messages(
+                            to=recipient_line_id,
+                            messages=[text_message(confirmation_text)],
+                            access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+                        )
+                        repo.record_push(
+                            tenant_id=body.tenant_id,
+                            recipient_line_id=recipient_line_id,
+                            message_type="publish_confirmation",
+                        )
+                    repo.save_audit_event(
+                        tenant_id=body.tenant_id,
+                        agentos_run_id=body.run_id,
+                        workflow_type="photo_content",
+                        event_type="push_sent",
+                        source="publish_content",
+                        payload={
+                            "message_type": "publish_confirmation",
+                            "recipient_line_ids": recipient_line_ids,
+                            "published_platforms": published_platforms,
+                            "run_id": body.run_id,
+                        },
+                    )
+                except httpx.HTTPError as exc:
+                    logger.warning(
+                        "Failed to push publish confirmation for run=%s: %s",
+                        body.run_id,
+                        exc,
+                    )
 
     return {"status": "done", "run_id": body.run_id, "results": results}
 
@@ -1449,6 +1607,7 @@ async def retrieve_answer(body: RetrieveAnswerRequest, request: Request) -> dict
             f"產業脈絡：{industry_context['industry_name']}；回答時請維持 {industry_context['recommended_tone']}。\n"
             f"品牌摘要：{brand_brief.get('summary', '未建立')}\n"
             f"老闆近期在意：{'、'.join(owner_brief.get('current_priorities', [])[:2]) or '維持一致服務品質'}\n"
+            f"較早老闆脈絡：{owner_brief.get('historical_summary', '') or '暫無'}\n"
             f"知識庫：\n{knowledge_text}\n\n顧客問題：{body.message}\n\n"
             "回覆 JSON：answer, confidence(0.0-1.0), should_escalate(bool), escalate_reason(若升級時填寫)"
         )
@@ -1516,6 +1675,7 @@ async def generate_response(body: GenerateResponseRequest, request: Request) -> 
 async def send_or_escalate(body: SendOrEscalateRequest, request: Request) -> dict[str, Any]:
     """Phase 1: Send LINE reply to customer or escalate to boss."""
     settings = _settings(request)
+    repo = _repo(request)
     answer = body.answer or {}
     should_escalate: bool = answer.get("should_escalate", False)
     reply_text: str = answer.get("response_text") or answer.get("answer", "")
@@ -1537,28 +1697,52 @@ async def send_or_escalate(body: SendOrEscalateRequest, request: Request) -> dic
             except httpx.HTTPError as exc:
                 logger.warning("Could not send customer auto-ack on escalation: %s", exc)
 
-        if settings.LINE_BOSS_USER_ID:
+        recipient_line_ids = resolve_tenant_line_recipients(
+            repo=repo,
+            settings=settings,
+            tenant_id=body.tenant_id,
+        )
+        if recipient_line_ids:
             escalate_reason = answer.get("escalate_reason", "顧客問題需要人工回覆")
             boss_text = f"⚠️ 顧客詢問需要你親自回覆：\n\n顧客 LINE ID：{body.customer_line_id}\n原因：{escalate_reason}"
-            repo = _repo(request)
             if not repo.can_push(body.tenant_id):
                 logger.warning(
                     "send_or_escalate: daily push limit reached for boss; skipping escalation"
                 )
                 return {"action": "escalation_rate_limited", "customer_line_id": body.customer_line_id}
             try:
-                await push_line_messages(to=settings.LINE_BOSS_USER_ID, messages=[text_message(boss_text)], access_token=settings.LINE_CHANNEL_ACCESS_TOKEN)
-                repo.record_push(
-                    tenant_id=body.tenant_id,
-                    recipient_line_id=settings.LINE_BOSS_USER_ID,
-                    message_type="escalation",
-                )
+                for recipient_line_id in recipient_line_ids:
+                    await push_line_messages(to=recipient_line_id, messages=[text_message(boss_text)], access_token=settings.LINE_CHANNEL_ACCESS_TOKEN)
+                    repo.record_push(
+                        tenant_id=body.tenant_id,
+                        recipient_line_id=recipient_line_id,
+                        message_type="escalation",
+                    )
                 repo.save_audit_event(
                     tenant_id=body.tenant_id,
                     workflow_type="line_faq",
                     event_type="push_sent",
                     source="send_or_escalate",
-                    payload={"message_type": "escalation", "recipient_line_id": settings.LINE_BOSS_USER_ID},
+                    payload={
+                        "message_type": "escalation",
+                        "recipient_line_ids": recipient_line_ids,
+                        "customer_line_id": body.customer_line_id,
+                        "reason": escalate_reason,
+                    },
+                )
+                repo.save_shared_context(
+                    tenant_id=body.tenant_id,
+                    context_type=_LAST_OWNER_NOTIFICATION_CONTEXT,
+                    content={
+                        "kind": "line_faq_escalation",
+                        "message_type": "escalation",
+                        "customer_line_id": body.customer_line_id,
+                        "reason": escalate_reason,
+                        "preview_text": boss_text,
+                        "recipient_line_ids": recipient_line_ids,
+                        "pushed_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    ttl_hours=24,
                 )
             except httpx.HTTPError as exc:
                 logger.error("Failed to escalate to boss: %s", exc)
@@ -1786,7 +1970,7 @@ async def apply_knowledge_update(
     diff = body.diff
     parsed = diff.get("parsed_update", {})
     conflicting = diff.get("conflicting_entries", [])
-    new_content = parsed.get("new_value") or parsed.get("boss_message", "")
+    new_content = str(parsed.get("new_value") or parsed.get("boss_message") or "")
     category = parsed.get("category", "product")
 
     superseded_ids = []
@@ -1885,9 +2069,15 @@ async def generate_google_post(
     body: GenerateGooglePostRequest, request: Request
 ) -> dict[str, Any]:
     """Generate a Google Business post text for a given topic."""
+    repo = _repo(request)
+    _assert_tenant_runtime_ready(repo, body.tenant_id)
     settings = _settings(request)
     selected_platforms = body.selected_platforms or ["google"]
     is_meta_only = "ig_fb" in selected_platforms and "google" not in selected_platforms
+    if len(set(selected_platforms)) > 1:
+        _assert_tenant_runtime_ready(repo, body.tenant_id, "cross_channel")
+    if "ig_fb" in selected_platforms:
+        _assert_tenant_runtime_ready(repo, body.tenant_id, "meta")
     context = body.context or {}
     brand_name = context.get("brand_name", "")
     brand_tone = context.get("brand_tone", "親切真誠")
@@ -1899,7 +2089,6 @@ async def generate_google_post(
     consultant_brief = context.get("consultant_brief", {})
 
     if not brand_name:
-        repo = _repo(request)
         tenant = repo.get_or_create_tenant(body.tenant_id)
         brand_name = tenant.name
         brand_address = tenant.address
@@ -1945,6 +2134,8 @@ async def generate_google_post(
         prompt += f"\n品牌摘要：{brand_brief.get('summary', '')}"
     if owner_brief:
         prompt += f"\n老闆近期在意：{'、'.join(owner_brief.get('current_priorities', [])[:2])}"
+        if owner_brief.get("historical_summary"):
+            prompt += f"\n較早老闆脈絡：{owner_brief.get('historical_summary', '')}"
 
     # Inject preference examples
     memory = _memory(request)
@@ -2007,14 +2198,67 @@ async def publish_google_post(
     """Publish a pre-approved post to Google Business Profile."""
     repo = _repo(request)
     settings = _settings(request)
-    selected_platforms = body.selected_platforms or ["google"]
+    _assert_tenant_runtime_ready(repo, body.tenant_id)
+
+    def _normalize_selected_platforms(raw_value: Any) -> list[str]:
+        if isinstance(raw_value, str):
+            candidates = [part.strip() for part in raw_value.split(",")]
+        elif isinstance(raw_value, (list, tuple, set)):
+            candidates = [str(part).strip() for part in raw_value]
+        else:
+            candidates = []
+
+        normalized: list[str] = []
+        for candidate in candidates:
+            if candidate in {"ig_fb", "google"} and candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
     drafts = dict(body.drafts or {})
+    selected_platforms: list[str] = []
+    if body.run_id:
+        pending = repo.get_pending_approval_by_run_id(body.run_id)
+        if pending and pending.draft_content:
+            try:
+                pending_drafts = json.loads(pending.draft_content)
+            except (TypeError, json.JSONDecodeError):
+                pending_drafts = {}
+            if isinstance(pending_drafts, dict):
+                for key, value in pending_drafts.items():
+                    drafts.setdefault(key, value)
+                if not selected_platforms:
+                    selected_platforms = _normalize_selected_platforms(pending_drafts.get("selected_platforms"))
+
+        if not selected_platforms:
+            workflow_record = repo.get_workflow_record_by_run_id(body.run_id)
+            if workflow_record:
+                for raw_blob in (workflow_record.input_data, workflow_record.trigger_payload):
+                    if not raw_blob:
+                        continue
+                    try:
+                        payload = json.loads(raw_blob)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    selected_platforms = _normalize_selected_platforms(payload.get("selected_platforms"))
+                    if selected_platforms:
+                        break
+
+    body_selected_platforms = _normalize_selected_platforms(body.selected_platforms)
+    if body_selected_platforms and (body_selected_platforms != ["google"] or not body.run_id):
+        selected_platforms = body_selected_platforms
+
+    if not selected_platforms:
+        selected_platforms = ["google"]
+
+    if len(set(selected_platforms)) > 1:
+        _assert_tenant_runtime_ready(repo, body.tenant_id, "cross_channel")
     post_text = body.post_text or drafts.get("post_text") or drafts.get("google") or drafts.get("ig_fb") or ""
 
     if not post_text:
         return {"status": "skipped", "reason": "empty post text"}
 
     if "ig_fb" in selected_platforms and "google" not in selected_platforms:
+        _assert_tenant_runtime_ready(repo, body.tenant_id, "meta")
         meta_drafts = {"ig_fb": drafts.get("ig_fb") or post_text}
         for key in ("image_url", "image_urls"):
             if key in drafts:
@@ -2073,6 +2317,7 @@ async def fetch_ga4_data(
     """Fetch GA4 metrics for the specified period."""
     repo = _repo(request)
     settings = _settings(request)
+    _assert_tenant_runtime_ready(repo, body.tenant_id, "ga4")
 
     connector = repo.get_connector_account(body.tenant_id, "ga4")
     property_id = settings.GA4_PROPERTY_ID
@@ -2094,9 +2339,20 @@ async def fetch_ga4_data(
     access_token = ""
     if connector:
         try:
-            creds = json.loads(connector.credentials_encrypted)
+            _, creds, _ = refresh_google_connector_credentials(
+                repo,
+                settings,
+                tenant_id=body.tenant_id,
+                platform="ga4",
+                force=False,
+                source="tool_auto_refresh",
+            )
+        except ValueError as exc:
+            logger.warning("GA4 token refresh error: %s", exc)
+            creds = load_connector_credentials(connector)
+        try:
             access_token = creds.get("access_token", "")
-        except (json.JSONDecodeError, TypeError):
+        except TypeError:
             pass
 
     if not access_token:
@@ -2465,11 +2721,20 @@ async def send_ga4_report(
     settings = _settings(request)
     insights = body.insights.get("insights", {})
 
-    if not settings.LINE_BOSS_USER_ID or not settings.LINE_CHANNEL_ACCESS_TOKEN:
+    if not settings.LINE_CHANNEL_ACCESS_TOKEN:
         logger.warning("LINE not configured; skipping GA4 report push")
         return {"status": "skipped", "insights": insights}
 
     repo = _repo(request)
+    _assert_tenant_runtime_ready(repo, body.tenant_id, "ga4")
+    recipient_line_ids = resolve_tenant_line_recipients(
+        repo=repo,
+        settings=settings,
+        tenant_id=body.tenant_id,
+    )
+    if not recipient_line_ids:
+        logger.warning("No LINE recipients configured; skipping GA4 report push for tenant=%s", body.tenant_id)
+        return {"status": "skipped", "insights": insights}
     recommendation_ctx = repo.get_shared_context(body.tenant_id, "ga4_recommendations") or {}
     if recommendation_ctx.get("recommendations"):
         merged_actions = list(insights.get("actions", []))
@@ -2492,24 +2757,25 @@ async def send_ga4_report(
     )
 
     try:
-        await push_line_messages(
-            to=settings.LINE_BOSS_USER_ID,
-            messages=[{"type": "flex", "altText": "📊 本週 GA4 週報已出爐", "contents": flex_bubble}],
-            access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
-        )
+        for recipient_line_id in recipient_line_ids:
+            await push_line_messages(
+                to=recipient_line_id,
+                messages=[{"type": "flex", "altText": "📊 本週 GA4 週報已出爐", "contents": flex_bubble}],
+                access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+            )
 
-        repo.record_push(
-            tenant_id=body.tenant_id,
-            recipient_line_id=settings.LINE_BOSS_USER_ID,
-            message_type="report",
-        )
+            repo.record_push(
+                tenant_id=body.tenant_id,
+                recipient_line_id=recipient_line_id,
+                message_type="report",
+            )
         repo.save_audit_event(
             tenant_id=body.tenant_id,
             agentos_run_id=body.run_id,
             workflow_type="ga4_report",
             event_type="push_sent",
             source="send_ga4_report",
-            payload={"message_type": "report", "recipient_line_id": settings.LINE_BOSS_USER_ID},
+            payload={"message_type": "report", "recipient_line_ids": recipient_line_ids},
         )
 
         return {"status": "sent", "run_id": body.run_id}
@@ -2890,8 +3156,16 @@ async def send_meta_insights_report(body: SendMetaInsightsReportRequest, request
     repo = _repo(request)
     settings = _settings(request)
 
-    if not settings.LINE_BOSS_USER_ID or not settings.LINE_CHANNEL_ACCESS_TOKEN:
-        raise HTTPException(status_code=400, detail="LINE boss user ID or token not configured")
+    if not settings.LINE_CHANNEL_ACCESS_TOKEN:
+        raise HTTPException(status_code=400, detail="LINE channel token not configured")
+
+    recipient_line_ids = resolve_tenant_line_recipients(
+        repo=repo,
+        settings=settings,
+        tenant_id=body.tenant_id,
+    )
+    if not recipient_line_ids:
+        return {"status": "skipped", "reason": "no_recipients"}
 
     try:
         details = _json.loads(body.details_json)
@@ -2903,23 +3177,24 @@ async def send_meta_insights_report(body: SendMetaInsightsReportRequest, request
         summary=body.summary,
         details=details,
     )
-    await push_line_messages(
-        to=settings.LINE_BOSS_USER_ID,
-        messages=[{"type": "flex", "altText": "📊 Facebook 成效報告", "contents": flex_msg}],
-        access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
-    )
-    repo.record_push(
-        tenant_id=body.tenant_id,
-        recipient_line_id=settings.LINE_BOSS_USER_ID,
-        message_type="meta_insights_report",
-    )
+    for recipient_line_id in recipient_line_ids:
+        await push_line_messages(
+            to=recipient_line_id,
+            messages=[{"type": "flex", "altText": "📊 Facebook 成效報告", "contents": flex_msg}],
+            access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+        )
+        repo.record_push(
+            tenant_id=body.tenant_id,
+            recipient_line_id=recipient_line_id,
+            message_type="meta_insights_report",
+        )
     repo.save_audit_event(
         tenant_id=body.tenant_id,
         agentos_run_id=body.run_id,
         workflow_type="meta_insights",
         event_type="insights_report_sent",
         source="send_meta_insights_report",
-        payload={"summary_length": len(body.summary)},
+        payload={"summary_length": len(body.summary), "recipient_line_ids": recipient_line_ids},
     )
     return {"status": "sent"}
 
@@ -2934,72 +3209,81 @@ async def send_post_performance_report(request: Request) -> dict[str, Any]:
     repo = _repo(request)
     settings = _settings(request)
 
-    if not settings.LINE_BOSS_USER_ID or not settings.LINE_CHANNEL_ACCESS_TOKEN:
+    if not settings.LINE_CHANNEL_ACCESS_TOKEN:
         raise HTTPException(status_code=400, detail="LINE config missing")
 
-    tenant_id = settings.LINE_BOSS_USER_ID
-    eligible_runs = repo.list_completed_photo_runs_for_perf_check(tenant_id)
     sent = 0
-    for wf_run in eligible_runs:
-        # Deduplicate: skip if we've already sent a perf report for this run
-        from datetime import timedelta
-        already_sent = repo.has_recent_audit_event(
+    for tenant_id in repo.list_active_tenant_ids():
+        recipient_line_ids = resolve_tenant_line_recipients(
+            repo=repo,
+            settings=settings,
             tenant_id=tenant_id,
-            workflow_type="photo_content",
-            event_type="perf_report_sent",
-            source="post_performance_scheduler",
-            since=datetime.now(timezone.utc) - timedelta(days=3),
-            payload_subset={"agentos_run_id": wf_run.agentos_run_id},
         )
-        if already_sent:
+        if not recipient_line_ids:
             continue
 
-        try:
-            output_data = json.loads(wf_run.output_data or "{}")
-            fb_post_id = output_data.get("fb_post_id", "")
-            if not fb_post_id:
-                continue
-
-            meta, _creds = _get_meta_client(repo, tenant_id)
-            post_metrics = ["post_impressions", "post_reach", "post_engaged_users", "post_clicks"]
-            raw_insights = await meta.get_fb_post_insights(post_id=fb_post_id, metric_names=post_metrics)
-
-            label_map = {
-                "post_impressions": "貼文曝光", "post_reach": "貼文觸及",
-                "post_engaged_users": "互動用戶", "post_clicks": "貼文點擊",
-            }
-            details = [{"label": label_map.get(k, k), "value": v} for k, v in raw_insights.items() if isinstance(v, (int, float, str))]
-            summary = (
-                f"你 24 小時前發的貼文表現：觸及 {raw_insights.get('post_reach', '-')} 人，"
-                f"曝光 {raw_insights.get('post_impressions', '-')} 次，"
-                f"互動 {raw_insights.get('post_engaged_users', '-')} 人。"
-            )
-
-            flex_msg = build_post_performance_flex(
-                tenant_id=tenant_id,
-                fb_post_id=fb_post_id,
-                summary=summary,
-                details=details,
-            )
-            await push_line_messages(
-                to=settings.LINE_BOSS_USER_ID,
-                messages=[{"type": "flex", "altText": "📈 貼文成效回報（發文後 24h）", "contents": flex_msg}],
-                access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
-            )
-            repo.record_push(
-                tenant_id=tenant_id,
-                recipient_line_id=settings.LINE_BOSS_USER_ID,
-                message_type="post_performance_report",
-            )
-            repo.save_audit_event(
+        eligible_runs = repo.list_completed_photo_runs_for_perf_check(tenant_id)
+        for wf_run in eligible_runs:
+            # Deduplicate: skip if we've already sent a perf report for this run
+            from datetime import timedelta
+            already_sent = repo.has_recent_audit_event(
                 tenant_id=tenant_id,
                 workflow_type="photo_content",
                 event_type="perf_report_sent",
                 source="post_performance_scheduler",
-                payload={"agentos_run_id": wf_run.agentos_run_id, "fb_post_id": fb_post_id},
+                since=datetime.now(timezone.utc) - timedelta(days=3),
+                payload_subset={"agentos_run_id": wf_run.agentos_run_id},
             )
-            sent += 1
-        except (MetaAPIError, httpx.HTTPError, SQLAlchemyError, json.JSONDecodeError) as exc:
-            logger.error("send-post-performance-report failed for run=%s: %s", wf_run.agentos_run_id, exc)
+            if already_sent:
+                continue
+
+            try:
+                output_data = json.loads(wf_run.output_data or "{}")
+                fb_post_id = output_data.get("fb_post_id", "")
+                if not fb_post_id:
+                    continue
+
+                meta, _creds = _get_meta_client(repo, tenant_id)
+                post_metrics = ["post_impressions", "post_reach", "post_engaged_users", "post_clicks"]
+                raw_insights = await meta.get_fb_post_insights(post_id=fb_post_id, metric_names=post_metrics)
+
+                label_map = {
+                    "post_impressions": "貼文曝光", "post_reach": "貼文觸及",
+                    "post_engaged_users": "互動用戶", "post_clicks": "貼文點擊",
+                }
+                details = [{"label": label_map.get(k, k), "value": v} for k, v in raw_insights.items() if isinstance(v, (int, float, str))]
+                summary = (
+                    f"你 24 小時前發的貼文表現：觸及 {raw_insights.get('post_reach', '-')} 人，"
+                    f"曝光 {raw_insights.get('post_impressions', '-')} 次，"
+                    f"互動 {raw_insights.get('post_engaged_users', '-')} 人。"
+                )
+
+                flex_msg = build_post_performance_flex(
+                    tenant_id=tenant_id,
+                    fb_post_id=fb_post_id,
+                    summary=summary,
+                    details=details,
+                )
+                for recipient_line_id in recipient_line_ids:
+                    await push_line_messages(
+                        to=recipient_line_id,
+                        messages=[{"type": "flex", "altText": "📈 貼文成效回報（發文後 24h）", "contents": flex_msg}],
+                        access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+                    )
+                    repo.record_push(
+                        tenant_id=tenant_id,
+                        recipient_line_id=recipient_line_id,
+                        message_type="post_performance_report",
+                    )
+                repo.save_audit_event(
+                    tenant_id=tenant_id,
+                    workflow_type="photo_content",
+                    event_type="perf_report_sent",
+                    source="post_performance_scheduler",
+                    payload={"agentos_run_id": wf_run.agentos_run_id, "fb_post_id": fb_post_id, "recipient_line_ids": recipient_line_ids},
+                )
+                sent += 1
+            except (MetaAPIError, httpx.HTTPError, SQLAlchemyError, json.JSONDecodeError) as exc:
+                logger.error("send-post-performance-report failed for tenant=%s run=%s: %s", tenant_id, wf_run.agentos_run_id, exc)
 
     return {"status": "done", "sent": sent}

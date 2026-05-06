@@ -221,6 +221,7 @@ async def test_retrieve_relevant_knowledge_no_api_key(memory_manager_with_mock_r
     results = await manager.retrieve_relevant_knowledge(tenant_id="t1", query="誠信服務")
     assert len(results) == 2
     assert all(e["_score"] == 0.0 for e in results)
+    mock_repo.mark_knowledge_entries_retrieved.assert_called_once_with(["k1", "k2"])
 
 
 @pytest.mark.asyncio
@@ -250,6 +251,60 @@ async def test_retrieve_relevant_knowledge_with_embeddings(memory_manager_with_m
 
     assert results[0]["id"] == "k1"
     assert results[0]["_score"] == pytest.approx(1.0)
+    mock_repo.mark_knowledge_entries_retrieved.assert_called_once_with(["k1", "k2"])
+
+
+def test_repository_refresh_knowledge_lifecycle_marks_old_entries_stale() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import SQLModel, Session, create_engine
+
+    from kachu.persistence.repository import KachuRepository
+    from kachu.persistence.tables import KnowledgeEntryTable
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    repo = KachuRepository(engine)
+
+    old_entry = repo.save_knowledge_entry(
+        tenant_id="tenant-knowledge",
+        category="product",
+        content="舊的午餐套餐資訊",
+        source_type="manual",
+    )
+    fresh_entry = repo.save_knowledge_entry(
+        tenant_id="tenant-knowledge",
+        category="basic_info",
+        content="店名：好吃小館",
+        source_type="manual",
+    )
+
+    with Session(engine) as session:
+        stale_target = session.get(KnowledgeEntryTable, old_entry.id)
+        protected_entry = session.get(KnowledgeEntryTable, fresh_entry.id)
+        assert stale_target is not None
+        assert protected_entry is not None
+        stale_target.updated_at = datetime.now(timezone.utc) - timedelta(days=90)
+        stale_target.last_reviewed_at = datetime.now(timezone.utc) - timedelta(days=90)
+        protected_entry.updated_at = datetime.now(timezone.utc) - timedelta(days=120)
+        protected_entry.last_reviewed_at = datetime.now(timezone.utc) - timedelta(days=120)
+        session.add(stale_target)
+        session.add(protected_entry)
+        session.commit()
+
+    result = repo.refresh_knowledge_lifecycle("tenant-knowledge", stale_after_days=60)
+
+    assert result["updated"] == 1
+    refreshed_old = repo.get_knowledge_entry(old_entry.id)
+    refreshed_fresh = repo.get_knowledge_entry(fresh_entry.id)
+    assert refreshed_old is not None and refreshed_old.status == "stale"
+    assert refreshed_old.last_reviewed_at is not None
+    assert refreshed_fresh is not None and refreshed_fresh.status == "active"
 
 
 # ── Repository: EditSession CRUD ──────────────────────────────────────────────

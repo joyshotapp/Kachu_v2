@@ -11,8 +11,8 @@
 
 | 項目 | 說明 |
 |---|---|
-| 測試用 LINE 帳號 | 建議用你自己的個人 LINE 帳號加 Kachu bot 為好友 |
-| 測試用 Boss User ID | `.env.prod` 的 `LINE_BOSS_USER_ID`，設為你的 LINE user ID |
+| 測試用 LINE 帳號 | 建議用已綁定目標 tenant membership 的個人 LINE 帳號加 Kachu bot 為好友 |
+| 選填 legacy Boss User ID | 只有在本機或舊版單租戶 smoke 還需要 fallback 時，才在 `.env.prod` 設定 `LINE_BOSS_USER_ID` |
 | 外部可連線 URL | `https://app.kachu.tw` |
 
 ---
@@ -105,7 +105,7 @@ docker compose -f docker-compose.prod.yml exec kachu \
 
 ## 第三關：核心 LINE 指令流程
 
-> 以下測試請從你的 LINE 帳號（設為 `LINE_BOSS_USER_ID` 的帳號）傳訊息給 bot
+> 以下測試請從已綁定目標 tenant membership 的 LINE 帳號傳訊息給 bot
 
 ### T-06 — 傳送一般文字訊息（intent routing）
 

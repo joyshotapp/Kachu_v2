@@ -197,6 +197,17 @@
           <input x-model="tenantId" @change="reloadCurrentPage()" @keyup.enter="reloadCurrentPage()"
             placeholder="自動偵測" class="input w-52 text-xs" />
         </div>
+        <div class="flex items-center gap-2">
+          <label class="text-xs text-slate-500 font-medium">Admin Token</label>
+          <input
+            x-model="adminToken"
+            @change="persistAdminToken(); reloadCurrentPage()"
+            @keyup.enter="persistAdminToken(); reloadCurrentPage()"
+            type="password"
+            placeholder="貼上 Bearer token"
+            class="input w-60 text-xs"
+          />
+        </div>
         <!-- Refresh -->
         <button @click="reloadCurrentPage()" class="btn-secondary">
           <svg class="w-4 h-4" :class="{'animate-spin': loading}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
@@ -550,8 +561,24 @@
                 class="px-3 py-1.5 rounded-full text-xs font-medium transition-colors" x-text="cat.label"></button>
             </template>
           </div>
-          <div class="ml-auto flex items-center gap-2">
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="status in knowledgeStatusOptions" :key="status.value">
+              <button @click="knowledgeStatusFilter = status.value; loadKnowledge()"
+                :class="knowledgeStatusFilter === status.value ? 'bg-slate-800 text-white' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50'"
+                class="px-3 py-1.5 rounded-full text-xs font-medium transition-colors" x-text="status.label"></button>
+            </template>
+          </div>
+          <div class="ml-auto flex items-center gap-2 flex-wrap justify-end">
+            <template x-if="knowledgeLifecycle">
+              <div class="flex items-center gap-1.5 flex-wrap text-xs text-slate-500">
+                <span class="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700" x-text="'Active ' + (knowledgeLifecycle.by_status?.active || 0)"></span>
+                <span class="px-2 py-1 rounded-full bg-amber-50 text-amber-700" x-text="'Stale ' + (knowledgeLifecycle.by_status?.stale || 0)"></span>
+                <span class="px-2 py-1 rounded-full bg-rose-50 text-rose-700" x-text="'Conflict ' + (knowledgeLifecycle.by_status?.conflict || 0)"></span>
+                <span class="px-2 py-1 rounded-full bg-slate-100 text-slate-600" x-text="'待掃描 ' + (knowledgeLifecycle.stale_candidates || 0)"></span>
+              </div>
+            </template>
             <span class="text-sm text-slate-500" x-text="knowledgeEntries.length + ' 條'"></span>
+            <button @click="refreshKnowledgeLifecycle()" class="btn-secondary">掃描陳舊</button>
             <button @click="openKnowledgeModal()" class="btn-primary">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
               新增條目
@@ -569,7 +596,10 @@
           <template x-for="entry in knowledgeEntries" :key="entry.id">
             <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100 hover:border-slate-200 transition-colors">
               <div class="flex items-start justify-between mb-2">
-                <span :class="categoryBadgeClass(entry.category)" class="badge" x-text="categoryLabel(entry.category)"></span>
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span :class="categoryBadgeClass(entry.category)" class="badge" x-text="categoryLabel(entry.category)"></span>
+                  <span :class="knowledgeStatusBadgeClass(entry.status)" class="badge" x-text="knowledgeStatusLabel(entry.status)"></span>
+                </div>
                 <div class="flex items-center gap-1.5">
                   <button @click="editKnowledgeEntry(entry)" class="p-1 text-slate-400 hover:text-slate-600 rounded">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
@@ -580,10 +610,19 @@
                 </div>
               </div>
               <p class="text-sm text-slate-700 leading-relaxed line-clamp-3" x-text="entry.content"></p>
-              <div class="flex items-center gap-3 mt-2.5 text-xs text-slate-400">
+              <div x-show="entry.conflict_with" class="mt-2 text-xs text-amber-600" x-text="'衝突對象：' + entry.conflict_with"></div>
+              <div class="flex items-center gap-2 mt-3 flex-wrap">
+                <button x-show="entry.status === 'active'" @click="changeKnowledgeStatus(entry, 'stale')" class="px-2.5 py-1 rounded-lg border border-amber-200 text-amber-700 hover:bg-amber-50 text-xs font-medium">標記陳舊</button>
+                <button x-show="entry.status === 'active'" @click="changeKnowledgeStatus(entry, 'conflict')" class="px-2.5 py-1 rounded-lg border border-rose-200 text-rose-700 hover:bg-rose-50 text-xs font-medium">標記衝突</button>
+                <button x-show="entry.status !== 'active'" @click="changeKnowledgeStatus(entry, 'active')" class="px-2.5 py-1 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50 text-xs font-medium">恢復 Active</button>
+                <button x-show="entry.status !== 'archived'" @click="changeKnowledgeStatus(entry, 'archived')" class="px-2.5 py-1 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-medium">封存</button>
+              </div>
+              <div class="flex items-center gap-3 mt-2.5 text-xs text-slate-400 flex-wrap">
                 <span x-text="sourceLabel(entry.source_type)"></span>
-                <span x-text="relativeTime(entry.created_at)"></span>
-                <span x-show="entry.status !== 'active'" :class="entry.status === 'superseded' ? 'text-slate-400 line-through' : 'text-amber-500'" x-text="entry.status"></span>
+                <span x-text="'更新 ' + relativeTime(entry.updated_at)"></span>
+                <span x-show="entry.last_retrieved_at" x-text="'最近使用 ' + relativeTime(entry.last_retrieved_at)"></span>
+                <span x-show="entry.last_reviewed_at" x-text="'最近檢視 ' + relativeTime(entry.last_reviewed_at)"></span>
+                <span x-show="entry.activity_age_days !== null" x-text="'活躍度 ' + entry.activity_age_days + ' 天'"></span>
               </div>
             </div>
           </template>
@@ -629,6 +668,16 @@
       <!-- ════════════ CONNECTORS ════════════ -->
       <div x-show="!loading && page==='connectors'" class="fade-in space-y-4">
 
+        <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <div>
+              <h3 class="text-sm font-semibold text-slate-700">連接器與租戶營運</h3>
+              <p class="text-xs text-slate-400 mt-1">這些操作都會直接作用在目前上方輸入的 Tenant ID。</p>
+            </div>
+            <div class="text-xs" :class="connectorOpsStatusTone === 'error' ? 'text-red-600' : connectorOpsStatusTone === 'success' ? 'text-emerald-600' : 'text-slate-400'" x-text="connectorOpsStatus"></div>
+          </div>
+        </div>
+
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <template x-for="conn in connectors" :key="conn.platform">
             <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100">
@@ -651,16 +700,314 @@
                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                   <span x-text="'上次更新：' + relativeTime(conn.last_refreshed_at)"></span>
                 </div>
+                <div x-show="conn.expires_at" class="flex items-center gap-2">
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                  <span x-text="'Token 到期：' + formatDate(conn.expires_at)"></span>
+                </div>
+                <div x-show="conn.id" class="text-slate-400">
+                  Connector ID：<span class="font-mono" x-text="conn.id"></span>
+                </div>
+                <div class="flex items-center gap-2" x-show="conn.has_token && conn.platform !== 'line'">
+                  <span :class="refreshStatusBadgeClass(conn.refresh_status)" class="badge" x-text="refreshStatusLabel(conn.refresh_status)"></span>
+                  <span class="text-slate-400" x-show="conn.can_refresh" x-text="conn.has_refresh_token ? '支援 refresh token' : ''"></span>
+                </div>
+                <div x-show="conn.refresh_error" class="rounded-lg border border-red-200 bg-red-50 p-2.5 text-red-700 leading-relaxed">
+                  <div class="font-medium">最近 refresh 失敗</div>
+                  <div class="mt-1" x-text="conn.refresh_error"></div>
+                  <div class="text-red-500 mt-1" x-show="conn.refresh_failed_at" x-text="formatDate(conn.refresh_failed_at)"></div>
+                </div>
                 <div x-show="!conn.has_token" class="text-amber-600">
                   ⚠️ <span x-text="conn.hint || platformConnectHint(conn.platform)"></span>
                 </div>
               </div>
-              <div class="mt-4 flex gap-2" x-show="conn.platform === 'google_business' || conn.platform === 'ga4'">
-                <a href="/auth/google/connect" class="btn-primary text-xs" x-show="!conn.has_token">連接 Google</a>
-                <a href="/auth/google/status" target="_blank" class="btn-secondary text-xs" x-show="conn.has_token">查看授權狀態</a>
+              <div class="mt-4 flex gap-2 flex-wrap">
+                <a :href="connectorConnectHref(conn.platform)" class="btn-primary text-xs" x-show="conn.platform !== 'line'">
+                  <span x-text="conn.has_token ? '重新連接' : '立即連接'"></span>
+                </a>
+                <a :href="connectorStatusHref()" target="_blank" class="btn-secondary text-xs" x-show="tenantId && conn.platform !== 'line'">查看授權狀態</a>
+                <button
+                  @click="refreshConnector(conn)"
+                  class="btn-secondary text-xs"
+                  x-show="conn.id && conn.platform !== 'line' && conn.can_refresh"
+                  :disabled="connectorBusyPlatform === conn.platform"
+                >
+                  <span x-text="connectorBusyPlatform === conn.platform && connectorBusyAction === 'refresh' ? '刷新中...' : '強制刷新 Token'"></span>
+                </button>
+                <button
+                  @click="disconnectConnector(conn)"
+                  class="btn-danger text-xs"
+                  x-show="conn.id && conn.platform !== 'line' && conn.has_token"
+                  :disabled="connectorBusyPlatform === conn.platform"
+                >
+                  <span x-text="connectorBusyPlatform === conn.platform && connectorBusyAction === 'disconnect' ? '中斷中...' : '中斷連接'"></span>
+                </button>
               </div>
             </div>
           </template>
+        </div>
+
+        <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+            <div class="flex items-start justify-between gap-4 flex-wrap">
+              <div>
+                <h3 class="text-sm font-semibold text-slate-700">Tenant Plan 與 Feature Flags</h3>
+                <p class="text-xs text-slate-400 mt-1">直接控制本 tenant 的產品權限與方案狀態。</p>
+              </div>
+              <div class="text-xs text-slate-400" x-text="tenantSettingsSaveMessage"></div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">Plan</label>
+                <select x-model="tenantSettings.plan" class="select w-full">
+                  <option value="trial">trial</option>
+                  <option value="starter">starter</option>
+                  <option value="growth">growth</option>
+                  <option value="pro">pro</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">Plan Expiry</label>
+                <input x-model="tenantSettings.plan_expires_at" type="datetime-local" class="input" />
+              </div>
+              <div class="md:col-span-2">
+                <label class="block text-xs font-medium text-slate-600 mb-1.5">Merchant Slug</label>
+                <input x-model="tenantSettings.merchant_slug" class="input" placeholder="例如 demo-sishixunyangtang" />
+                <p class="mt-2 text-xs text-slate-400">這會成為該 tenant merchant page 的預設 slug，merchant page 管理卡片會直接沿用。</p>
+              </div>
+            </div>
+
+            <div class="flex items-center gap-2 flex-wrap">
+              <span :class="planStatusBadgeClass(tenantSettings.plan_status)" class="badge" x-text="planStatusLabel(tenantSettings.plan_status)"></span>
+              <span class="text-xs text-slate-400" x-text="tenantSettings.is_active ? 'Tenant 啟用中' : 'Tenant 已停用'"></span>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+              <label class="rounded-xl border border-slate-100 p-3 flex items-center justify-between gap-3">
+                <div>
+                  <div class="font-medium text-slate-700">GA4</div>
+                  <div class="text-xs text-slate-400">分析報表與週報</div>
+                </div>
+                <input x-model="tenantSettings.ga4_enabled" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
+              </label>
+              <label class="rounded-xl border border-slate-100 p-3 flex items-center justify-between gap-3">
+                <div>
+                  <div class="font-medium text-slate-700">Meta</div>
+                  <div class="text-xs text-slate-400">IG / FB 發文</div>
+                </div>
+                <input x-model="tenantSettings.meta_enabled" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
+              </label>
+              <label class="rounded-xl border border-slate-100 p-3 flex items-center justify-between gap-3">
+                <div>
+                  <div class="font-medium text-slate-700">Cross-channel</div>
+                  <div class="text-xs text-slate-400">多平台同步發送</div>
+                </div>
+                <input x-model="tenantSettings.cross_channel_enabled" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
+              </label>
+              <label class="rounded-xl border border-slate-100 p-3 flex items-center justify-between gap-3">
+                <div>
+                  <div class="font-medium text-slate-700">CRM</div>
+                  <div class="text-xs text-slate-400">進階客戶管理能力</div>
+                </div>
+                <input x-model="tenantSettings.crm_enabled" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
+              </label>
+            </div>
+
+            <div class="rounded-xl border border-slate-100 bg-slate-50 p-4 space-y-2">
+              <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Effective Capabilities</div>
+              <template x-for="capability in ['ga4', 'meta', 'cross_channel', 'crm']" :key="capability">
+                <div class="flex items-center justify-between gap-3 text-sm">
+                  <div>
+                    <div class="font-medium text-slate-700" x-text="capabilityLabel(capability)"></div>
+                    <div class="text-xs text-slate-400" x-text="tenantSettings.capabilities?.[capability]?.reason || '可使用'"></div>
+                  </div>
+                  <span :class="tenantSettings.capabilities?.[capability]?.allowed ? 'badge bg-emerald-100 text-emerald-700' : 'badge bg-slate-200 text-slate-600'" x-text="tenantSettings.capabilities?.[capability]?.allowed ? 'enabled' : 'blocked'"></span>
+                </div>
+              </template>
+            </div>
+
+            <div class="flex justify-end">
+              <button @click="saveTenantSettings()" class="btn-primary" :disabled="!tenantId.trim()">
+                儲存 Tenant 設定
+              </button>
+            </div>
+          </div>
+
+          <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+            <div class="flex items-start justify-between gap-4 flex-wrap">
+              <div>
+                <h3 class="text-sm font-semibold text-slate-700">Tenant Health Snapshot</h3>
+                <p class="text-xs text-slate-400 mt-1">快速確認連接器風險、方案狀態與最近工作流異常。</p>
+              </div>
+              <span :class="planStatusBadgeClass(tenantHealth?.tenant?.plan_status)" class="badge" x-text="planStatusLabel(tenantHealth?.tenant?.plan_status)"></span>
+            </div>
+
+            <div x-show="tenantHealth?.tenant" class="grid grid-cols-2 gap-3">
+              <div class="rounded-xl border border-slate-100 p-3">
+                <div class="text-xs text-slate-400 mb-1">Plan</div>
+                <div class="font-semibold text-slate-800" x-text="tenantHealth?.tenant?.plan || 'trial'"></div>
+              </div>
+              <div class="rounded-xl border border-slate-100 p-3">
+                <div class="text-xs text-slate-400 mb-1">Connector Alerts</div>
+                <div class="font-semibold text-slate-800" x-text="tenantHealth?.alerts?.connector_alerts ?? 0"></div>
+              </div>
+              <div class="rounded-xl border border-slate-100 p-3">
+                <div class="text-xs text-slate-400 mb-1">24h Runs</div>
+                <div class="font-semibold text-slate-800" x-text="tenantHealth?.recent_activity?.runs_last_24h ?? 0"></div>
+              </div>
+              <div class="rounded-xl border border-slate-100 p-3">
+                <div class="text-xs text-slate-400 mb-1">Pending Approvals</div>
+                <div class="font-semibold text-slate-800" x-text="tenantHealth?.recent_activity?.pending_approvals ?? 0"></div>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-slate-100 bg-slate-50 p-4 space-y-3" x-show="tenantHealth?.recent_activity">
+              <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Recent Activity</div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm text-slate-600">
+                <div>
+                  <div class="text-xs text-slate-400">Last Successful Run</div>
+                  <div x-text="tenantHealth?.recent_activity?.last_successful_run_at ? formatDate(tenantHealth.recent_activity.last_successful_run_at) : '尚無'"></div>
+                </div>
+                <div>
+                  <div class="text-xs text-slate-400">Last Failed Run</div>
+                  <div x-text="tenantHealth?.recent_activity?.last_failed_run_at ? formatDate(tenantHealth.recent_activity.last_failed_run_at) : '尚無'"></div>
+                </div>
+                <div>
+                  <div class="text-xs text-slate-400">Active Knowledge</div>
+                  <div x-text="tenantHealth?.recent_activity?.active_knowledge_entries ?? 0"></div>
+                </div>
+                <div>
+                  <div class="text-xs text-slate-400">Active Memberships</div>
+                  <div x-text="tenantHealth?.recent_activity?.active_memberships ?? 0"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-slate-100 p-4 space-y-3" x-show="(tenantHealth?.recent_failures || []).length > 0">
+              <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Recent Failures</div>
+              <template x-for="failure in tenantHealth?.recent_failures || []" :key="failure.created_at + failure.workflow_type">
+                <div class="rounded-lg border border-red-100 bg-red-50 p-3 text-sm">
+                  <div class="font-medium text-red-800" x-text="workflowLabel(failure.workflow_type)"></div>
+                  <div class="text-xs text-red-500 mt-1" x-text="failure.created_at ? formatDate(failure.created_at) : ''"></div>
+                  <div class="text-xs text-red-700 mt-1" x-text="failure.error_message || '未提供錯誤訊息'"></div>
+                </div>
+              </template>
+            </div>
+            <div x-show="(tenantHealth?.recent_failures || []).length === 0" class="rounded-xl border border-emerald-100 bg-emerald-50 p-4 text-sm text-emerald-700">
+              最近沒有 workflow failures。
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <div>
+              <h3 class="text-sm font-semibold text-slate-700">Merchant Page 管理</h3>
+              <p class="text-xs text-slate-400 mt-1">用最小 JSON 流程讀寫 tenant 商家頁資料，適合先做示範頁與對帳樣板。</p>
+            </div>
+            <div class="text-xs" :class="merchantPageStatusTone === 'error' ? 'text-red-600' : merchantPageStatusTone === 'success' ? 'text-emerald-600' : 'text-slate-400'" x-text="merchantPageStatus"></div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-[240px_1fr] gap-4">
+            <div>
+              <label class="block text-xs font-medium text-slate-600 mb-1.5">Merchant Slug</label>
+              <input x-model="merchantPageForm.merchant_slug" class="input" placeholder="例如 demo-sishixunyangtang" />
+              <p class="mt-2 text-xs text-slate-400">預設會沿用 tenant settings 的 merchant slug；需要時也可以在這裡臨時切換。</p>
+              <div class="mt-3 flex gap-2">
+                <button @click="generateMerchantPageTemplate()" class="btn-secondary" :disabled="merchantPageBusy || !merchantPageForm.merchant_slug.trim()">產生範本</button>
+                <button @click="loadMerchantPage()" class="btn-secondary" :disabled="merchantPageBusy || !merchantPageForm.merchant_slug.trim()">載入</button>
+                <button @click="saveMerchantPage()" class="btn-primary" :disabled="merchantPageBusy || !merchantPageForm.merchant_slug.trim() || !merchantPageForm.payloadText.trim()">儲存</button>
+              </div>
+              <div x-show="merchantPageForm.public_url" class="mt-4 rounded-lg border border-slate-100 bg-slate-50 p-3 text-xs text-slate-600 break-all">
+                <div class="font-medium text-slate-700 mb-1">公開網址</div>
+                <a :href="merchantPageForm.public_url" target="_blank" class="text-emerald-700 hover:text-emerald-800" x-text="merchantPageForm.public_url"></a>
+              </div>
+            </div>
+
+            <div>
+              <label class="block text-xs font-medium text-slate-600 mb-1.5">Merchant Payload JSON</label>
+              <textarea x-model="merchantPageForm.payloadText" rows="18" class="input resize-y font-mono text-xs leading-6" placeholder='{
+  "merchant_name": "示範商家",
+  "canonical_url": "https://kachu.tw/merchants/demo-merchant"
+}'></textarea>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 xl:grid-cols-3 gap-4">
+          <div class="xl:col-span-2 bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+            <div class="flex items-center justify-between gap-4 flex-wrap">
+              <div>
+                <h3 class="text-sm font-semibold text-slate-700">Tenant 營運操作</h3>
+                <p class="text-xs text-slate-400 mt-1">建議先 export，再做 deactivate 或 delete。</p>
+              </div>
+              <div class="text-xs" :class="tenantOpsStatusTone === 'error' ? 'text-red-600' : tenantOpsStatusTone === 'success' ? 'text-emerald-600' : 'text-slate-400'" x-text="tenantOpsStatus"></div>
+            </div>
+
+            <div class="rounded-xl border border-slate-100 bg-slate-50 p-4 space-y-3">
+              <div class="flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  <div class="text-sm font-medium text-slate-700">Tenant 資料匯出</div>
+                  <div class="text-xs text-slate-400 mt-1">下載目前 tenant 的完整 JSON 快照，適合備份與人工審查。</div>
+                </div>
+                <button @click="exportTenant()" class="btn-secondary" :disabled="tenantOpsBusy === 'export' || !tenantId.trim()">
+                  <span x-text="tenantOpsBusy === 'export' ? '匯出中...' : '匯出 JSON'" ></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-amber-200 bg-amber-50 p-4 space-y-3">
+              <div class="flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  <div class="text-sm font-medium text-amber-900">Tenant 停用</div>
+                  <div class="text-xs text-amber-700 mt-1">會停用 tenant、本 tenant memberships 與 active connectors，但資料仍保留，可先 export 後再操作。</div>
+                </div>
+                <button @click="deactivateTenant()" class="btn-secondary" :disabled="tenantOpsBusy === 'deactivate' || !tenantId.trim()">
+                  <span x-text="tenantOpsBusy === 'deactivate' ? '停用中...' : '停用 Tenant'"></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-red-200 bg-red-50 p-4 space-y-3">
+              <div>
+                <div class="text-sm font-medium text-red-900">Tenant 永久刪除</div>
+                <div class="text-xs text-red-700 mt-1">會刪除 tenant 與所有 tenant-scoped records。請先匯出，再輸入完整 Tenant ID 確認。</div>
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-red-800 mb-1.5">確認 Tenant ID</label>
+                <input x-model="tenantDeleteConfirm" class="input" :placeholder="tenantId ? '請輸入 ' + tenantId : '請先在上方輸入 Tenant ID'" />
+              </div>
+              <div class="flex items-center justify-between gap-3 flex-wrap">
+                <div class="text-xs text-red-700">
+                  <span x-show="tenantId && tenantDeleteConfirm !== tenantId">確認字串必須完全等於目前 Tenant ID。</span>
+                </div>
+                <button @click="deleteTenant()" class="btn-danger" :disabled="tenantOpsBusy === 'delete' || !tenantId.trim() || tenantDeleteConfirm !== tenantId">
+                  <span x-text="tenantOpsBusy === 'delete' ? '刪除中...' : '永久刪除 Tenant'"></span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100 space-y-4">
+            <div>
+              <h3 class="text-sm font-semibold text-slate-700">操作前檢查</h3>
+              <p class="text-xs text-slate-400 mt-1">這一頁的 destructive actions 都依賴兩個欄位。</p>
+            </div>
+            <div class="space-y-3 text-xs text-slate-600">
+              <div class="rounded-lg border border-slate-100 p-3">
+                <div class="font-medium text-slate-700">1. Tenant ID</div>
+                <div class="mt-1" x-text="tenantId ? '目前目標：' + tenantId : '尚未輸入 Tenant ID'" :class="tenantId ? 'text-emerald-600' : 'text-amber-600'"></div>
+              </div>
+              <div class="rounded-lg border border-slate-100 p-3">
+                <div class="font-medium text-slate-700">2. Admin Token</div>
+                <div class="mt-1" x-text="adminToken ? '已載入 bearer token' : '尚未輸入 token，API 會回 401'" :class="adminToken ? 'text-emerald-600' : 'text-amber-600'"></div>
+              </div>
+              <div class="rounded-lg border border-slate-100 p-3 bg-slate-50">
+                <div class="font-medium text-slate-700">建議流程</div>
+                <div class="mt-1 text-slate-500">先 export，必要時再 disconnect connector，最後才做 deactivate 或 delete。</div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -901,6 +1248,7 @@ function app() {
   return {
     page: 'overview',
     tenantId: '',
+    adminToken: '',
     loading: false,
     lastRefresh: '',
 
@@ -911,7 +1259,32 @@ function app() {
     runs: [],
     approvals: [],
     knowledgeEntries: [],
+    knowledgeLifecycle: null,
     connectors: [],
+    tenantSettings: {
+      tenant_id: '',
+      tenant_name: '',
+      plan: 'trial',
+      plan_expires_at: '',
+      merchant_slug: '',
+      plan_status: 'active',
+      is_active: true,
+      ga4_enabled: true,
+      meta_enabled: true,
+      cross_channel_enabled: true,
+      crm_enabled: false,
+      capabilities: {},
+    },
+    tenantSettingsSaveMessage: '',
+    tenantHealth: null,
+    merchantPageForm: {
+      merchant_slug: '',
+      payloadText: '',
+      public_url: '',
+    },
+    merchantPageStatus: '',
+    merchantPageStatusTone: 'idle',
+    merchantPageBusy: false,
     pushData: {},
     automationSettings: {
       timezone: 'Asia/Taipei',
@@ -934,6 +1307,14 @@ function app() {
       content_calendar_hour: 9,
     },
     automationSaveMessage: '',
+    connectorOpsStatus: '',
+    connectorOpsStatusTone: 'idle',
+    connectorBusyPlatform: '',
+    connectorBusyAction: '',
+    tenantOpsStatus: '',
+    tenantOpsStatusTone: 'idle',
+    tenantOpsBusy: '',
+    tenantDeleteConfirm: '',
     runAuditEvents: [],
     selectedRun: null,
 
@@ -941,6 +1322,7 @@ function app() {
     runsFilter: { workflow_type: '', status: '' },
     approvalsFilter: { status: '' },
     knowledgeFilter: '',
+    knowledgeStatusFilter: '',
 
     // Knowledge modal
     knowledgeModal: {
@@ -963,9 +1345,39 @@ function app() {
       { value: 'basic_info', label: '🏪 基本資訊' },
       { value: 'preference', label: '⚙️ 偏好設定' },
     ],
+    knowledgeStatusOptions: [
+      { value: '', label: '全部狀態' },
+      { value: 'active', label: 'Active' },
+      { value: 'stale', label: 'Stale' },
+      { value: 'conflict', label: 'Conflict' },
+      { value: 'superseded', label: 'Superseded' },
+      { value: 'archived', label: 'Archived' },
+    ],
 
     async init() {
+      const params = new URLSearchParams(window.location.search)
+      const savedToken = window.localStorage.getItem('kachu.dashboard.adminToken') || ''
+      this.adminToken = (params.get('token') || savedToken || '').trim()
+      this.tenantId = (params.get('tenant_id') || this.tenantId || '').trim()
+      this.persistAdminToken()
+      if (params.has('token')) this.scrubBootstrapTokenFromUrl(params)
       await this.loadOverview()
+    },
+
+    scrubBootstrapTokenFromUrl(params = null) {
+      const nextParams = params ? new URLSearchParams(params) : new URLSearchParams(window.location.search)
+      if (!nextParams.has('token')) return
+      nextParams.delete('token')
+      const nextQuery = nextParams.toString()
+      const nextUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}${window.location.hash || ''}`
+      window.history.replaceState({}, document.title, nextUrl)
+    },
+
+    persistAdminToken() {
+      const normalized = (this.adminToken || '').trim()
+      this.adminToken = normalized
+      if (normalized) window.localStorage.setItem('kachu.dashboard.adminToken', normalized)
+      else window.localStorage.removeItem('kachu.dashboard.adminToken')
     },
 
     pageTitle() {
@@ -997,13 +1409,51 @@ function app() {
       await this.navigate(this.page)
     },
 
-    async fetch(url) {
-      const params = new URLSearchParams()
-      if (this.tenantId) params.set('tenant_id', this.tenantId)
-      const fullUrl = url + (url.includes('?') ? '&' : '?') + params.toString()
-      const res = await fetch(fullUrl)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    buildApiUrl(url, includeTenant = true) {
+      const fullUrl = new URL(url, window.location.origin)
+      if (includeTenant && this.tenantId && !fullUrl.searchParams.has('tenant_id')) {
+        fullUrl.searchParams.set('tenant_id', this.tenantId)
+      }
+      return fullUrl.pathname + fullUrl.search
+    },
+
+    buildHeaders(extraHeaders = {}, body = null) {
+      const headers = { ...extraHeaders }
+      if (body !== null && !headers['Content-Type']) headers['Content-Type'] = 'application/json'
+      if (this.adminToken) headers['Authorization'] = `Bearer ${this.adminToken}`
+      return headers
+    },
+
+    async parseError(res) {
+      try {
+        const data = await res.json()
+        if (data && typeof data.detail === 'string' && data.detail.trim()) return data.detail.trim()
+      } catch {}
+      if (res.status === 401) return '請先輸入有效的 Admin Token'
+      return `HTTP ${res.status}`
+    },
+
+    async request(url, options = {}) {
+      const method = options.method || 'GET'
+      const body = options.body ?? null
+      const res = await window.fetch(this.buildApiUrl(url, options.includeTenant !== false), {
+        method,
+        headers: this.buildHeaders(options.headers || {}, body),
+        body,
+      })
+      if (!res.ok) throw new Error(await this.parseError(res))
+      if (res.status === 204) return null
       return res.json()
+    },
+
+    async fetch(url) {
+      return this.request(url)
+    },
+
+    requireTenantId(actionLabel = '這個操作') {
+      const tid = (this.tenantId || '').trim()
+      if (tid) return tid
+      throw new Error(`${actionLabel}需要先輸入 Tenant ID`)
     },
 
     async loadOverview() {
@@ -1018,11 +1468,11 @@ function app() {
         this.overviewRuns = runsData.runs || []
         this.pendingApprovals = approvalsData.approvals || []
         this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
-        this.$nextTick(() => this.renderWorkflowChart())
       } catch (e) {
         console.error('loadOverview error', e)
       } finally {
         this.loading = false
+        this.$nextTick(() => this.scheduleWorkflowChartRender())
       }
     },
 
@@ -1034,7 +1484,7 @@ function app() {
         if (this.runsFilter.workflow_type) params.set('workflow_type', this.runsFilter.workflow_type)
         if (this.runsFilter.status) params.set('status', this.runsFilter.status)
         params.set('limit', '100')
-        const data = await fetch('/dashboard/api/runs?' + params).then(r => r.json())
+        const data = await this.fetch('/dashboard/api/runs?' + params.toString())
         this.runs = data.runs || []
         this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
       } catch (e) { console.error(e) } finally { this.loading = false }
@@ -1046,7 +1496,7 @@ function app() {
         const params = new URLSearchParams()
         if (this.tenantId) params.set('tenant_id', this.tenantId)
         if (this.approvalsFilter.status) params.set('status', this.approvalsFilter.status)
-        const data = await fetch('/dashboard/api/approvals?' + params).then(r => r.json())
+        const data = await this.fetch('/dashboard/api/approvals?' + params.toString())
         this.approvals = data.approvals || []
         this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
       } catch (e) { console.error(e) } finally { this.loading = false }
@@ -1058,8 +1508,10 @@ function app() {
         const params = new URLSearchParams()
         if (this.tenantId) params.set('tenant_id', this.tenantId)
         if (this.knowledgeFilter) params.set('category', this.knowledgeFilter)
-        const data = await fetch('/dashboard/api/knowledge?' + params).then(r => r.json())
+        if (this.knowledgeStatusFilter) params.set('status', this.knowledgeStatusFilter)
+        const data = await this.fetch('/dashboard/api/knowledge?' + params.toString())
         this.knowledgeEntries = data.entries || []
+        this.knowledgeLifecycle = data.lifecycle || null
         this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
       } catch (e) { console.error(e) } finally { this.loading = false }
     },
@@ -1067,10 +1519,154 @@ function app() {
     async loadConnectors() {
       this.loading = true
       try {
-        const data = await this.fetch('/dashboard/api/connectors')
-        this.connectors = data.connectors || []
+        const tid = (this.tenantId || '').trim()
+        if (!tid) {
+          this.connectors = []
+          this.tenantHealth = null
+          this.tenantSettingsSaveMessage = '請先輸入 Tenant ID 才能查看連接器與租戶控管'
+          return
+        }
+        const [connectorData, settingsData, healthData] = await Promise.all([
+          this.fetch('/dashboard/api/connectors'),
+          this.fetch('/dashboard/api/tenants/settings'),
+          this.fetch('/dashboard/api/tenants/health'),
+        ])
+        this.connectors = connectorData.connectors || []
+        this.tenantSettings = {
+          ...this.tenantSettings,
+          ...settingsData,
+          plan_expires_at: this.toDateTimeLocal(settingsData.plan_expires_at),
+        }
+        const configuredMerchantSlug = (settingsData.merchant_slug || '').trim()
+        if (configuredMerchantSlug) {
+          this.merchantPageForm.merchant_slug = configuredMerchantSlug
+        } else if (!this.merchantPageForm.merchant_slug && tid) {
+          this.merchantPageForm.merchant_slug = 'demo-sishixunyangtang'
+        }
+        this.tenantHealth = healthData
+        this.tenantSettingsSaveMessage = settingsData.updated_at ? '已載入目前 tenant 設定' : ''
         this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
-      } catch (e) { console.error(e) } finally { this.loading = false }
+      } catch (e) {
+        console.error(e)
+        this.connectorOpsStatus = e.message || '載入 connector 狀態失敗'
+        this.connectorOpsStatusTone = 'error'
+      } finally { this.loading = false }
+    },
+
+    toDateTimeLocal(value) {
+      if (!value) return ''
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) return ''
+      const pad = (num) => String(num).padStart(2, '0')
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+    },
+
+    async saveTenantSettings() {
+      try {
+        const tid = this.requireTenantId('儲存 tenant 設定')
+        const payload = {
+          tenant_id: tid,
+          plan: this.tenantSettings.plan,
+          plan_expires_at: this.tenantSettings.plan_expires_at ? new Date(this.tenantSettings.plan_expires_at).toISOString() : null,
+          merchant_slug: (this.tenantSettings.merchant_slug || '').trim() || null,
+          ga4_enabled: !!this.tenantSettings.ga4_enabled,
+          meta_enabled: !!this.tenantSettings.meta_enabled,
+          cross_channel_enabled: !!this.tenantSettings.cross_channel_enabled,
+          crm_enabled: !!this.tenantSettings.crm_enabled,
+        }
+        const data = await this.request('/dashboard/api/tenants/settings', {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+          includeTenant: false,
+        })
+        this.tenantSettings = {
+          ...this.tenantSettings,
+          ...data,
+          plan_expires_at: this.toDateTimeLocal(data.plan_expires_at),
+        }
+        if ((data.merchant_slug || '').trim()) {
+          this.merchantPageForm.merchant_slug = data.merchant_slug.trim()
+        }
+        this.tenantSettingsSaveMessage = 'Tenant 設定已儲存'
+        await this.loadConnectors()
+      } catch (e) {
+        console.error(e)
+        this.tenantSettingsSaveMessage = e.message || '儲存 tenant 設定失敗'
+      }
+    },
+
+    async loadMerchantPage() {
+      try {
+        const tid = this.requireTenantId('載入 merchant page')
+        const merchantSlug = (this.merchantPageForm.merchant_slug || '').trim()
+        if (!merchantSlug) throw new Error('請先輸入 Merchant Slug')
+        this.merchantPageBusy = true
+        const data = await this.fetch(`/dashboard/api/merchant-page?tenant_id=${encodeURIComponent(tid)}&merchant_slug=${encodeURIComponent(merchantSlug)}`)
+        this.merchantPageForm.payloadText = JSON.stringify(data.payload || {}, null, 2)
+        this.merchantPageForm.public_url = data.public_url || ''
+        this.merchantPageStatus = 'Merchant page 已載入'
+        this.merchantPageStatusTone = 'success'
+      } catch (e) {
+        console.error(e)
+        this.merchantPageStatus = e.message || '載入 merchant page 失敗'
+        this.merchantPageStatusTone = 'error'
+      } finally {
+        this.merchantPageBusy = false
+      }
+    },
+
+    async generateMerchantPageTemplate() {
+      try {
+        const tid = this.requireTenantId('產生 merchant page 範本')
+        const merchantSlug = (this.merchantPageForm.merchant_slug || '').trim()
+        if (!merchantSlug) throw new Error('請先輸入 Merchant Slug')
+        this.merchantPageBusy = true
+        const data = await this.fetch(`/dashboard/api/merchant-page/template?tenant_id=${encodeURIComponent(tid)}&merchant_slug=${encodeURIComponent(merchantSlug)}`)
+        this.merchantPageForm.payloadText = JSON.stringify(data.payload || {}, null, 2)
+        this.merchantPageForm.public_url = data.public_url || ''
+        this.merchantPageStatus = 'Merchant page 範本已產生'
+        this.merchantPageStatusTone = 'success'
+      } catch (e) {
+        console.error(e)
+        this.merchantPageStatus = e.message || '產生 merchant page 範本失敗'
+        this.merchantPageStatusTone = 'error'
+      } finally {
+        this.merchantPageBusy = false
+      }
+    },
+
+    async saveMerchantPage() {
+      try {
+        const tid = this.requireTenantId('儲存 merchant page')
+        const merchantSlug = (this.merchantPageForm.merchant_slug || '').trim()
+        if (!merchantSlug) throw new Error('請先輸入 Merchant Slug')
+        let payload
+        try {
+          payload = JSON.parse(this.merchantPageForm.payloadText || '{}')
+        } catch {
+          throw new Error('Merchant Payload JSON 格式錯誤')
+        }
+        this.merchantPageBusy = true
+        const data = await this.request('/dashboard/api/merchant-page', {
+          method: 'PUT',
+          body: JSON.stringify({
+            tenant_id: tid,
+            merchant_slug: merchantSlug,
+            payload,
+          }),
+          includeTenant: false,
+        })
+        this.merchantPageForm.payloadText = JSON.stringify(data.payload || {}, null, 2)
+        this.merchantPageForm.public_url = data.public_url || ''
+        this.merchantPageStatus = 'Merchant page 已儲存'
+        this.merchantPageStatusTone = 'success'
+      } catch (e) {
+        console.error(e)
+        this.merchantPageStatus = e.message || '儲存 merchant page 失敗'
+        this.merchantPageStatusTone = 'error'
+      } finally {
+        this.merchantPageBusy = false
+      }
     },
 
     async loadPushes() {
@@ -1098,13 +1694,10 @@ function app() {
     async saveAutomationSettings() {
       try {
         const payload = { ...this.automationSettings, tenant_id: this.tenantId || undefined }
-        const res = await fetch('/dashboard/api/automation-settings', {
+        const data = await this.request('/dashboard/api/automation-settings', {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const data = await res.json()
         this.automationSettings = { ...this.automationSettings, ...data }
         this.automationSaveMessage = '設定已儲存'
         this.lastRefresh = new Date().toLocaleTimeString('zh-TW')
@@ -1141,46 +1734,240 @@ function app() {
             alert('請先輸入 Tenant ID 才能新增知識條目')
             return
           }
-          await fetch('/dashboard/api/knowledge', {
+          await this.request('/dashboard/api/knowledge', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ tenant_id: tid, category: (m.category || '').trim(), content: m.content.trim(), source_type: 'manual' }),
+            includeTenant: false,
           })
         } else {
-          await fetch(`/dashboard/api/knowledge/${m.id}`, {
+          await this.request(`/dashboard/api/knowledge/${m.id}`, {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content: m.content.trim(), category: (m.category || '').trim() }),
+            includeTenant: false,
           })
         }
         m.open = false
         await this.loadKnowledge()
       } catch (e) { console.error(e) }
     },
+    async refreshKnowledgeLifecycle() {
+      try {
+        const tid = this.requireTenantId('掃描知識生命周期')
+        const data = await this.request('/dashboard/api/knowledge/lifecycle/refresh', {
+          method: 'POST',
+          body: JSON.stringify({ tenant_id: tid, stale_after_days: 60 }),
+          includeTenant: false,
+        })
+        this.knowledgeLifecycle = data.summary || null
+        await this.loadKnowledge()
+      } catch (e) { console.error(e) }
+    },
+    async changeKnowledgeStatus(entry, status) {
+      if (!entry || !entry.id) return
+      const prompts = {
+        active: '確定要把這條知識恢復為 Active 嗎？',
+        stale: '確定要把這條知識標記為陳舊嗎？',
+        conflict: '確定要把這條知識標記為衝突待確認嗎？',
+        archived: '確定要封存這條知識嗎？',
+      }
+      if (!confirm(prompts[status] || '確定要更新知識狀態嗎？')) return
+      try {
+        const tid = this.requireTenantId('更新知識狀態')
+        const data = await this.request(`/dashboard/api/knowledge/${entry.id}/status`, {
+          method: 'POST',
+          body: JSON.stringify({ tenant_id: tid, status }),
+          includeTenant: false,
+        })
+        this.knowledgeLifecycle = data.lifecycle || this.knowledgeLifecycle
+        await this.loadKnowledge()
+      } catch (e) { console.error(e) }
+    },
     async deleteKnowledgeEntry(id) {
       if (!confirm('確定要刪除這條知識條目嗎？')) return
       try {
-        await fetch(`/dashboard/api/knowledge/${id}`, { method: 'DELETE' })
+        await this.request(`/dashboard/api/knowledge/${id}`, { method: 'DELETE', includeTenant: false })
         await this.loadKnowledge()
       } catch (e) { console.error(e) }
     },
 
+    connectorConnectHref(platform) {
+      const tid = (this.tenantId || '').trim()
+      if (!tid) return '#'
+      if (platform === 'meta') return `/auth/meta/connect?tenant_id=${encodeURIComponent(tid)}`
+      if (platform === 'ga4') return `/auth/google/connect?tenant_id=${encodeURIComponent(tid)}&platforms=ga4`
+      if (platform === 'google_business') return `/auth/google/connect?tenant_id=${encodeURIComponent(tid)}&platforms=gbp,ga4`
+      return '#'
+    },
+
+    connectorStatusHref() {
+      const tid = (this.tenantId || '').trim()
+      if (!tid) return '#'
+      return `/auth/status/${encodeURIComponent(tid)}`
+    },
+
+    async disconnectConnector(conn) {
+      if (!conn || !conn.platform) return
+      try {
+        const tid = this.requireTenantId('中斷連接')
+        if (!confirm(`確定要中斷 ${this.platformLabel(conn.platform)} 與 ${tid} 的連結嗎？`)) return
+        this.connectorBusyPlatform = conn.platform
+        this.connectorBusyAction = 'disconnect'
+        const data = await this.request('/dashboard/api/connectors/disconnect', {
+          method: 'POST',
+          body: JSON.stringify({ tenant_id: tid, platform: conn.platform }),
+          includeTenant: false,
+        })
+        this.connectorOpsStatus = `${this.platformLabel(conn.platform)} 已中斷連接`
+        this.connectorOpsStatusTone = 'success'
+        await this.loadConnectors()
+        return data
+      } catch (e) {
+        console.error(e)
+        this.connectorOpsStatus = e.message || '中斷連接失敗'
+        this.connectorOpsStatusTone = 'error'
+      } finally {
+        this.connectorBusyPlatform = ''
+        this.connectorBusyAction = ''
+      }
+    },
+
+    async refreshConnector(conn) {
+      if (!conn || !conn.platform) return
+      try {
+        const tid = this.requireTenantId('刷新 connector token')
+        this.connectorBusyPlatform = conn.platform
+        this.connectorBusyAction = 'refresh'
+        const data = await this.request('/dashboard/api/connectors/refresh', {
+          method: 'POST',
+          body: JSON.stringify({ tenant_id: tid, platform: conn.platform }),
+          includeTenant: false,
+        })
+        this.connectorOpsStatus = `${this.platformLabel(conn.platform)} ${data.status === 'already_fresh' ? '目前仍有效' : 'Token 已刷新'}`
+        this.connectorOpsStatusTone = 'success'
+        await this.loadConnectors()
+      } catch (e) {
+        console.error(e)
+        this.connectorOpsStatus = e.message || '刷新 connector 失敗'
+        this.connectorOpsStatusTone = 'error'
+      } finally {
+        this.connectorBusyPlatform = ''
+        this.connectorBusyAction = ''
+      }
+    },
+
+    async exportTenant() {
+      try {
+        const tid = this.requireTenantId('匯出 tenant')
+        this.tenantOpsBusy = 'export'
+        const data = await this.fetch('/dashboard/api/tenants/export')
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+        const downloadUrl = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = downloadUrl
+        link.download = `${tid}-export.json`
+        document.body.appendChild(link)
+        link.click()
+        link.remove()
+        URL.revokeObjectURL(downloadUrl)
+        this.tenantOpsStatus = `${tid} 匯出完成`
+        this.tenantOpsStatusTone = 'success'
+      } catch (e) {
+        console.error(e)
+        this.tenantOpsStatus = e.message || '匯出失敗'
+        this.tenantOpsStatusTone = 'error'
+      } finally {
+        this.tenantOpsBusy = ''
+      }
+    },
+
+    async deactivateTenant() {
+      try {
+        const tid = this.requireTenantId('停用 tenant')
+        if (!confirm(`確定要停用 ${tid} 嗎？這會同時停用 memberships 與 active connectors。`)) return
+        this.tenantOpsBusy = 'deactivate'
+        await this.request('/dashboard/api/tenants/deactivate', {
+          method: 'POST',
+          body: JSON.stringify({ tenant_id: tid }),
+          includeTenant: false,
+        })
+        this.tenantOpsStatus = `${tid} 已停用`
+        this.tenantOpsStatusTone = 'success'
+        await this.loadConnectors()
+      } catch (e) {
+        console.error(e)
+        this.tenantOpsStatus = e.message || '停用失敗'
+        this.tenantOpsStatusTone = 'error'
+      } finally {
+        this.tenantOpsBusy = ''
+      }
+    },
+
+    async deleteTenant() {
+      try {
+        const tid = this.requireTenantId('刪除 tenant')
+        if (this.tenantDeleteConfirm !== tid) throw new Error('確認字串必須完全等於目前 Tenant ID')
+        if (!confirm(`確定要永久刪除 ${tid} 嗎？這個操作無法復原。`)) return
+        this.tenantOpsBusy = 'delete'
+        await this.request('/dashboard/api/tenants/delete', {
+          method: 'POST',
+          body: JSON.stringify({ tenant_id: tid, confirm_tenant_id: this.tenantDeleteConfirm }),
+          includeTenant: false,
+        })
+        this.tenantOpsStatus = `${tid} 已永久刪除`
+        this.tenantOpsStatusTone = 'success'
+        this.connectors = []
+        this.tenantDeleteConfirm = ''
+      } catch (e) {
+        console.error(e)
+        this.tenantOpsStatus = e.message || '刪除失敗'
+        this.tenantOpsStatusTone = 'error'
+      } finally {
+        this.tenantOpsBusy = ''
+      }
+    },
+
     // ── Chart ───────────────────────────────────────────────────────────────
     _chart: null,
+    scheduleWorkflowChartRender(attempt = 0) {
+      if (this.page !== 'overview') return
+      const canvas = document.getElementById('workflowChart')
+      if (!(canvas instanceof HTMLCanvasElement) || !canvas.isConnected || canvas.offsetParent === null) {
+        if (attempt < 5) {
+          window.requestAnimationFrame(() => this.scheduleWorkflowChartRender(attempt + 1))
+        }
+        return
+      }
+      this.renderWorkflowChart(canvas)
+    },
     renderWorkflowChart() {
-      const ctx = document.getElementById('workflowChart')
+      const canvas = arguments[0] || document.getElementById('workflowChart')
+      if (!(canvas instanceof HTMLCanvasElement)) return
+      const ctx = canvas.getContext('2d')
       if (!ctx) return
       const byType = this.stats.runs_by_type || {}
       const labels = Object.keys(byType).map(t => this.workflowLabel(t))
       const data = Object.values(byType)
       const colors = ['#10b981','#3b82f6','#f59e0b','#8b5cf6','#ef4444','#06b6d4']
-      if (this._chart) { this._chart.destroy() }
+      if (this._chart) {
+        try { this._chart.destroy() } catch (e) { console.warn('workflowChart destroy error', e) }
+        this._chart = null
+      }
       if (data.length === 0) return
-      this._chart = new Chart(ctx, {
-        type: 'doughnut',
-        data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 0 }] },
-        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, cutout: '65%' },
-      })
+      try {
+        this._chart = new Chart(ctx, {
+          type: 'doughnut',
+          data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 0 }] },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            plugins: { legend: { display: false } },
+            cutout: '65%',
+          },
+        })
+      } catch (e) {
+        console.warn('workflowChart render skipped', e)
+      }
     },
 
     // ── Label / styling helpers ─────────────────────────────────────────────
@@ -1216,6 +2003,14 @@ function app() {
       const m = { core_value:'bg-blue-100 text-blue-700', pain_point:'bg-red-100 text-red-700', goal:'bg-purple-100 text-purple-700', product:'bg-emerald-100 text-emerald-700', style:'bg-pink-100 text-pink-700', contact:'bg-slate-100 text-slate-600', basic_info:'bg-orange-100 text-orange-700', preference:'bg-indigo-100 text-indigo-700', episode:'bg-teal-100 text-teal-700' }
       return m[c] || 'bg-slate-100 text-slate-600'
     },
+    knowledgeStatusLabel(status) {
+      const m = { active:'Active', stale:'Stale', conflict:'Conflict', superseded:'Superseded', archived:'Archived' }
+      return m[status] || status || 'Unknown'
+    },
+    knowledgeStatusBadgeClass(status) {
+      const m = { active:'bg-emerald-100 text-emerald-700', stale:'bg-amber-100 text-amber-700', conflict:'bg-rose-100 text-rose-700', superseded:'bg-slate-200 text-slate-600', archived:'bg-slate-100 text-slate-500' }
+      return m[status] || 'bg-slate-100 text-slate-600'
+    },
     sourceLabel(s) {
       const m = { conversation:'對話', document:'文件上傳', photo:'照片', review:'評論', platform_data:'平台數據', edit:'老闆修改', workflow:'工作流', manual:'手動新增' }
       return '來源：' + (m[s] || s)
@@ -1239,6 +2034,32 @@ function app() {
     platformConnectHint(p) {
       const m = { google_business:'請先設定 Google Service Account 或 OAuth', ga4:'請先設定 GA4 Property ID', meta:'尚未整合（Phase 3）', line:'請設定 LINE Channel Access Token' }
       return m[p] || '尚未連接'
+    },
+    capabilityLabel(capability) {
+      const labels = {
+        ga4: 'GA4 analytics',
+        meta: 'Meta publishing',
+        cross_channel: 'Cross-channel publishing',
+        crm: 'CRM features',
+      }
+      return labels[capability] || capability
+    },
+    planStatusLabel(status) {
+      const labels = { active:'Active', scheduled_expiry:'Scheduled Expiry', expired:'Expired' }
+      return labels[status] || (status || 'Unknown')
+    },
+    planStatusBadgeClass(status) {
+      if (status === 'expired') return 'bg-red-100 text-red-700'
+      if (status === 'scheduled_expiry') return 'bg-amber-100 text-amber-700'
+      return 'bg-emerald-100 text-emerald-700'
+    },
+    refreshStatusLabel(status) {
+      const labels = { healthy:'healthy', failed:'refresh failed' }
+      return labels[status] || (status || 'unknown')
+    },
+    refreshStatusBadgeClass(status) {
+      if (status === 'failed') return 'bg-red-100 text-red-700'
+      return 'bg-emerald-100 text-emerald-700'
     },
     pushTypeLabel(t) {
       const m = { approval:'📋 草稿確認推播', report:'📊 GA4 週報推播', escalation:'⚠️ 顧客升級通知', general:'💬 一般訊息' }

@@ -3,11 +3,13 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 from urllib.parse import parse_qs
 from zoneinfo import ZoneInfo
 
@@ -26,6 +28,7 @@ from ..memory import MemoryManager
 from ..models import ApprovalAction, BossRouteDecision, BossRouteMode, Intent
 from ..onboarding import OnboardingFlow
 from ..persistence import KachuRepository
+from ..post_task_review import PostTaskReviewService
 from .push import push_line_messages, text_message
 
 
@@ -40,6 +43,18 @@ _PENDING_BOSS_ASSET_INTENT = "pending_boss_asset_intent"
 _PENDING_BOSS_TEXT_INTENT = "pending_boss_text_intent"
 _PENDING_SCHEDULE_REQUEST = "pending_schedule_request"
 _PENDING_SCHEDULE_CONFIRMATION = "pending_schedule_confirmation"
+_LAST_OWNER_NOTIFICATION_CONTEXT = "last_owner_notification"
+_OWNER_ONLY_POSTBACK_ACTIONS = frozenset({
+    ApprovalAction.APPROVE.value,
+    ApprovalAction.EDIT.value,
+    ApprovalAction.REJECT.value,
+    "schedule_publish",
+    "confirm_schedule_publish",
+    "cancel_schedule_publish",
+    "cancel_run",
+    "retry_run",
+    "replay_run",
+})
 _EXPLICIT_KNOWLEDGE_CUES = frozenset([
     "品牌資訊", "品牌資料", "產品資訊", "品牌定位", "品牌故事", "這是我們的",
     "幫我記住", "記住這個", "記下來", "吸收這份", "內化這份",
@@ -58,6 +73,9 @@ _DOCUMENT_LIKE_CUES: frozenset[str] = frozenset()  # kept for backward compat; n
 _QUESTION_CUES = frozenset([
     "?", "？", "嗎", "呢", "怎麼", "如何", "為什麼", "哪個", "哪些", "是不是",
     "要怎麼", "你覺得", "可不可以", "行不行",
+])
+_NOTIFICATION_SOURCE_CUES = frozenset([
+    "哪裡來", "從哪來", "怎麼來", "什麼訊息", "什麼通知", "為什麼收到", "誰傳的",
 ])
 
 
@@ -119,6 +137,94 @@ def _build_small_talk_reply(text: str) -> str:
     if "謝謝" in normalized:
         return "不客氣，我在。接下來想處理什麼，直接跟我說。"
     return "你好，我在。你可以直接跟我說想做的事，例如發文、看流量、更新店家資訊，或傳照片給我。"
+
+
+def _looks_like_notification_source_question(text: str) -> bool:
+    normalized = "".join(str(text or "").split())
+    if not normalized:
+        return False
+    has_source_cue = any(cue in normalized for cue in _NOTIFICATION_SOURCE_CUES)
+    has_notification_object = any(token in normalized for token in ("訊息", "通知", "這則", "這個", "剛剛"))
+    return has_source_cue and has_notification_object
+
+
+def _build_last_owner_notification_reply(repo: KachuRepository, tenant_id: str, line_text: str) -> str | None:
+    if not _looks_like_notification_source_question(line_text):
+        return None
+
+    last_notification = repo.get_shared_context(tenant_id, _LAST_OWNER_NOTIFICATION_CONTEXT)
+    if not last_notification:
+        return None
+
+    notification_kind = str(last_notification.get("kind", "")).strip()
+    if notification_kind == "line_faq_escalation":
+        customer_line_id = str(last_notification.get("customer_line_id", "")).strip()
+        reason = str(last_notification.get("reason", "")).strip()
+        segments = ["剛剛那則是顧客 FAQ 的人工接手通知。"]
+        if customer_line_id:
+            segments.append(f"顧客 LINE ID 是 {customer_line_id}。")
+        if reason:
+            segments.append(f"系統判斷原因是：{reason}。")
+        segments.append("如果你要，我可以接著幫你整理回覆方向。")
+        return "".join(segments)
+
+    preview_text = str(last_notification.get("preview_text", "")).strip()
+    message_type = str(last_notification.get("message_type", "通知")).strip() or "通知"
+    if preview_text:
+        return f"剛剛那則是系統推送的{message_type}。內容摘要是：{preview_text[:120]}"
+    return f"剛剛那則是系統推送的{message_type}。"
+
+
+def _resolve_actor_tenant_context(
+    repo: KachuRepository,
+    settings: Settings,
+    line_user_id: str,
+) -> tuple[str | None, bool, bool, str | None]:
+    normalized_line_user_id = str(line_user_id or "").strip()
+    membership_lookup = getattr(repo, "get_active_membership_by_line_user_id", None)
+    membership_lookup_is_placeholder_mock = isinstance(membership_lookup, (AsyncMock, Mock)) and isinstance(
+        getattr(membership_lookup, "return_value", None),
+        (AsyncMock, Mock),
+    )
+    if normalized_line_user_id and callable(membership_lookup) and not membership_lookup_is_placeholder_mock:
+        candidate = membership_lookup(normalized_line_user_id)
+        if inspect.isawaitable(candidate):
+            candidate = None
+        if candidate is not None and not isinstance(candidate, Mock):
+            membership_tenant_id = str(getattr(candidate, "tenant_id", "")).strip()
+            membership_line_user_id = str(getattr(candidate, "line_user_id", "")).strip()
+            membership_active = bool(getattr(candidate, "is_active", True))
+            membership_role = str(getattr(candidate, "role", "owner") or "owner").strip().lower() or "owner"
+            if membership_tenant_id and membership_active and (
+                not membership_line_user_id or membership_line_user_id == normalized_line_user_id
+            ):
+                is_boss_flag = membership_role in {"owner", "admin"}
+                return membership_tenant_id, is_boss_flag, True, membership_role
+        return None, False, True, None
+
+    legacy_boss_user_id = str(getattr(settings, "LINE_BOSS_USER_ID", "") or "").strip()
+    if legacy_boss_user_id:
+        return (
+            legacy_boss_user_id,
+            normalized_line_user_id == legacy_boss_user_id,
+            False,
+            "owner" if normalized_line_user_id == legacy_boss_user_id else None,
+        )
+
+    return None, False, False, None
+
+
+async def _notify_unbound_line_user(*, line_user_id: str, settings: Settings) -> None:
+    if not line_user_id or not settings.LINE_CHANNEL_ACCESS_TOKEN:
+        return
+    try:
+        await push_line_messages(
+            to=line_user_id,
+            messages=[text_message("這個 LINE 帳號尚未綁定任何品牌租戶，請先完成邀請或綁定設定。")],
+            access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+        )
+    except Exception:
+        logger.warning("Failed to notify unbound LINE user: user=%s", line_user_id)
 
 
 def _is_retriable_line_download_error(exc: httpx.HTTPError) -> bool:
@@ -786,6 +892,8 @@ async def line_webhook(
 
     context_brief_manager = request.app.state.context_brief_manager
 
+    post_task_review = getattr(request.app.state, "post_task_review", None)
+
     business_consultant: BusinessConsultant = request.app.state.business_consultant
 
 
@@ -811,6 +919,8 @@ async def line_webhook(
             memory_manager=memory_manager,
 
             context_brief_manager=context_brief_manager,
+
+            post_task_review=post_task_review,
 
             business_consultant=business_consultant,
 
@@ -846,6 +956,8 @@ async def _handle_event(
 
     context_brief_manager=None,
 
+    post_task_review: PostTaskReviewService | None = None,
+
     business_consultant: BusinessConsultant | None = None,
 
 ) -> None:
@@ -860,17 +972,20 @@ async def _handle_event(
         settings,
         memory_manager=memory_manager,
         context_brief_manager=context_brief_manager,
+        post_task_review=post_task_review,
     )
 
 
 
-    # Identify if this is the boss or a customer
-
-    is_boss = bool(settings.LINE_BOSS_USER_ID and line_user_id == settings.LINE_BOSS_USER_ID)
-
-    # For single-tenant MVP: boss's user ID is both the tenant_id and the boss identifier
-
-    tenant_id = settings.LINE_BOSS_USER_ID if is_boss else (settings.LINE_BOSS_USER_ID or line_user_id)
+    tenant_id, is_boss, membership_bound, actor_role = _resolve_actor_tenant_context(
+        repo,
+        settings,
+        line_user_id,
+    )
+    if tenant_id is None:
+        logger.info("Ignoring LINE event from unbound user: user=%s type=%s", line_user_id, event_type)
+        await _notify_unbound_line_user(line_user_id=line_user_id, settings=settings)
+        return
 
 
 
@@ -885,6 +1000,36 @@ async def _handle_event(
         run_id = params.get("run_id", "")
 
         pb_tenant_id = params.get("tenant_id", tenant_id)
+        if membership_bound and pb_tenant_id and pb_tenant_id != tenant_id:
+            logger.warning(
+                "Rejecting LINE postback with mismatched tenant: actor_user=%s actor_tenant=%s requested_tenant=%s",
+                line_user_id,
+                tenant_id,
+                pb_tenant_id,
+            )
+            if settings.LINE_CHANNEL_ACCESS_TOKEN:
+                await push_line_messages(
+                    to=line_user_id,
+                    messages=[text_message("這個操作不屬於你目前綁定的品牌。")],
+                    access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+                )
+            return
+
+        if membership_bound and actor_role != "owner" and action_raw in _OWNER_ONLY_POSTBACK_ACTIONS:
+            logger.warning(
+                "Rejecting owner-only LINE postback: actor_user=%s actor_tenant=%s actor_role=%s action=%s",
+                line_user_id,
+                tenant_id,
+                actor_role,
+                action_raw,
+            )
+            if settings.LINE_CHANNEL_ACCESS_TOKEN:
+                await push_line_messages(
+                    to=line_user_id,
+                    messages=[text_message("這個操作目前只開放品牌 owner 執行。")],
+                    access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+                )
+            return
 
 
 
@@ -893,6 +1038,12 @@ async def _handle_event(
             workflow_name = params.get("workflow", "")
             intent_name = params.get("intent", "")
             topic = params.get("topic", "")
+            line_event_ts = str(event.get("timestamp", "")).strip()
+            selected_platforms = [
+                platform.strip()
+                for platform in params.get("selected_platforms", "").split(",")
+                if platform.strip()
+            ]
             if intent_router:
                 workflow_intent_map = {
                     "kachu_google_post": Intent.GOOGLE_POST,
@@ -914,6 +1065,8 @@ async def _handle_event(
                         trigger_payload={
                             "message": topic,
                             "triggered_by": workflow_name or intent_name,
+                            "line_event_ts": line_event_ts,
+                            "selected_platforms": selected_platforms,
                         },
                     )
             return
@@ -986,6 +1139,7 @@ async def _handle_event(
                     settings,
                     memory_manager=memory_manager,
                     context_brief_manager=context_brief_manager,
+                    post_task_review=post_task_review,
                 )
                 messages = await kb_svc.capture_knowledge_text(
                     tenant_id=pb_tenant_id,
@@ -1041,11 +1195,23 @@ async def _handle_event(
                 draft_content = json.loads(pending.draft_content or "{}")
             except json.JSONDecodeError:
                 draft_content = {}
-            if pending.workflow_type in ("kachu_photo_content", "photo_content") and run_id and not draft_content.get("image_url"):
-                draft_content["image_url"] = _build_photo_preview_url(
-                    settings.KACHU_BASE_URL,
-                    run_id,
-                )
+            if pending.workflow_type in ("kachu_photo_content", "photo_content") and run_id:
+                if not draft_content.get("approval_photo_source"):
+                    workflow_record = repo.get_workflow_record_by_run_id(run_id)
+                    trigger_payload_raw = getattr(workflow_record, "trigger_payload", None)
+                    if isinstance(trigger_payload_raw, (str, bytes, bytearray)) and trigger_payload_raw:
+                        try:
+                            trigger_payload = json.loads(trigger_payload_raw)
+                        except json.JSONDecodeError:
+                            trigger_payload = {}
+                        photo_source = str(trigger_payload.get("photo_url", "")).strip()
+                        if photo_source:
+                            draft_content["approval_photo_source"] = photo_source
+                if not draft_content.get("image_url"):
+                    draft_content["image_url"] = _build_photo_preview_url(
+                        settings.KACHU_BASE_URL,
+                        run_id,
+                    )
             _clear_pending_schedule_contexts(repo, pb_tenant_id)
             repo.save_shared_context(
                 tenant_id=pb_tenant_id,
@@ -1338,6 +1504,8 @@ async def _handle_event(
 
                     memory_manager=memory_manager,
 
+                    post_task_review=post_task_review,
+
                     settings=settings,
 
                 )
@@ -1493,6 +1661,31 @@ async def _handle_event(
             if pending_schedule_handled:
                 return
 
+            notification_origin_reply = _build_last_owner_notification_reply(
+                repo,
+                tenant_id,
+                boss_text_2,
+            )
+            if notification_origin_reply:
+                repo.save_conversation(
+                    tenant_id=tenant_id,
+                    role="owner",
+                    content=boss_text_2,
+                    conversation_type="general",
+                )
+                repo.save_conversation(
+                    tenant_id=tenant_id,
+                    role="ai",
+                    content=notification_origin_reply,
+                    conversation_type="general",
+                )
+                await push_line_messages(
+                    to=line_user_id,
+                    messages=[text_message(notification_origin_reply)],
+                    access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+                )
+                return
+
             if _should_absorb_explicit_knowledge_text(boss_text_2):
                 repo.save_conversation(
                     tenant_id=tenant_id,
@@ -1527,11 +1720,17 @@ async def _handle_event(
                 conversation_type=owner_conversation_type,
             )
 
-            if owner_conversation_type == COMMAND_CONVERSATION_TYPE and context_brief_manager is not None:
-                await context_brief_manager.refresh_briefs(
-                    tenant_id,
-                    reason="boss_command_message",
-                )
+            if owner_conversation_type == COMMAND_CONVERSATION_TYPE:
+                if post_task_review is not None:
+                    await post_task_review.after_owner_command_message(
+                        tenant_id,
+                        reason="boss_command_message",
+                    )
+                elif context_brief_manager is not None:
+                    await context_brief_manager.refresh_briefs(
+                        tenant_id,
+                        reason="boss_command_message",
+                    )
 
             if route.mode == BossRouteMode.CLARIFY:
                 repo.save_shared_context(
@@ -1575,7 +1774,7 @@ async def _handle_event(
                     conversation_type="general",
                 )
                 await push_line_messages(
-                    to=settings.LINE_BOSS_USER_ID,
+                    to=line_user_id,
                     messages=[text_message(reply_text)],
                     access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
                 )
@@ -1596,7 +1795,7 @@ async def _handle_event(
                     conversation_type=CONSULTATION_CONVERSATION_TYPE,
                 )
                 await push_line_messages(
-                    to=settings.LINE_BOSS_USER_ID,
+                    to=line_user_id,
                     messages=[reply_msg],
                     access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
                 )
@@ -1753,6 +1952,8 @@ async def _handle_edit_reply(
 
     memory_manager: MemoryManager,
 
+    post_task_review: PostTaskReviewService | None,
+
     settings: Settings,
 
 ) -> None:
@@ -1783,19 +1984,39 @@ async def _handle_edit_reply(
 
         if text.strip() not in skip_keywords:
 
-            memory_manager.store_preference(
+            if post_task_review is not None:
 
-                tenant_id=tenant_id,
+                await post_task_review.after_preference_update(
 
-                platform="ig_fb",
+                    tenant_id=tenant_id,
 
-                original_draft=edit_session.original_ig_draft,
+                    platform="ig_fb",
 
-                edited_draft=text,
+                    original_draft=edit_session.original_ig_draft,
 
-                run_id=edit_session.run_id,
+                    edited_draft=text,
 
-            )
+                    run_id=edit_session.run_id,
+
+                    refresh_reason="edit_session_feedback",
+
+                )
+
+            else:
+
+                memory_manager.store_preference(
+
+                    tenant_id=tenant_id,
+
+                    platform="ig_fb",
+
+                    original_draft=edit_session.original_ig_draft,
+
+                    edited_draft=text,
+
+                    run_id=edit_session.run_id,
+
+                )
 
             repo.update_edit_session_draft(edit_session.id, "ig_fb", text)
 
@@ -1831,19 +2052,41 @@ async def _handle_edit_reply(
 
         if text.strip() not in skip_keywords:
 
-            memory_manager.store_preference(
+            if post_task_review is not None:
 
-                tenant_id=tenant_id,
+                await post_task_review.after_preference_update(
 
-                platform="google",
+                    tenant_id=tenant_id,
 
-                original_draft=edit_session.original_google_draft,
+                    platform="google",
 
-                edited_draft=text,
+                    original_draft=edit_session.original_google_draft,
 
-                run_id=edit_session.run_id,
+                    edited_draft=text,
 
-            )
+                    run_id=edit_session.run_id,
+
+                    refresh_reason="edit_session_feedback",
+
+                    refresh_briefs=False,
+
+                )
+
+            else:
+
+                memory_manager.store_preference(
+
+                    tenant_id=tenant_id,
+
+                    platform="google",
+
+                    original_draft=edit_session.original_google_draft,
+
+                    edited_draft=text,
+
+                    run_id=edit_session.run_id,
+
+                )
 
             repo.update_edit_session_draft(edit_session.id, "google", text)
 
@@ -1873,17 +2116,19 @@ async def _handle_edit_reply(
 
             repo.complete_edit_session(edit_session.id)
 
-        memory_manager.record_episode(
+        if post_task_review is None:
 
-            tenant_id=tenant_id,
+            memory_manager.record_episode(
 
-            workflow_type="photo_content",
+                tenant_id=tenant_id,
 
-            outcome="edited",
+                workflow_type="photo_content",
 
-            context_summary={"run_id": edit_session.run_id},
+                outcome="edited",
 
-        )
+                context_summary={"run_id": edit_session.run_id},
+
+            )
 
         if settings.LINE_CHANNEL_ACCESS_TOKEN:
 
@@ -1987,19 +2232,45 @@ async def _handle_edit_reply(
 
     # 3. Store preference memory
 
-    memory_manager.store_preference(
+    if post_task_review is not None:
 
-        tenant_id=tenant_id,
+        await post_task_review.after_preference_update(
 
-        platform="ig_fb",
+            tenant_id=tenant_id,
 
-        original_draft=ig_draft,
+            platform="ig_fb",
 
-        edited_draft=new_ig,
+            original_draft=ig_draft,
 
-        run_id=edit_session.run_id,
+            edited_draft=new_ig,
 
-    )
+            run_id=edit_session.run_id,
+
+            workflow_type="photo_content",
+
+            outcome="edited",
+
+            context_summary={"run_id": edit_session.run_id},
+
+            refresh_reason="edit_feedback_regenerated",
+
+        )
+
+    else:
+
+        memory_manager.store_preference(
+
+            tenant_id=tenant_id,
+
+            platform="ig_fb",
+
+            original_draft=ig_draft,
+
+            edited_draft=new_ig,
+
+            run_id=edit_session.run_id,
+
+        )
 
 
 
@@ -2011,17 +2282,19 @@ async def _handle_edit_reply(
 
     # 5. Record episode
 
-    memory_manager.record_episode(
+    if post_task_review is None:
 
-        tenant_id=tenant_id,
+        memory_manager.record_episode(
 
-        workflow_type="photo_content",
+            tenant_id=tenant_id,
 
-        outcome="edited",
+            workflow_type="photo_content",
 
-        context_summary={"run_id": edit_session.run_id},
+            outcome="edited",
 
-    )
+            context_summary={"run_id": edit_session.run_id},
+
+        )
 
 
 

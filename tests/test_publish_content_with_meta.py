@@ -20,7 +20,6 @@ def settings() -> Settings:
     return Settings(
         LINE_CHANNEL_ACCESS_TOKEN="test-token",
         LINE_CHANNEL_SECRET="",
-        LINE_BOSS_USER_ID="U_boss",
         AGENTOS_BASE_URL="http://agentos-mock",
         KACHU_BASE_URL="http://localhost:8001",
         DATABASE_URL="sqlite://",
@@ -197,3 +196,41 @@ def test_publish_content_ig_fb_unexpected_error_is_not_swallowed(client: TestCli
                     },
                 },
             )
+
+
+def test_publish_content_sends_line_confirmation_on_publish_success(client: TestClient) -> None:
+    _connect_meta_account(client, "tenant-meta-confirm")
+    repo = client.app.state.repository
+    repo.create_tenant_membership(
+        tenant_id="tenant-meta-confirm",
+        line_user_id="U-owner-001",
+        role="owner",
+    )
+
+    with patch(
+        "kachu.meta.client.MetaClient.post_ig_photo",
+        new=AsyncMock(return_value={"creation_id": "c1", "ig_media_id": "m1"}),
+    ), patch(
+        "kachu.meta.client.MetaClient.post_fb_photo",
+        new=AsyncMock(return_value={"fb_post_id": "p1"}),
+    ), patch(
+        "kachu.tools.router.push_line_messages",
+        new=AsyncMock(),
+    ) as push_mock:
+        resp = client.post(
+            "/tools/publish-content",
+            json={
+                "tenant_id": "tenant-meta-confirm",
+                "run_id": "run-meta-confirm-001",
+                "selected_platforms": ["ig_fb"],
+                "drafts": {
+                    "ig_fb": "Photo caption",
+                    "image_url": "https://example.com/photo.jpg",
+                },
+            },
+        )
+
+    assert resp.status_code == 200
+    push_mock.assert_awaited_once()
+    assert push_mock.await_args.kwargs["to"] == "U-owner-001"
+    assert "Facebook" in push_mock.await_args.kwargs["messages"][0]["text"]

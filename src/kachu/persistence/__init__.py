@@ -1,4 +1,4 @@
-from .db import create_db_engine, init_db
+from .db import assert_schema_migrated, create_db_engine, init_db
 from .repository import KachuRepository
 from .tables import (
     ApprovalTaskTable,
@@ -16,6 +16,8 @@ from .tables import (
     ScheduledPublishTable,
     TenantLlmBudgetTable,
     TenantAutomationSettingsTable,
+    TenantFeatureFlagTable,
+    TenantMembershipTable,
     TenantTable,
     WorkflowRunTable,
     # Backward-compat aliases
@@ -25,6 +27,7 @@ from .tables import (
 
 __all__ = [
     "create_db_engine",
+    "assert_schema_migrated",
     "init_db",
     "KachuRepository",
     "ApprovalTaskTable",
@@ -42,6 +45,8 @@ __all__ = [
     "ScheduledPublishTable",
     "TenantLlmBudgetTable",
     "TenantAutomationSettingsTable",
+    "TenantFeatureFlagTable",
+    "TenantMembershipTable",
     "TenantTable",
     "WorkflowRunTable",
     # Backward-compat aliases

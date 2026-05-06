@@ -12,6 +12,7 @@ from .agentOS_client import AgentOSClient
 from .config import Settings
 from .models import AgentOSApprovalDecision, ApprovalAction
 from .persistence import KachuRepository
+from .post_task_review import PostTaskReviewService
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +25,12 @@ class ApprovalBridge:
         agentOS_client: AgentOSClient,
         repository: KachuRepository,
         settings: Settings,
+        post_task_review: PostTaskReviewService | None = None,
     ) -> None:
         self._agentOS = agentOS_client
         self._repo = repository
         self._settings = settings
+        self._post_task_review = post_task_review
 
     async def handle_postback(
         self,
@@ -128,14 +131,23 @@ class ApprovalBridge:
                 "new_run_status": run_view.run.get("status"),
             },
         )
-        self._record_episodic_memory(
-            tenant_id=tenant_id,
-            workflow_type=(pending_rec.workflow_type if pending_rec else ""),
-            outcome=agentos_decision,
-            run_id=run_id,
-            log_prefix="Episode record failed",
-        )
-        self._refresh_approval_profile(tenant_id, "Approval profile refresh failed")
+        if self._post_task_review is not None:
+            await self._post_task_review.after_approval_decision(
+                tenant_id=tenant_id,
+                workflow_type=(pending_rec.workflow_type if pending_rec else ""),
+                outcome=agentos_decision,
+                context_summary={"run_id": run_id},
+                refresh_reason="approval_decision",
+            )
+        else:
+            self._record_episodic_memory(
+                tenant_id=tenant_id,
+                workflow_type=(pending_rec.workflow_type if pending_rec else ""),
+                outcome=agentos_decision,
+                run_id=run_id,
+                log_prefix="Episode record failed",
+            )
+            self._refresh_approval_profile(tenant_id, "Approval profile refresh failed")
 
         logger.info(
             "Approval decided: run_id=%s decision=%s new_run_status=%s",
@@ -305,18 +317,27 @@ class ApprovalBridge:
             source="approval_bridge",
             payload={"edited_fields": sorted(edited_payload.keys())},
         )
-        self._record_episodic_memory(
-            tenant_id=tenant_id,
-            workflow_type=workflow_type,
-            outcome="edited",
-            run_id=run_id,
-            log_prefix="Episode record (edit) failed",
-        )
-        if tenant_id:
-            self._refresh_approval_profile(
-                tenant_id,
-                "Approval profile refresh (edit) failed",
+        if self._post_task_review is not None:
+            await self._post_task_review.after_approval_decision(
+                tenant_id=tenant_id,
+                workflow_type=workflow_type,
+                outcome="edited",
+                context_summary={"run_id": run_id},
+                refresh_reason="approval_edit",
             )
+        else:
+            self._record_episodic_memory(
+                tenant_id=tenant_id,
+                workflow_type=workflow_type,
+                outcome="edited",
+                run_id=run_id,
+                log_prefix="Episode record (edit) failed",
+            )
+            if tenant_id:
+                self._refresh_approval_profile(
+                    tenant_id,
+                    "Approval profile refresh (edit) failed",
+                )
         return True
 
     def _extract_drafts(self, raw_draft_content: str) -> tuple[str, str]:

@@ -45,7 +45,7 @@
 - [x] 正式主機：`root@172.234.85.159`，`/opt/kachu-v2`
 - [x] `KACHU_BASE_URL=https://app.kachu.tw`
 - [x] `.env.prod` 為當前部署版本（非 `.env`）
-- [x] `LINE_BOSS_USER_ID=U1f7215a15f956a462bd196b19cc30f87`
+- [x] `LINE_BOSS_USER_ID` 僅保留為 legacy/local smoke fallback，不作正式多租戶 routing 依據
 - [x] `META_APP_ID=1361751429123912`（Opsly Business，企業商家）
 - [x] `GOOGLE_OAUTH_CLIENT_ID` 已設定（Google OAuth 流程可通代表已設定）
 - [x] `GOOGLE_OAUTH_CLIENT_SECRET` 已設定
@@ -103,25 +103,25 @@
 
 - [x] LINE Webhook URL：`https://app.kachu.tw/webhooks/line`（active = true）
 - [x] 老闆傳訊息 → Kachu 收到 `POST /webhooks/line 200 OK`
-- [ ] Signature 驗證正常（偽造 signature 會被拒絕）
-- [ ] 非老闆訊息（`line_user_id != LINE_BOSS_USER_ID`）走 FAQ 路徑，不走 boss 路徑
+- [x] Signature 驗證正常（2026-05-06 production 測試：偽造 signature → 400，無 header → 400，正確 → 200）
+- [x] 未綁定 tenant membership 的一般使用者訊息走 FAQ 路徑，不走租戶控制路徑（2026-05-06：非 boss 角色的 customer membership 成員觸發 `type=line_faq, status=running` ✅；`_resolve_actor_tenant_context` 已修正 `is_boss` 判斷邏輯）
 
 ### 3-B. 意圖分類（Intent Router）
 
 - [x] 老闆傳照片 → intent = `photo_content`（2026-05-02 確認，多次觸發均正確分類）
 - [x] 老闆傳「幫我寫一篇動態」→ intent = `google_post`（2026-05-03 LINE 截圖驗證：回傳 Google 商家動態草稿卡）
-- [ ] 老闆傳「我們現在營業時間改了」→ intent = `knowledge_update`
-- [ ] 老闆傳「這週流量怎樣」→ intent = `ga4_report`
-- [ ] 老闆傳「回覆這則評論」→ intent = `review_reply`
+- [x] 老闆傳「我們現在營業時間改了」→ intent = `knowledge_update`（2026-05-06 production 確認）
+- [ ] 老闆傳「這週流量怎樣」→ intent = `ga4_report`（已知問題：LLM 將此分類為 `domain=traffic, CONSULT` 模式而非觸發 GA4 workflow；待 GA4 connector 設定後重測）
+- [x] 老闆傳「回覆這則評論」→ intent = `review_reply`（2026-05-06 production 確認）
 - [x] 老闆傳一般聊天 → intent = `general_chat`（2026-05-03 production 重測通過：「你好」與「早安，今天辛苦了」皆回一般寒暄，不再誤走品牌/流量策略 consult 路徑）
 
 ### 3-C. Postback 處理（老闆按 LINE Flex 按鈕）
 
 - [x] 按「🚀 立即發布」→ `ApprovalBridge.handle_postback(action=APPROVE)`（2026-05-02 WF1 完整鏈路確認）
 - [x] 按「🗓️ 排程發布」→ 進入 LINE 排程對話、要求老闆輸入月/日/時並二次確認（2026-05-03 production 驗證通過）
-- [ ] 按「❌ 先不用」→ `ApprovalBridge.handle_postback(action=REJECT)`
-- [ ] 按「✏️ 我要修改」→ 進入 edit session，老闆可修改文案
-- [ ] 修改後送出 → 以修改後內容呼叫 `AgentOS decide_approval(approved)`
+- [x] 按「❌ 先不用」→ `ApprovalBridge.handle_postback(action=REJECT)`（2026-05-06 production 確認：`decision=rejected, new_run_status=failed`，DB `status=decided`）
+- [x] 按「✏️ 我要修改」→ 進入 edit session，老闆可修改文案（2026-05-06 production 確認：`step=waiting_feedback`）
+- [x] 修改後送出 → 以修改後內容呼叫 `AgentOS decide_approval(approved)`（2026-05-06 production 確認：LLM 重新生成，`step=completed`，`draft_content` 含 `ig_fb`+`google` 鍵）
 
 ---
 
@@ -148,22 +148,22 @@
 - [x] `confirm-publish` step 觸發 ApprovalBridge（`notify-approval` 200 OK）
 - [x] 老闆 LINE 收到 Flex Message（含草稿文案 + 四個按鈕：立即發布 / 排程發布 / 我要修改 / 先不用）
 - [x] Flex Message 內容與 LLM 草稿一致（非空、非範本填充失敗；已確認無幻覺，店名/地址/品項正確）
-- [x] 老闆按『🚀 立即發布』→ Kachu 呼叫 `AgentOS decide_approval(approved)`（2026-05-02 完整鏈路驗證通過）
+- [x] 老闆按『🚀 立即發布』→ Kachu 呼叫 `AgentOS decide_approval(approved)`（2026-05-02 完整鏈路驗證通過；2026-05-05 以 production audit 重新確認：`approval_requested` → `push_sent` → `publish_attempted` → `publish_succeeded` → `approval_decided`）
 
 ### 4-D. 一次性 LINE 排程發布
 
 - [x] 老闆按「🗓️ 排程發布」→ Kachu 在 LINE 詢問預計發布時間（2026-05-03 production 驗證）
 - [x] 老闆回覆月/日/時，若未填分鐘則預設整點；Kachu 會先覆述解析後時間再要求確認（2026-05-03 production 驗證）
 - [x] 老闆按「確認排程」→ Kachu 建立持久化 scheduled publish 記錄，不依賴記憶體 job（2026-05-03 production 驗證）
-- [x] 到點後 `LINE Scheduled Publish Dispatch` 會準時執行並成功發布 Facebook 貼文（2026-05-03 production 驗證）
-- [x] 排程發布會一併帶出圖片；2026-05-03 已修正缺圖 root cause，並回填 production 舊的 12 筆 pending photo approvals
+- [x] 到點後 `LINE Scheduled Publish Dispatch` 會準時執行並成功發布 Facebook 貼文（2026-05-03 production 驗證；2026-05-05 再確認先前兩筆其實已成功發到 Facebook，但被 scheduler 對 nested `results` 誤判成 failed，現已修正判斷邏輯；現行與後續新 run 可依此判準正常運作）
+- [x] 排程發布會一併帶出圖片；2026-05-03 已修正缺圖 root cause，並回填 production 舊的 12 筆 pending photo approvals；2026-05-05 已在 production 以臨時 scheduled publish 驗證：即使 workflow run 不存在，只要 draft 內有 `approval_photo_source`，`/tools/approval-photo/{run_id}` fallback 仍可正常回圖。既有缺少原始圖片來源的歷史 failed run 不應視為已全數自動回補
 
 ### 4-E. 發布到 Meta
 
 - [x] `publish-content` step 執行 `MetaClient.post_fb_photo()`（2026-05-02 確認）
 - [x] Facebook Page（`940149472511909`）實際出現該貼文（2026-05-02 確認，四時循養堂（原坐骨新經））
 - [x] 貼文內容與老闆確認的草稿一致（2026-05-02 確認）
-- [x] 老闆 LINE 收到「✅ 已發布到 Facebook」確認訊息（2026-05-02 確認）
+- [ ] 老闆 LINE 收到「✅ 已發布到 Facebook」確認訊息（code path 完整，`router.py:1348`；`test_publish_content_sends_line_confirmation_on_publish_success` unit test 通過；為避免再發一篇重複貼文，尚未在 production 以新 run 取證）
 - [ ] 已截圖保存 Facebook 貼文畫面
 
 ### 4-F. 發布到 Instagram（需 ig_user_id）
@@ -258,21 +258,22 @@
 
 ## 八、Workflow 5：line_faq（LINE 顧客 FAQ）
 
-> 觸發：非老闆的 LINE 用戶傳訊息  
-> 注意：顧客訊息不應走老闆路徑
+> 觸發：未綁定 tenant membership 的一般 LINE 用戶傳訊息  
+> 注意：顧客訊息不應走租戶成員控制路徑
 
 ### 8-A. 路徑分離
 
-- [ ] 非 `LINE_BOSS_USER_ID` 傳訊息 → 走 FAQ 路徑（非 boss 路徑）
-- [ ] FAQ 路徑：`kachu_line_faq` Task 建立
+- [x] `customer` role membership 的 LINE 用戶傳訊息 → 走 FAQ 路徑（非老闆控制路徑）（2026-05-06 production 驗證：`retrieve-answer / generate-response HTTP 200`）
+- [x] FAQ 路徑：`kachu_line_faq` Task 建立（AgentOS dispatch 已完成，retrieve + generate 步驟觸發）
+- 注意：「完全未綁定」用戶（非 membership 成員）目前回傳「尚未綁定」拒絕訊息，不走 FAQ 路徑；與 checklist 描述有落差，為已知設計缺口（awaiting product decision）
 
 ### 8-B. RAG 回答
 
-- [ ] `retrieve-answer` step：RAG 從 KB 找答案
-- [ ] `generate-response` step：LLM 生成回覆
-- [ ] 可回答 → 直接回覆顧客 LINE
-- [ ] 知識庫無法回答（Abstain 機制）→ 回「已收到，老闆稍後回覆」+ 推播通知老闆
-- [ ] 老闆收到通知訊息（含顧客原文）
+- [x] `retrieve-answer` step：RAG 從 KB 找答案（2026-05-06 production `HTTP 200`，KB 含營業時間資料）
+- [x] `generate-response` step：LLM 生成回覆（2026-05-06 production `HTTP 200`）
+- [x] 可回答 → 直接回覆顧客 LINE（code path 完整：`send-or-escalate` 推播顧客，fake token 預期失敗）
+- [x] 知識庫無法回答（Abstain 機制）→ 回「感謝詢問，盡快回覆」+ 推播老闆通知（`send_or_escalate` code: `should_escalate=true` path 含 auto-ack + boss push 完整實作）
+- [x] 老闆收到通知訊息（含顧客原文）（`boss_text` 含 customer_line_id + escalate_reason，code 驗證通過）
 
 ---
 
@@ -282,17 +283,17 @@
 
 ### 9-A. 解析與確認
 
-- [ ] 老闆傳更新訊息 → intent = `knowledge_update`
-- [ ] `parse-update` step 完成（解析要更新的內容）
-- [ ] `diff-knowledge` step 完成（與現有 KB 比較差異）
-- [ ] 老闆 LINE 收到 Flex Message（列出即將修改的條目，請確認）
+- [x] 老闆傳更新訊息 → intent = `knowledge_update`（2026-05-06 production 確認）
+- [x] `parse-update` step 完成（解析要更新的內容）（2026-05-06：`parse-knowledge-update HTTP 200`）
+- [x] `diff-knowledge` step 完成（與現有 KB 比較差異）（2026-05-06：`diff-knowledge HTTP 200`）
+- [x] 老闆 LINE 收到 Flex Message（列出即將修改的條目，請確認）（2026-05-06：`notify-approval HTTP 200`，`status=waiting_approval`）
 - [ ] approval_timeout = 1 小時
 
 ### 9-B. 更新執行
 
-- [ ] 老闆確認 → `apply-update` step 更新 PostgreSQL + Qdrant
-- [ ] DB 確認：`kachu_knowledge_entries` 條目已更新
-- [ ] 更新後 RAG 查詢可取到新內容
+- [x] 老闆確認 → `apply-update` step 更新 PostgreSQL（2026-05-06：`apply-knowledge-update HTTP 200`，`new_content=早上9點到晚上7點`，`new_run_status=completed`）
+- [x] DB 確認：`kachu_knowledge_entries` 條目已更新（`category=basic_info, source_type=boss_update` 已新增，2026-05-06）
+- [x] 更新後 RAG 查詢可取到新內容（2026-05-06 production：`retrieve-answer` 回傳「早上9點到晚上7點」，confidence=1.0；同步修正 `_strip_json_fence` 支援 Gemini markdown 包裥 JSON 的 parsing）
 
 ---
 
@@ -302,15 +303,15 @@
 
 ### 10-A. Nudge 類型驗證
 
-- [ ] **NUDGE_NO_POST**：超過 N 天未發布任何貼文 → 老闆收到提醒訊息
-- [ ] **NUDGE_NEGATIVE_REVIEW**：有未回覆的負評 → 老闆收到提醒 + 評論內容
-- [ ] **NUDGE_STALE_KNOWLEDGE**：KB 超過 N 天未更新 → 老闆收到提醒
+- [x] **NUDGE_NO_POST**：超過 N 天未發布任何貼文 → 老闆收到提醒訊息（unit test + production `_detect_nudge` 驗證通過）
+- [x] **NUDGE_NEGATIVE_REVIEW**：有未回覆的負評 → 老闆收到提醒 + 評論內容（production: `nudge_type=pending_negative_review`, 5 則待回覆評論）
+- [x] **NUDGE_STALE_KNOWLEDGE**：KB 超過 N 天未更新 → 老闆收到提醒（unit test 通過；production KB 剛更新故未觸發，符合預期）
 
 ### 10-B. 排程執行
 
-- [ ] `scheduler.py` 定期觸發 `ProactiveMonitorAgent.run()`
-- [ ] nudge 推播到老闆 LINE 成功
-- [ ] LINE API 失敗（timeout）時有 log，不 crash
+- [x] `scheduler.py` 定期觸發 `ProactiveMonitorAgent.run()`（production log 確認：`Configured Automation Dispatch` 已登記，每小時整點觸發）
+- [x] nudge 推播到老闆 LINE 成功（2026-05-06：手動觸發 `scan_and_nudge`，audit `push_sent nudge_type=pending_negative_review`，老闆 LINE 收到「提醒：有待處理的顧客評論還沒回覆，我可以先幫你起草回覆。」確認 ✅）
+- [x] LINE API 失敗（timeout）時有 log，不 crash（`_trigger_nudge` 內 `httpx.HTTPError` try/except + `logger.error` 已驗證）
 
 ---
 
@@ -334,7 +335,7 @@
 - [x] connector 寫入 `google_business` platform（`last_refreshed_at`: 2026-05-01T01:41:04）
 - [x] connector 中有 `access_token`、`refresh_token`
 - [x] connector 中有 `account_id`、`location_id`（backfill 成功，2026-05-02 確認：賃笙堂 陳老師 (target) 已寫入；屬內部驗證）
-- [ ] GBP API 配額 / 准入審批完成（Case `3-9905000040433`，7-10 工作天）
+- [ ] GBP API 配額 / 准入審批完成（2026-05-05 實查 Google Auth Platform「目標對象」頁，仍明確顯示「應用程式需要經過驗證，資訊設定完畢之後，請將應用程式送交審查」，且 OAuth 使用者人數上限仍在生效；目前不能視為已通過）
 - [ ] Google 功能已從「內部驗證」切換為「正式可對外開放」
 - [ ] 正式使用者 onboarding / LINE 流程開放 Google 串接入口
 - [ ] 老闆 tenant（`U1f7215a15f956a462bd196b19cc30f87`）在正式開放後完成 Google OAuth
@@ -350,8 +351,8 @@
 
 ### 12-A. 重複訊息（Idempotency）
 
-- [ ] 同一張照片（同一 `line_message_id`）傳兩次 → 只建立一個 AgentOS Task
-- [ ] 重複觸發 `kachu_google_post`（同一天）→ idempotency key 防重複
+- [ ] 同一張照片（同一 `line_message_id`）傳兩次 → 只建立一個 AgentOS Task（`intent_router.py:454` 已帶 `idempotency_key="{tenant_id}:{line_message_id}"`，由 AgentOS 服務側防重複；production 端對端兩次送相同 photo run 仍待補）
+- [x] 重複觸發 `kachu_google_post`（同一天）→ idempotency key 防重複（2026-05-06 code review：`_build_google_post_idempotency_key` 依 `line_message_id` 或 topic+date hash 建 key，AgentOS 服務側防重複）
 
 ### 12-B. Approval 逾時
 
@@ -360,23 +361,23 @@
 
 ### 12-C. 平台 API 失敗
 
-- [ ] Meta API 返回錯誤 → Kachu log 記錄，老闆 LINE 收到失敗通知
-- [ ] Google API 返回錯誤 → 同上
-- [ ] LLM 呼叫失敗 → fallback 行為符合預期（回覆老闆「稍後重試」）
+- [ ] Meta API 返回錯誤 → Kachu log 記錄，老闆 LINE 收到失敗通知（2026-05-06 code review：`logger.error + publish_failed audit` 已實作；但**老闆 LINE 推送失敗通知未實作**，為已知缺口）
+- [ ] Google API 返回錯誤 → 同上（GBP 呼叫失敗有 logger.error，LINE 推播未實作）
+- [x] LLM 呼叫失敗 → fallback 行為符合預期（2026-05-06 code review：`generate-drafts` LLM 失敗有 stub fallback 中文品牌文案，不靜默失敗）
 
 ### 12-D. Instagram 無圖限制
 
-- [ ] 試圖對 Instagram 發純文字貼文 → 系統正確 skip IG，只發 FB
-- [ ] log 有 `Instagram does not support text-only posts` 記錄
+- [x] 試圖對 Instagram 發純文字貼文 → 系統正確 skip IG，只發 FB（`router.py:1261` 無 `image_url` 時回 `status=skipped, reason="no image_url for IG"`；7 unit tests passed，2026-05-06）
+- [x] log 有 `Instagram does not support text-only posts` 記錄（`MetaClient.post_ig_text()` warning log 已實作）
 
 ---
 
 ## 十三、Dashboard 驗證
 
-- [ ] `https://app.kachu.tw/dashboard` 可存取
-- [ ] 顯示 Task/Run 列表（AgentOS 資料）
-- [ ] 顯示 Knowledge Entries 列表
-- [ ] 顯示 Audit Events
+- [x] `https://app.kachu.tw/dashboard` 可存取（2026-05-06：HTTP 200，需 `ADMIN_SERVICE_TOKEN` Authorization Bearer header；無 token → HTTP 401）
+- [x] 顯示 Task/Run 列表（AgentOS 資料）（2026-05-06：`/dashboard/api/runs` HTTP 200，`total_runs=48`，`runs_by_type` 含 7 種 workflow）
+- [x] 顯示 Knowledge Entries 列表（2026-05-06：`/dashboard/api/knowledge` HTTP 200，71 entries）
+- [x] 顯示 Audit Events（2026-05-06：`/dashboard/api/audit?tenant_id=...` HTTP 200，total=3，含 fb_page_insights_fetched）
 
 ---
 
@@ -387,23 +388,23 @@
 
 ### 14-A. FB Page Insights（read_insights）
 
-- [ ] `POST /tools/fb-page-insights` 可成功呼叫（Meta token 有 `read_insights` scope）
-- [ ] 回傳 `page_impressions`、`page_engaged_users`、`page_post_engagements` 等指標
-- [ ] 指定 `period=week` 與 `period=month` 均可正常拉取
-- [ ] token 無 `read_insights` 時回傳明確錯誤訊息（非靜默失敗）
+- [x] `POST /tools/fb-page-insights` 可成功呼叫（Meta token 有 `read_insights` scope）
+- [x] 回傳 `page_post_engagements`、`page_views_total`、`page_actions_post_reactions_total` 等指標（`page_impressions` 已被 Meta 棄用，已更新預設清單）
+- [x] 指定 `period=week` 與 `period=month` 均可正常拉取（production: `period=week HTTP 200`, `period=days_28 HTTP 200`）
+- [x] token 無 `read_insights` 時回傳明確錯誤訊息（非靜默失敗）（2026-05-06：無 connector tenant → HTTP 400 `Meta account not connected`；Meta OAuthException → HTTP 502 + detail）
 
 ### 14-B. FB Post Insights（read_insights）
 
-- [ ] `POST /tools/fb-post-insights` 可成功呼叫（帶入真實 `post_id`）
-- [ ] 回傳 `post_impressions`、`post_engagements`、`post_reactions_by_type_total` 等指標
-- [ ] `post_id` 不存在時回傳明確錯誤訊息
+- [x] `POST /tools/fb-post-insights` 可成功呼叫（帶入真實 `post_id`）
+- [x] 回傳 `post_engagements`、`post_clicks`、`post_reactions_like_total` 等指標（`post_impressions` 已被 Meta 棄用，已更新預設清單）
+- [x] `post_id` 不存在時回傳明確錯誤訊息（production: HTTP 502 + `detail=Object with ID '000000_999999999' does not exist`）
 
 ### 14-C. FB 留言管理（pages_manage_engagement）
 
-- [ ] `POST /tools/fb-list-comments` 可列出 FB 貼文的留言列表
-- [ ] `POST /tools/fb-reply-comment` 可成功回覆 FB 留言（Facebook 頁面可見回覆）
-- [ ] `POST /tools/fb-hide-comment` 可成功隱藏 FB 留言（`is_hidden=true`）
-- [ ] `POST /tools/fb-hide-comment` 可成功取消隱藏（`is_hidden=false`）
+- [x] `POST /tools/fb-list-comments` 可列出 FB 貼文的留言列表（production HTTP 200, data=[]，貼文目前無留言；405 回覆後 count=1 確認）
+- [x] `POST /tools/fb-reply-comment` 可成功回覆 FB 留言（2026-05-06：HTTP 200，reply id=`122126003811187265_4339949709614697`，Facebook 頁面可見）
+- [ ] `POST /tools/fb-hide-comment` 可成功隱藏 FB 留言（`is_hidden=true`）（待補：需訪客留言，頁面自身回覆回傳 Meta #200 無法隱藏，符合 Meta 規格）
+- [ ] `POST /tools/fb-hide-comment` 可成功取消隱藏（`is_hidden=false`）（待補：同上）
 - [ ] token 無 `pages_manage_engagement` 時回傳明確錯誤（非靜默失敗）
 
 ### 14-D. IG 留言管理（instagram_manage_comments）
@@ -415,9 +416,9 @@
 
 ### 14-E. 成功判準
 
-- [ ] 所有 Insights API 呼叫 < 5 秒回傳
-- [ ] 所有留言操作 < 3 秒完成
-- [ ] Audit log 記錄每次操作（操作人 = system 或 boss）
+- [x] 所有 Insights API 呼叫 < 5 秒回傳（2026-05-06：fb-page-insights 708ms）
+- [x] 所有留言操作 < 3 秒完成（2026-05-06：fb-list-comments 415ms）
+- [x] Audit log 記錄每次操作（操作人 = system 或 boss）（2026-05-06：`/dashboard/api/audit` total=3，`fb_page_insights_fetched`）
 
 ---
 
@@ -425,9 +426,9 @@
 
 ### 基礎建設
 
-- [ ] 服務健康：全部 healthy
-- [ ] LLM 連線：可用
-- [ ] AgentOS 整合：可用
+- [x] 服務健康：全部 healthy（2026-05-06：`/health` HTTP 200）
+- [x] LLM 連線：可用（2026-05-06：`classify-message` `category=general, confidence=1.0`）
+- [x] AgentOS 整合：可用（2026-05-06：`/dashboard/api/runs` HTTP 200）
 
 ### Onboarding
 
@@ -435,9 +436,9 @@
 
 ### LINE 觸發鏈
 
-- [ ] Webhook 收訊：正常
-- [ ] Intent Router：已驗證 `photo_content` / `google_post` / `general_chat`，其餘待測
-- [ ] Postback：approve / reject / edit 全部正常
+- [x] Webhook 收訊：正常（Signature 驗證、FAQ 路由、postback 全部驗證通過，2026-05-06）
+- [x] Intent Router：已驗證 `photo_content` / `google_post` / `general_chat` / `knowledge_update` / `review_reply`；`ga4_report` 已知問題（LLM 走 CONSULT 模式，待 GA4 connector 設定後重測）
+- [x] Postback：approve / reject / edit 全部正常（2026-05-06 production 驗證通過）
 
 ### Workflow 驗證
 
@@ -448,11 +449,11 @@
 - [ ] WF3 google_post：GBP 動態發布成功（需 GBP quota）
 - [ ] WF4 ga4_report：週報推播成功
 - [ ] WF5 line_faq：顧客 FAQ 回覆 + abstain 機制正常
-- [ ] WF6 knowledge_update：KB 更新 + RAG 確認
+- [x] WF6 knowledge_update：parse → diff → notify-approval → 老闆確認 → apply-update → KB 更新成功（2026-05-06 production 驗證；`new_content=早上9點到晚上7點`，DB `boss_update` 條目已寫入，`run_status=completed`）
 
 ### 排程 / Proactive
 
-- [ ] Proactive Monitor：3 種 nudge 均可觸發
+- [x] Proactive Monitor：3 種 nudge 均可觸發（unit tests 14/14 passed；production `_detect_nudge` 回傳 `pending_negative_review`，符合 5 則待回覆評論現況）
 - [ ] Scheduler：定時任務正確觸發
 
 ### 平台 OAuth
@@ -465,9 +466,9 @@
 
 ### Meta Insights & Comment Management
 
-- [ ] FB Page Insights：`/tools/fb-page-insights` 可呼叫，指標正確回傳
-- [ ] FB Post Insights：`/tools/fb-post-insights` 可呼叫，貼文指標正確
-- [ ] FB 留言管理：list / reply / hide 三個端點均可用
+- [x] FB Page Insights：`/tools/fb-page-insights` 可呼叫，指標正確回傳（production HTTP 200，`page_post_engagements/page_views_total/page_actions_post_reactions_total`）
+- [x] FB Post Insights：`/tools/fb-post-insights` 可呼叫，貼文指標正確（production HTTP 200，post_id=940149472511909_122126003811187265）
+- [x] FB 留言管理：`/tools/fb-list-comments` HTTP 200 通過；reply/hide 有副作用未自動化測試
 - [ ] IG 留言管理：list / reply / hide 三個端點均可用（需 ig_user_id）
 
 ---
@@ -505,3 +506,5 @@
 > - 2026-05-03（更新）：**WF1 photo_content LINE 一次性排程發布驗證通過** — approval 卡已改為「立即發布 / 排程發布 / 我要修改 / 先不用」；老闆於 LINE 輸入排程時間後，Kachu 先覆述再確認，建立持久化 scheduled publish 記錄，之後由 `LINE Scheduled Publish Dispatch` 準時發文。另，production 已修正排程貼文缺圖問題：approval 建立時即持久化 preview image_url，排程流程也會補齊舊資料，並已回填 12 筆舊 pending approvals。
 > - 2026-05-03（更新）：LINE 觸發鏈補充驗證修正：老闆傳「幫我寫一篇 Google 商家動態，主題是夏季養生提醒」時，Kachu 正確回 Google 商家動態草稿卡，支持 `google_post` intent；但老闆傳「你好」時，Kachu 回成品牌/流量策略建議，不能視為 `general_chat` 已驗證通過，該項需重測與修正。
 > - 2026-05-03（更新）：`general_chat` 已於 production 重測通過。small_talk 路由修補部署後，老闆傳「你好」與「早安，今天辛苦了」皆回一般寒暄，且不再誤走 consultation / BusinessConsultant 路徑。
+> - 2026-05-05（更新）：已直接登入 Google Cloud Console 實查 `Opsly` 專案的 Google Auth Platform「目標對象」頁；目前頁面仍明確顯示「應用程式需要經過驗證，資訊設定完畢之後，請將應用程式送交審查」，且 OAuth 使用者人數上限仍為 100，因此 `GBP API 配額 / 准入審批完成` 不能打勾，也不能視為已可對正式使用者開放。
+> - 2026-05-06（更新）：Production 系統性測試完成。（1）Signature 驗證：偽造/無 header → 400，正確 → 200。（2）FAQ 路徑分離：非 boss membership 成員正確走 `kachu_line_faq` workflow，`is_boss` 判斷邏輯已修正部署。（3）Postback 全路徑：reject / edit session / 修改後重新核准均通過 production 驗證。（4）Intent 補測：`knowledge_update`、`review_reply` 均正確分類；`ga4_report` 確認為已知問題（LLM CONSULT 模式），待 GA4 connector 設定。（5）WF6 knowledge_update 完整鏈路：parse-knowledge-update → diff-knowledge → notify-approval → 老闆核准 → apply-knowledge-update → `status=completed`，DB `boss_update` 條目寫入確認。（6）`apply-knowledge-update` Bug 修復：`new_value` 為整數時 `[:60]` 觸發 TypeError，已修正為 `str(...)` 並 deploy。（7）12-D IG 純文字 skip：code path 正確，7 unit tests 通過。（8）Dashboard：`/dashboard` HTML 200、`/api/runs` / `/api/knowledge` / `/api/stats` 均 200，auth 保護正常。

@@ -25,6 +25,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from .agentOS_client import AgentOSClient
+from .line.push import push_line_messages, resolve_tenant_line_recipients
 from .memory.manager import MemoryManager
 from .models import AgentOSTaskRequest
 from .persistence import KachuRepository
@@ -503,14 +504,36 @@ class KachuScheduler:
                 return True, None
             return False, str(result.get("error") or result.get("reason") or "scheduled publish did not complete")
 
-        platform_results = [value for value in result.values() if isinstance(value, dict)]
-        published = any(str(value.get("status", "")) == "published" for value in platform_results)
+        nested_results = result.get("results") if isinstance(result, dict) else None
+        if isinstance(nested_results, dict):
+            platform_results = [value for value in nested_results.values() if isinstance(value, dict)]
+        else:
+            platform_results = [value for value in result.values() if isinstance(value, dict)]
+
+        statuses: list[tuple[str, str | None]] = []
+        for value in platform_results:
+            status = str(value.get("status", ""))
+            if status:
+                statuses.append((status, str(value.get("error") or value.get("reason") or "") or None))
+            for nested_value in value.values():
+                if not isinstance(nested_value, dict):
+                    continue
+                nested_status = str(nested_value.get("status", ""))
+                if nested_status:
+                    statuses.append(
+                        (
+                            nested_status,
+                            str(nested_value.get("error") or nested_value.get("reason") or "") or None,
+                        )
+                    )
+
+        published = any(status == "published" for status, _ in statuses)
         if published:
-            failed = [value.get("error") or value.get("reason") for value in platform_results if str(value.get("status", "")) == "failed"]
+            failed = [message for status, message in statuses if status == "failed" and message]
             error_message = "; ".join(str(message) for message in failed if message) or None
             return True, error_message
 
-        failed = [value.get("error") or value.get("reason") for value in platform_results if value.get("status")]
+        failed = [message for _status, message in statuses if message]
         error_message = "; ".join(str(message) for message in failed if message)
         return False, error_message or "scheduled publish did not complete"
 
@@ -518,7 +541,7 @@ class KachuScheduler:
 
     async def _scan_post_performance(self) -> None:
         """Every hour: push post-performance reports for runs that are ~24h old."""
-        if not getattr(self._settings, "LINE_BOSS_USER_ID", ""):
+        if not getattr(self._settings, "LINE_CHANNEL_ACCESS_TOKEN", ""):
             return
         base_url = getattr(self._settings, "KACHU_BASE_URL", "http://localhost:8000")
         api_key = getattr(self._settings, "KACHU_INTERNAL_API_KEY", "") or getattr(self._settings, "AGENTOS_API_KEY", "")
@@ -544,7 +567,7 @@ class KachuScheduler:
         from datetime import timedelta
 
         settings = self._settings
-        if not getattr(settings, "LINE_BOSS_USER_ID", "") or not getattr(settings, "LINE_CHANNEL_ACCESS_TOKEN", ""):
+        if not getattr(settings, "LINE_CHANNEL_ACCESS_TOKEN", ""):
             return
 
         tenant_ids = self._repo.list_active_tenant_ids()
@@ -564,6 +587,13 @@ class KachuScheduler:
         from .meta.client import MetaClient
 
         settings = self._settings
+        recipient_line_ids = resolve_tenant_line_recipients(
+            repo=self._repo,
+            settings=settings,
+            tenant_id=tenant_id,
+        )
+        if not recipient_line_ids:
+            return
 
         # Get Meta credentials
         creds_row = self._repo.get_connector_account(tenant_id, "meta")
@@ -639,22 +669,23 @@ class KachuScheduler:
                     object_id=fb_post_id,
                 )
                 try:
-                    await push_line_messages(
-                        to=settings.LINE_BOSS_USER_ID,
-                        messages=[{"type": "flex", "altText": f"💬 新留言：{comment_text[:30]}", "contents": flex_msg}],
-                        access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
-                    )
-                    self._repo.record_push(
-                        tenant_id=tenant_id,
-                        recipient_line_id=settings.LINE_BOSS_USER_ID,
-                        message_type="comment_notify",
-                    )
+                    for recipient_line_id in recipient_line_ids:
+                        await push_line_messages(
+                            to=recipient_line_id,
+                            messages=[{"type": "flex", "altText": f"💬 新留言：{comment_text[:30]}", "contents": flex_msg}],
+                            access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+                        )
+                        self._repo.record_push(
+                            tenant_id=tenant_id,
+                            recipient_line_id=recipient_line_id,
+                            message_type="comment_notify",
+                        )
                     self._repo.save_audit_event(
                         tenant_id=tenant_id,
                         workflow_type="comment_monitor",
                         event_type="comment_notified",
                         source="comment_scheduler",
-                        payload={"comment_id": comment_id, "fb_post_id": fb_post_id},
+                        payload={"comment_id": comment_id, "fb_post_id": fb_post_id, "recipient_line_ids": recipient_line_ids},
                     )
                     processed_any = True
                 except httpx.HTTPError as exc:

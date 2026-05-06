@@ -13,7 +13,6 @@ def client() -> TestClient:
         Settings(
             LINE_CHANNEL_ACCESS_TOKEN="",
             LINE_CHANNEL_SECRET="",
-            LINE_BOSS_USER_ID="U_boss_phase6",
             AGENTOS_BASE_URL="http://agentos-mock",
             KACHU_BASE_URL="http://localhost:8001",
             DATABASE_URL="sqlite://",

@@ -29,11 +29,13 @@ class KnowledgeCaptureService:
         settings,
         memory_manager=None,
         context_brief_manager=None,
+        post_task_review=None,
     ) -> None:
         self._repo = repo
         self._settings = settings
         self._memory = memory_manager
         self._context_brief_manager = context_brief_manager
+        self._post_task_review = post_task_review
 
     async def capture_document_input(
         self,
@@ -115,7 +117,13 @@ class KnowledgeCaptureService:
             source_type=source_type,
             source_id=source_id,
         )
-        await self.refresh_briefs(tenant_id, reason="knowledge_capture")
+        if self._post_task_review is not None:
+            await self._post_task_review.after_knowledge_capture(
+                tenant_id,
+                reason="knowledge_capture",
+            )
+        else:
+            await self.refresh_briefs(tenant_id, reason="knowledge_capture")
         return self.build_absorption_messages(tenant_id, ack_text=ack_text)
 
     async def store_knowledge(

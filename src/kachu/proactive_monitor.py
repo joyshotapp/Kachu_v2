@@ -25,11 +25,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from .agentOS_client import AgentOSClient
 from .models import AgentOSTaskRequest
 from .persistence import KachuRepository
-from .line.push import push_line_messages, text_message
+from .line.push import push_line_messages, resolve_tenant_line_recipients, text_message
 
 logger = logging.getLogger(__name__)
 
 _NUDGE_DOMAIN = "kachu_proactive_nudge"
+_KNOWLEDGE_STALE_AFTER_DAYS = 60
 
 # Nudge type constants
 NUDGE_NO_POST = "no_recent_post"
@@ -74,6 +75,10 @@ class ProactiveMonitorAgent:
 
         for tenant_id in tenant_ids:
             try:
+                self._repo.refresh_knowledge_lifecycle(
+                    tenant_id,
+                    stale_after_days=_KNOWLEDGE_STALE_AFTER_DAYS,
+                )
                 nudge_type = self._detect_nudge(tenant_id)
                 if nudge_type:
                     await self._trigger_nudge(tenant_id, nudge_type, today)
@@ -86,6 +91,10 @@ class ProactiveMonitorAgent:
     async def scan_tenant_and_nudge(self, tenant_id: str, bucket: str) -> bool:
         """Run proactive checks for one tenant when its configured cadence is due."""
         try:
+            self._repo.refresh_knowledge_lifecycle(
+                tenant_id,
+                stale_after_days=_KNOWLEDGE_STALE_AFTER_DAYS,
+            )
             nudge_type = self._detect_nudge(tenant_id)
             if not nudge_type:
                 return False
@@ -101,6 +110,8 @@ class ProactiveMonitorAgent:
 
         # Rule 1: No content published in 7 days
         last_published = self._repo.get_last_published_at(tenant_id)
+        if last_published is not None and last_published.tzinfo is None:
+            last_published = last_published.replace(tzinfo=timezone.utc)
         if last_published is None or (now - last_published) > timedelta(days=7):
             return NUDGE_NO_POST
 
@@ -110,6 +121,8 @@ class ProactiveMonitorAgent:
 
         # Rule 3: Knowledge base stale > 60 days
         kb_updated = self._repo.get_knowledge_last_updated_at(tenant_id)
+        if kb_updated is not None and kb_updated.tzinfo is None:
+            kb_updated = kb_updated.replace(tzinfo=timezone.utc)
         if kb_updated and (now - kb_updated) > timedelta(days=60):
             return NUDGE_STALE_KNOWLEDGE
 
@@ -117,8 +130,17 @@ class ProactiveMonitorAgent:
 
     async def _trigger_nudge(self, tenant_id: str, nudge_type: str, today: str) -> None:
         """Send a direct LINE nudge to the boss (idempotent enough for daily scan cadence)."""
-        if not self._settings.LINE_BOSS_USER_ID or not self._settings.LINE_CHANNEL_ACCESS_TOKEN:
+        if not self._settings.LINE_CHANNEL_ACCESS_TOKEN:
             logger.info("ProactiveMonitor: LINE not configured, skipping tenant=%s type=%s", tenant_id, nudge_type)
+            return
+
+        recipient_line_ids = resolve_tenant_line_recipients(
+            repo=self._repo,
+            settings=self._settings,
+            tenant_id=tenant_id,
+        )
+        if not recipient_line_ids:
+            logger.info("ProactiveMonitor: no LINE recipients configured for tenant=%s", tenant_id)
             return
 
         dedupe_payload = {
@@ -148,41 +170,45 @@ class ProactiveMonitorAgent:
             return
 
         message = text_message(_NUDGE_MESSAGES.get(nudge_type, "提醒：我發現有一件事值得你注意。"))
+        delivered_recipients: list[str] = []
         try:
-            await push_line_messages(
-                to=self._settings.LINE_BOSS_USER_ID,
-                messages=[message],
-                access_token=self._settings.LINE_CHANNEL_ACCESS_TOKEN,
-            )
-            self._repo.record_push(
-                tenant_id=tenant_id,
-                recipient_line_id=self._settings.LINE_BOSS_USER_ID,
-                message_type="general",
-            )
-            self._repo.save_audit_event(
-                tenant_id=tenant_id,
-                workflow_type="proactive_monitor",
-                event_type="push_sent",
-                source="proactive_monitor",
-                payload=dedupe_payload,
-            )
-            logger.info("ProactiveMonitor: nudge pushed tenant=%s type=%s day=%s", tenant_id, nudge_type, today)
-        except httpx.HTTPError as exc:
-            try:
+            for recipient_line_id in recipient_line_ids:
+                try:
+                    await push_line_messages(
+                        to=recipient_line_id,
+                        messages=[message],
+                        access_token=self._settings.LINE_CHANNEL_ACCESS_TOKEN,
+                    )
+                    self._repo.record_push(
+                        tenant_id=tenant_id,
+                        recipient_line_id=recipient_line_id,
+                        message_type="general",
+                    )
+                    delivered_recipients.append(recipient_line_id)
+                except httpx.HTTPError as exc:
+                    logger.error(
+                        "ProactiveMonitor push failed tenant=%s type=%s recipient=%s: %s",
+                        tenant_id,
+                        nudge_type,
+                        recipient_line_id,
+                        exc,
+                    )
+            if delivered_recipients:
+                self._repo.save_audit_event(
+                    tenant_id=tenant_id,
+                    workflow_type="proactive_monitor",
+                    event_type="push_sent",
+                    source="proactive_monitor",
+                    payload={**dedupe_payload, "recipient_line_ids": delivered_recipients},
+                )
+                logger.info("ProactiveMonitor: nudge pushed tenant=%s type=%s day=%s", tenant_id, nudge_type, today)
+            else:
                 self._repo.save_audit_event(
                     tenant_id=tenant_id,
                     workflow_type="proactive_monitor",
                     event_type="push_failed",
                     source="proactive_monitor",
-                    payload={"message_type": "general", "nudge_type": nudge_type, "error": str(exc)},
+                    payload={"message_type": "general", "nudge_type": nudge_type, "recipient_line_ids": recipient_line_ids},
                 )
-            except SQLAlchemyError as audit_exc:
-                logger.error(
-                    "ProactiveMonitor push audit failed tenant=%s type=%s: %s",
-                    tenant_id,
-                    nudge_type,
-                    audit_exc,
-                )
-            logger.error("ProactiveMonitor push failed tenant=%s type=%s: %s", tenant_id, nudge_type, exc)
         except SQLAlchemyError as exc:
             logger.error("ProactiveMonitor persistence failed tenant=%s type=%s: %s", tenant_id, nudge_type, exc)
