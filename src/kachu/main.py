@@ -288,4 +288,9 @@ def create_app(settings: Settings | None = None, _engine=None) -> FastAPI:
     def sitemap_xml() -> FileResponse:
         return FileResponse(_static_dir / "sitemap.xml", media_type="application/xml")
 
+    @app.get("/googledc0423ede5af4719.html", include_in_schema=False)
+    def gsc_verify():
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("google-site-verification: googledc0423ede5af4719.html")
+
     return app

@@ -10,7 +10,7 @@ Kachu v2 是一套面向微型商家與個人品牌經營者的 AI 營運助理�
 
 ## 專案現況
 
-截至 2026-05-03，Kachu 已從單租戶原型推進到可持續運作的多租戶 beta 系統。
+截至 2026-05-06，Kachu 已從單租戶原型推進到可持續運作的多租戶 beta 系統。
 
 這一輪已完成的關鍵收尾包括：
 
@@ -156,6 +156,7 @@ token 到期前 5 分鐘內，系統會自動使用 `refresh_token` 更新 acces
 - `20260503_0006_tenant_feature_flags`
 - `20260503_0007_repair_legacy_membership_backfill`
 - `20260503_0008_knowledge_lifecycle_metadata`
+- `20260505_0009_tenant_merchant_slug`
 
 ## 本機開發
 
@@ -205,13 +206,13 @@ Authorization: Bearer <ADMIN_SERVICE_TOKEN>
 
 ## 測試與 release gate
 
-截至 2026-05-03，完整測試套件結果為：
+截至 2026-05-06，完整測試套件結果為：
 
 ```bash
 .venv311/bin/python -m pytest
 ```
 
-結果：`285 passed`
+結果：`305 passed`
 
 Phase 6 release gate 單一入口：
 
