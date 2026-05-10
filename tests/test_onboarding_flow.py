@@ -1,276 +1,277 @@
+"""
+任務 1-4 驗收測試：Onboarding flow。
+
+完成條件：
+- 完整走完 6 steps（name→industry→sleep_threshold→address→docs→interview）
+- 「上一題」正確回退，且不遺失已存資料
+- sleep_threshold 正確解析並儲存到 tenant
+"""
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock
-
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy.pool import StaticPool
-from sqlmodel import SQLModel
+from unittest.mock import AsyncMock, MagicMock, call
 
-from kachu.config import Settings
-from kachu.context_brief_manager import ContextBriefManager
-from kachu.main import create_app
-from kachu.memory import MemoryManager
-from kachu.onboarding.flow import OnboardingFlow
-from kachu.persistence import KachuRepository, create_db_engine, init_db
+from kachu_plus.onboarding.flow import OnboardingFlow, _parse_sleep_threshold, _detect_redo_step
+from kachu_plus.persistence.tables import TenantTable, OnboardingStateTable
+from kachu_plus.website_knowledge import WebsiteKnowledgeResult
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-@pytest.fixture()
-def repo() -> KachuRepository:
-    engine = create_db_engine("sqlite://")
-    init_db(engine)
-    return KachuRepository(engine)
-
-
-@pytest.fixture()
-def intent_router() -> AsyncMock:
-    router = AsyncMock()
-    router.dispatch = AsyncMock()
-    return router
-
-
-@pytest.fixture()
-def settings() -> Settings:
-    return Settings(
-        APP_ENV="test",
-        DATABASE_URL="sqlite://",
-        KACHU_BASE_URL="https://app.kachu.tw",
+def _make_tenant(tenant_id: str = "t1") -> TenantTable:
+    return TenantTable(
+        id=tenant_id,
+        name="",
+        industry_type="",
+        address="",
+        sleep_threshold=60,
+        is_active=True,
     )
 
 
-@pytest.fixture()
-def flow(repo: KachuRepository, intent_router: AsyncMock, settings: Settings) -> OnboardingFlow:
-    memory = MemoryManager(repo, settings)
-    brief_manager = ContextBriefManager(repo, memory)
-    return OnboardingFlow(
-        repo,
-        settings=settings,
-        intent_router=intent_router,
-        memory_manager=memory,
-        context_brief_manager=brief_manager,
-    )
+def _make_state(step: str = "new", tenant_id: str = "t1") -> OnboardingStateTable:
+    return OnboardingStateTable(id="s1", tenant_id=tenant_id, step=step)
 
 
-TENANT = "U_boss_test_001"
+def _make_repo(step: str = "new") -> MagicMock:
+    repo = MagicMock()
+    tenant = _make_tenant()
+    state = _make_state(step)
+    repo.get_tenant.return_value = tenant
+    repo.get_or_create_onboarding_state.return_value = state
+    repo.is_onboarding_complete.return_value = (step == "completed")
+    repo.get_knowledge_entries.return_value = []
+    return repo
 
 
-# ── is_in_onboarding ──────────────────────────────────────────────────────────
-
-def test_new_tenant_is_in_onboarding(flow: OnboardingFlow) -> None:
-    assert flow.is_in_onboarding(TENANT) is True
+# ── _parse_sleep_threshold ────────────────────────────────────────────────────
 
 
-def test_completed_tenant_not_in_onboarding(flow: OnboardingFlow, repo: KachuRepository) -> None:
-    repo.update_onboarding_state(TENANT, "completed")
-    assert flow.is_in_onboarding(TENANT) is False
+@pytest.mark.parametrize("text,expected_days", [
+    ("每週", 7),
+    ("每月", 30),
+    ("每兩週", 14),
+    ("每天", 1),
+    ("半個月", 15),
+    ("每兩個月", 60),
+    ("30", 30),
+    ("45天", 45),
+    ("無法辨認的文字", 30),  # default
+    ("每周来一次", 7),
+])
+def test_parse_sleep_threshold(text: str, expected_days: int) -> None:
+    assert _parse_sleep_threshold(text) == expected_days
 
 
-# ── Full DAY 0 happy-path ─────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_welcome_message_on_first_contact(flow: OnboardingFlow) -> None:
-    msgs = await flow.handle_message(TENANT, "text", "hi")
-    assert len(msgs) == 1
-    assert "歡迎" in msgs[0]["text"]
-    assert "店名" in msgs[0]["text"]
+# ── _detect_redo_step ─────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_collecting_name(flow: OnboardingFlow, repo: KachuRepository) -> None:
-    # Advance to asking_name state
-    await flow.handle_message(TENANT, "text", "hi")
-
-    msgs = await flow.handle_message(TENANT, "text", "小王美食")
-    assert "小王美食" in msgs[0]["text"]
-    assert "行業" in msgs[0]["text"]
-
-    tenant = repo.get_or_create_tenant(TENANT)
-    assert tenant.name == "小王美食"
+def test_detect_redo_from_q2_generic() -> None:
+    assert _detect_redo_step("上一題", "interview_q2") == "interview_q1"
 
 
-@pytest.mark.asyncio
-async def test_collecting_industry(flow: OnboardingFlow, repo: KachuRepository) -> None:
-    await flow.handle_message(TENANT, "text", "hi")
-    await flow.handle_message(TENANT, "text", "小王美食")
-
-    msgs = await flow.handle_message(TENANT, "text", "餐廳")
-    assert "地址" in msgs[0]["text"]
-
-    tenant = repo.get_or_create_tenant(TENANT)
-    assert tenant.industry_type == "餐廳"
+def test_detect_redo_from_q3_to_q2() -> None:
+    assert _detect_redo_step("上一題", "interview_q3") == "interview_q2"
 
 
-@pytest.mark.asyncio
-async def test_collecting_address(flow: OnboardingFlow, repo: KachuRepository) -> None:
-    await flow.handle_message(TENANT, "text", "hi")
-    await flow.handle_message(TENANT, "text", "小王美食")
-    await flow.handle_message(TENANT, "text", "餐廳")
+def test_detect_redo_explicit_q1_from_q3() -> None:
+    assert _detect_redo_step("回到第一題", "interview_q3") == "interview_q1"
 
-    msgs = await flow.handle_message(TENANT, "text", "台北市信義區")
-    assert "完成" in msgs[0]["text"] or "文件" in msgs[0]["text"]
 
-    tenant = repo.get_or_create_tenant(TENANT)
-    assert tenant.address == "台北市信義區"
+def test_detect_redo_explicit_q2_from_q3() -> None:
+    assert _detect_redo_step("第二題要重新回答", "interview_q3") == "interview_q2"
+
+
+def test_no_redo_signal() -> None:
+    assert _detect_redo_step("我覺得我們的差異是手工製作", "interview_q2") is None
+
+
+# ── OnboardingFlow 完整流程 ───────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_awaiting_docs_skip(flow: OnboardingFlow) -> None:
-    await flow.handle_message(TENANT, "text", "hi")
-    await flow.handle_message(TENANT, "text", "小王美食")
-    await flow.handle_message(TENANT, "text", "餐廳")
-    await flow.handle_message(TENANT, "text", "台北市信義區")
-
-    msgs = await flow.handle_message(TENANT, "text", "跳過")
-    assert "第 1 題" in msgs[0]["text"]
-
-
-@pytest.mark.asyncio
-async def test_awaiting_docs_image_upload(
-    flow: OnboardingFlow, repo: KachuRepository
-) -> None:
-    await flow.handle_message(TENANT, "text", "hi")
-    await flow.handle_message(TENANT, "text", "小王美食")
-    await flow.handle_message(TENANT, "text", "餐廳")
-    await flow.handle_message(TENANT, "text", "台北市信義區")
-
-    msgs = await flow.handle_message(TENANT, "image", "msg_id_001")
-    assert "收到" in msgs[0]["text"]
-    assert any("我目前已先吸收這些資訊" in message["text"] for message in msgs)
-
-    # Check knowledge entry saved
-    entries = repo.get_knowledge_entries(TENANT, category="document")
-    assert len(entries) == 1
-    assert "msg_id_001" in entries[0].content
+async def test_new_step_sends_welcome() -> None:
+    repo = _make_repo("new")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "")
+    assert len(replies) == 1
+    assert "歡迎" in replies[0]["text"]
+    repo.update_onboarding_step.assert_called_once_with("t1", "asking_name")
 
 
 @pytest.mark.asyncio
-async def test_awaiting_docs_done_keyword(flow: OnboardingFlow) -> None:
-    await flow.handle_message(TENANT, "text", "hi")
-    await flow.handle_message(TENANT, "text", "小王美食")
-    await flow.handle_message(TENANT, "text", "餐廳")
-    await flow.handle_message(TENANT, "text", "台北市信義區")
-
-    msgs = await flow.handle_message(TENANT, "text", "完成")
-    assert "第 1 題" in msgs[0]["text"]
-
-
-@pytest.mark.asyncio
-async def test_full_interview_creates_knowledge_entries(
-    flow: OnboardingFlow, repo: KachuRepository, intent_router: AsyncMock
-) -> None:
-    # Run entire flow
-    await flow.handle_message(TENANT, "text", "hi")
-    await flow.handle_message(TENANT, "text", "小王美食")
-    await flow.handle_message(TENANT, "text", "餐廳")
-    await flow.handle_message(TENANT, "text", "台北市信義區")
-    await flow.handle_message(TENANT, "text", "跳過")
-    await flow.handle_message(TENANT, "text", "我們用祖傳秘方，別家沒有")
-    await flow.handle_message(TENANT, "text", "客人太少，不知道怎麼宣傳")
-    repo.save_connector_account(
-        tenant_id=TENANT,
-        platform="meta",
-        credentials_json=json.dumps(
-            {
-                "access_token": "meta-token",
-                "fb_page_id": "fb-page-001",
-                "fb_page_name": "小王美食粉專",
-                "ig_user_id": "",
-            }
-        ),
-        account_label="Meta (小王美食粉專)",
-    )
-
-    msgs = await flow.handle_message(TENANT, "text", "今年想開第二家店")
-    assert len(msgs) == 3
-    assert "我目前已先吸收這些資訊" in msgs[0]["text"]
-    assert "目前渠道狀態" in msgs[1]["text"]
-    assert "Facebook：已可用" in msgs[1]["text"]
-    assert "太好了" in msgs[2]["text"] or "了解" in msgs[2]["text"] or "照片" in msgs[2]["text"]
-
-    # Verify knowledge entries
-    core = repo.get_knowledge_entries(TENANT, category="core_value")
-    pain = repo.get_knowledge_entries(TENANT, category="pain_point")
-    goal = repo.get_knowledge_entries(TENANT, category="goal")
-    basic = repo.get_knowledge_entries(TENANT, category="basic_info")
-
-    assert len(core) == 1
-    assert "祖傳秘方" in core[0].content
-    assert len(pain) == 1
-    assert "客人太少" in pain[0].content
-    assert len(goal) == 1
-    assert "第二家" in goal[0].content
-    assert len(basic) == 1
-    assert "小王美食" in basic[0].content
-    brand_brief = repo.get_shared_context(TENANT, "brand_brief")
-    assert brand_brief is not None
-    assert brand_brief["brand_name"] == "小王美食"
-    assert intent_router.dispatch.await_count == 3
-
-    topics = [
-        call.kwargs["trigger_payload"]["topic"]
-        for call in intent_router.dispatch.await_args_list
-    ]
-    assert all(call.kwargs["trigger_source"] == "onboarding_aha" for call in intent_router.dispatch.await_args_list)
-    assert topics == [
-        "認識小王美食：第一次來店前最值得知道的亮點",
-        "為什麼大家會選擇小王美食：主打特色與推薦理由",
-        "這週想讓更多人知道的餐廳亮點：來店前先看這篇",
-    ]
+async def test_asking_name_saves_and_advances() -> None:
+    repo = _make_repo("asking_name")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "好味咖啡")
+    assert len(replies) == 1
+    assert "好味咖啡" in replies[0]["text"]
+    # tenant name was saved
+    tenant = repo.get_tenant.return_value
+    assert tenant.name == "好味咖啡"
+    repo.update_onboarding_step.assert_called_once_with("t1", "asking_industry")
 
 
 @pytest.mark.asyncio
-async def test_completed_flow_is_no_longer_onboarding(
-    flow: OnboardingFlow,
-) -> None:
-    await flow.handle_message(TENANT, "text", "hi")
-    await flow.handle_message(TENANT, "text", "小王美食")
-    await flow.handle_message(TENANT, "text", "餐廳")
-    await flow.handle_message(TENANT, "text", "台北市信義區")
-    await flow.handle_message(TENANT, "text", "跳過")
-    await flow.handle_message(TENANT, "text", "祖傳秘方")
-    await flow.handle_message(TENANT, "text", "客人太少")
-    await flow.handle_message(TENANT, "text", "開第二家")
-
-    assert flow.is_in_onboarding(TENANT) is False
+async def test_asking_name_rejects_non_text_input() -> None:
+    repo = _make_repo("asking_name")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "image", "")
+    assert "請直接用文字" in replies[0]["text"]
+    repo.update_onboarding_step.assert_not_called()
+    repo.save_tenant.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_completed_flow_returns_empty_messages(
-    flow: OnboardingFlow,
-) -> None:
-    """After completion, further messages return nothing from onboarding."""
-    repo_inner = flow._repo
-    repo_inner.update_onboarding_state(TENANT, "completed")
-
-    msgs = await flow.handle_message(TENANT, "text", "隨便說什麼")
-    assert msgs == []
+async def test_asking_industry_rejects_empty_text() -> None:
+    repo = _make_repo("asking_industry")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "   ")
+    assert "請直接用文字" in replies[0]["text"]
+    repo.update_onboarding_step.assert_not_called()
+    repo.save_tenant.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_conversations_saved_during_interview(
-    flow: OnboardingFlow, repo: KachuRepository
-) -> None:
-    await flow.handle_message(TENANT, "text", "hi")
-    await flow.handle_message(TENANT, "text", "小王美食")
-    await flow.handle_message(TENANT, "text", "餐廳")
-    await flow.handle_message(TENANT, "text", "台北市信義區")
-    await flow.handle_message(TENANT, "text", "跳過")
-    await flow.handle_message(TENANT, "text", "我的獨特性")
-    await flow.handle_message(TENANT, "text", "我的困擾")
-    await flow.handle_message(TENANT, "text", "我的目標")
+async def test_asking_industry_advances_to_sleep_threshold() -> None:
+    repo = _make_repo("asking_industry")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "咖啡廳")
+    assert len(replies) == 1
+    # 應進入 sleep_threshold 問題
+    assert "幾天" in replies[0]["text"] or "客人" in replies[0]["text"]
+    repo.update_onboarding_step.assert_called_once_with("t1", "asking_sleep_threshold")
 
-    # Check conversations saved (name + industry + address + 3 interview answers)
-    convs = repo.save_conversation.__self__  # just check via get
-    # Use select directly on tables
-    from sqlmodel import Session, select
-    from kachu.persistence.tables import ConversationTable
-    with Session(repo._engine) as session:
-        results = list(session.exec(
-            select(ConversationTable).where(ConversationTable.tenant_id == TENANT)
-        ).all())
-    # name, industry, address, q1, q2, q3 = 6 boss messages
-    boss_msgs = [r for r in results if r.role == "boss"]
-    assert len(boss_msgs) == 6
+
+@pytest.mark.asyncio
+async def test_sleep_threshold_saves_and_advances() -> None:
+    repo = _make_repo("asking_sleep_threshold")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "每月")
+    assert len(replies) == 1
+    # 應詢問地址
+    assert "地址" in replies[0]["text"] or "地點" in replies[0]["text"]
+    tenant = repo.get_tenant.return_value
+    assert tenant.sleep_threshold == 30
+    repo.update_onboarding_step.assert_called_once_with("t1", "asking_address")
+
+
+@pytest.mark.asyncio
+async def test_asking_address_advances() -> None:
+    repo = _make_repo("asking_address")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "台北市信義區忠孝東路100號")
+    assert len(replies) == 1
+    repo.update_onboarding_step.assert_called_once_with("t1", "awaiting_docs")
+
+
+@pytest.mark.asyncio
+async def test_awaiting_docs_skip_advances_to_interview() -> None:
+    repo = _make_repo("awaiting_docs")
+    flow = OnboardingFlow(repo)
+    for skip_word in ("跳過", "skip", "完成"):
+        repo.update_onboarding_step.reset_mock()
+        replies = await flow.handle_message("t1", "text", skip_word)
+        assert "第 1 題" in replies[0]["text"]
+        repo.update_onboarding_step.assert_called_once_with("t1", "interview_q1")
+
+
+@pytest.mark.asyncio
+async def test_awaiting_docs_text_saved_as_knowledge() -> None:
+    repo = _make_repo("awaiting_docs")
+    flow = OnboardingFlow(repo)
+    await flow.handle_message("t1", "text", "我們主打有機食材")
+    repo.save_knowledge_entry.assert_called_once()
+    call_kwargs = repo.save_knowledge_entry.call_args.kwargs
+    assert call_kwargs["category"] == "brand_material"
+    assert "有機食材" in call_kwargs["content"]
+
+
+@pytest.mark.asyncio
+async def test_awaiting_docs_url_triggers_website_ingestion() -> None:
+    repo = _make_repo("awaiting_docs")
+    website_ingestion_service = MagicMock()
+    website_ingestion_service.ingest_from_message = AsyncMock(return_value=WebsiteKnowledgeResult(
+        source_url="https://seasonwell.com.tw",
+        brand_name="四時循養堂",
+        summary="主打漢方保健與日常調理。",
+        highlights=["筋骨保養", "漢方保健食品"],
+        contact_points=["地址資訊：新北市泰山區仁義路222號"],
+        page_urls=["https://seasonwell.com.tw"],
+    ))
+    flow = OnboardingFlow(repo, website_ingestion_service=website_ingestion_service)
+
+    replies = await flow.handle_message("t1", "text", "給你官網可以嗎？ https://seasonwell.com.tw/")
+
+    assert "官網重點" in replies[0]["text"]
+    assert "四時循養堂" in replies[0]["text"]
+    website_ingestion_service.ingest_from_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_interview_q1_saves_core_value() -> None:
+    repo = _make_repo("interview_q1")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "手工製作，堅持每日新鮮")
+    assert "第 2 題" in replies[0]["text"]
+    repo.save_knowledge_entry.assert_called_once()
+    call_kwargs = repo.save_knowledge_entry.call_args.kwargs
+    assert call_kwargs["category"] == "core_value"
+    repo.update_onboarding_step.assert_called_once_with("t1", "interview_q2")
+
+
+@pytest.mark.asyncio
+async def test_interview_q2_saves_pain_point() -> None:
+    repo = _make_repo("interview_q2")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "老客人越來越少回來")
+    assert "第 3 題" in replies[0]["text"]
+    repo.save_knowledge_entry.assert_called_once()
+    call_kwargs = repo.save_knowledge_entry.call_args.kwargs
+    assert call_kwargs["category"] == "pain_point"
+    repo.update_onboarding_step.assert_called_once_with("t1", "interview_q3")
+
+
+@pytest.mark.asyncio
+async def test_interview_q3_completes_onboarding() -> None:
+    repo = _make_repo("interview_q3")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "今年要開第二家店")
+    # 最後一則包含 completed 訊息
+    assert any("🎉" in r["text"] or "直接跟我說" in r["text"] for r in replies)
+    repo.update_onboarding_step.assert_called_once_with("t1", "completed")
+
+
+# ── Redo 功能（上一題不遺失已存資料）────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_redo_from_q2_to_q1() -> None:
+    repo = _make_repo("interview_q2")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "上一題")
+    assert "重新來" in replies[0]["text"]
+    assert "第 1 題" in replies[0]["text"]
+    # 已刪除 core_value 的知識條目
+    repo.delete_knowledge_entries_by_category.assert_called_once_with("t1", "core_value")
+    repo.update_onboarding_step.assert_called_once_with("t1", "interview_q1")
+
+
+@pytest.mark.asyncio
+async def test_redo_from_q3_to_q2() -> None:
+    repo = _make_repo("interview_q3")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "上一題")
+    assert "第 2 題" in replies[0]["text"]
+    repo.delete_knowledge_entries_by_category.assert_called_once_with("t1", "pain_point")
+    repo.update_onboarding_step.assert_called_once_with("t1", "interview_q2")
+
+
+@pytest.mark.asyncio
+async def test_redo_from_q3_to_q1() -> None:
+    """第一題重新回答，應刪除 core_value + pain_point。"""
+    repo = _make_repo("interview_q3")
+    flow = OnboardingFlow(repo)
+    replies = await flow.handle_message("t1", "text", "第一題重新回答")
+    assert "第 1 題" in replies[0]["text"]
+    calls = {c.args[1] for c in repo.delete_knowledge_entries_by_category.call_args_list}
+    assert "core_value" in calls
+    assert "pain_point" in calls

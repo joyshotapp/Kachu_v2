@@ -10,9 +10,9 @@ COPY pyproject.toml .
 COPY src/ src/
 RUN pip install --no-cache-dir .
 
-COPY . .
+COPY alembic/ alembic/
+COPY alembic.ini .
 
 EXPOSE 8001
 
-# --factory: uvicorn calls create_app() at startup; no module-level side effects in tests
-CMD ["uvicorn", "kachu.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "kachu_plus.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8001"]

@@ -1,206 +1,263 @@
-# Kachu v2 — 部署 Runbook
+# Kachu+ Production Deploy Runbook
 
-> 適用版本：v2 beta  
-> 更新日期：2026-04-28  
-> 目標環境：單台 Linux 主機（Docker + nginx + Let's Encrypt）  
-> 估計總時間：首次約 60–90 分鐘，之後更新約 10 分鐘
-
----
-
-## 前置需求
-
-| 項目 | 說明 |
-|---|---|
-| Docker Engine ≥ 24 | `docker --version` 確認 |
-| Docker Compose v2 | `docker compose version` 確認（注意是空格，不是 `-`） |
-| 公有 IP + 網域 | 需要能讓 LINE 與 Google 打 webhook，建議 `app.kachu.tw` |
-| DNS A record 已指向主機 IP | Let's Encrypt 需要 80 port 回應 |
-| `.env` 中所有 `REPLACE_WITH_*` 已填妥 | 見步驟一 |
+版本：1.0  
+更新：2026-05-09  
+適用環境：Linode 172.234.85.159（與 Kachu v2 共用同一台伺服器）
 
 ---
 
-## 步驟一：填妥生產環境變數
+## 架構說明
 
-### 1-1 複製並編輯 `.env.prod`
-
-所有 `REPLACE_WITH_*` 的欄位，照下表填入：
-
-| 欄位 | 來源 | 說明 |
-|---|---|---|
-| `LINE_CHANNEL_ACCESS_TOKEN` | [LINE Developers Console](https://developers.line.biz/) → Channel → Messaging API | 長效 token |
-| `LINE_CHANNEL_SECRET` | 同上 → Basic settings | Channel Secret |
-| `LINE_BOSS_USER_ID` | 選填；僅舊版單租戶 smoke 或本機 fallback 需要 | 多租戶 production 應改用 `kachu_tenant_memberships` 綁定，不作正式 routing 依據 |
-| `POSTGRES_PASSWORD` | 自訂，至少 20 個字元隨機字串 | 同時更新 `DATABASE_URL` 裡的密碼 |
-| `DATABASE_URL` | `postgresql+psycopg://kachu:<POSTGRES_PASSWORD>@postgres:5432/kachu` | 替換密碼 |
-| `GOOGLE_AI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) → API Keys | Gemini 用 |
-| `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com/) → API Keys | Embeddings 用 |
-| `GOOGLE_OAUTH_CLIENT_SECRET` | [GCP Console](https://console.cloud.google.com/) → API & Services → Credentials | OAuth 2.0 Client |
-| `META_APP_SECRET` | [Meta for Developers](https://developers.facebook.com/) → App → Settings | 若不用 Meta 功能可留空並確認 `FEATURE_META=False` |
-| `SECRET_KEY` | 執行 `python -c "import secrets; print(secrets.token_hex(32))"` 產生 | 至少 32 字元 |
-| `TOKEN_ENCRYPTION_KEY` | 執行 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` 產生 | Fernet key |
-
-> ⚠️ `DATABASE_URL` 裡的 `<POSTGRES_PASSWORD>` 和 `POSTGRES_PASSWORD` 欄位必須完全一致。
-
-### 1-2 確認 Google service account 檔案
-
-```bash
-ls credentials/google-service-account.json
 ```
-
-此檔案應存在且屬於 `contentflow-gsc@opsly-492412.iam.gserviceaccount.com`。  
-確認 GCP Console 上這個 service account 仍有效，且對應的 API 已啟用：
-- Google Business Profile API
-- Google Search Console API（若有用到）
-
----
-
-## 步驟二：首次取得 TLS 憑證（Let's Encrypt）
-
-> 若用 IP 直接測試（不走 HTTPS）可跳過此步，改用 `infra/nginx/nginx.init.conf`。
-
-### 2-1 先用初始化 nginx 設定啟動（只跑 port 80）
-
-```bash
-# 暫時讓 nginx 只聽 80，以便 ACME challenge 可以通過
-docker compose -f docker-compose.prod.yml run --rm --entrypoint "" \
-  gateway nginx -c /etc/nginx/nginx.conf
-```
-
-若 `infra/nginx/nginx.init.conf` 存在，先掛載它：
-
-```bash
-docker run --rm -d -p 80:80 \
-  -v $(pwd)/infra/nginx/nginx.init.conf:/etc/nginx/nginx.conf:ro \
-  -v certbot_www:/var/www/certbot \
-  --name nginx-init nginx:alpine
-```
-
-### 2-2 申請憑證
-
-```bash
-docker run --rm \
-  -v certbot_certs:/etc/letsencrypt \
-  -v certbot_www:/var/www/certbot \
-  certbot/certbot certonly --webroot \
-  --webroot-path=/var/www/certbot \
-  --email your-email@example.com \
-  --agree-tos --no-eff-email \
-  -d app.kachu.tw
-
-# 停掉臨時 nginx
-docker stop nginx-init
+172.234.85.159
+├── /opt/kachu-v2/          ← v2（繼續運行，不影響）
+│     └── kachu-v2-gateway-1（nginx，佔用 80/443）
+│
+├── /opt/AgentOS_real/      ← Kachu+ 專屬 AgentOS（由 deploy.py 同步）
+│
+└── /opt/kachu-plus/        ← Kachu+（本文件的目標）
+      ├── kachu-plus-postgres-1   內部 5432
+      ├── kachu-plus-agentos-1    內部 8000
+      └── kachu-plus-kachu-plus-1 host:127.0.0.1:8002
+                                   ↑
+                       v2 nginx proxy_pass 過來
+                       (plus.kachu.tw → 8002)
 ```
 
 ---
 
-## 步驟三：啟動所有服務
+## 首次部署 SOP
 
-### 3-1 確認 AgentOS 目錄存在
+### 步驟 0：前置確認清單
 
-`docker-compose.prod.yml` 會 build `../agentOS-v2`。確認路徑正確：
+- [ ] DNS：`plus.kachu.tw` A record → `172.234.85.159`（先確認，certbot 要用）
+- [ ] 本機有 SSH 連線：`ssh root@172.234.85.159 "echo ok"`
+- [ ] `AgentOS_real/` 在本機路徑 `/Users/yuchuchen/Desktop/AgentOS_real`（或調整 `--local-agentos`）
+- [ ] `.env.prod` 已從 `.env.prod.example` 填妥（見步驟 1）
 
-```bash
-ls ../agentOS-v2/Dockerfile
-```
-
-> 若 agentOS 目錄名稱不同（例如 `../AgentOS`），編輯 `docker-compose.prod.yml` 的 `agentos.build.context` 欄位。
-
-### 3-2 Build 並啟動
+### 步驟 1：建立 .env.prod
 
 ```bash
-# 在 Kachu-v2 目錄下執行
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+cd /Users/yuchuchen/Desktop/Kachu+
+cp .env.prod.example .env.prod
 ```
 
-### 3-3 確認所有容器健康
+編輯 `.env.prod`，填入以下值：
+
+| Key | 說明 | 來源 |
+|-----|------|------|
+| `POSTGRES_PASSWORD` | 自訂強密碼（≥ 24 字元） | 自產：`openssl rand -hex 16` |
+| `FIELD_ENCRYPTION_KEY` | Fernet key | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `ADMIN_API_TOKEN` | Admin API Bearer token | `openssl rand -hex 32` |
+| `GOOGLE_AI_API_KEY` | Gemini API key | 從 v2 `.env.prod` 複製 |
+| `OPENAI_API_KEY` | OpenAI key（選填） | 從 v2 `.env.prod` 複製 |
+| `GOOGLE_OAUTH_CLIENT_ID` | GBP OAuth client | 從 v2 `.env.prod` 複製 |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | GBP OAuth secret | 從 v2 `.env.prod` 複製 |
+| `META_APP_ID` | Meta App ID | Meta App dashboard |
+| `META_APP_SECRET` | Meta App secret | Meta App dashboard |
+| `META_WEBHOOK_VERIFY_TOKEN` | Meta webhook verify token | 自產：`openssl rand -hex 24` |
+
+> ⚠️ `.env.prod` 已在 `.gitignore`，絕對不要 commit。
+
+### API Key / 憑證盤點
+
+正式導入前，至少要先備齊以下資料。
+
+| 類型 | Key / 憑證 | 必填 | 用途 |
+|-----|-----------|------|------|
+| 系統層 | `POSTGRES_PASSWORD` | 是 | production DB |
+| 系統層 | `FIELD_ENCRYPTION_KEY` | 是 | 加密 LINE / connector 憑證 |
+| 系統層 | `ADMIN_API_TOKEN` | 是 | 建 tenant / patch 憑證 |
+| 系統層 | `GOOGLE_AI_API_KEY` | 建議必填 | photo analyze、FAQ、顧問回覆主力 LLM |
+| 系統層 | `OPENAI_API_KEY` | 選填 | LLM 備援 provider |
+| 系統層 | `GOOGLE_OAUTH_CLIENT_ID` | Google 串接時必填 | Google Business OAuth |
+| 系統層 | `GOOGLE_OAUTH_CLIENT_SECRET` | Google 串接時必填 | Google Business OAuth |
+| 系統層 | `META_APP_ID` | Meta 串接時必填 | Meta OAuth 與 Graph API |
+| 系統層 | `META_APP_SECRET` | Meta 串接時必填 | Meta OAuth token exchange |
+| 系統層 | `META_WEBHOOK_VERIFY_TOKEN` | Meta 留言/私訊 webhook 時必填 | 驗證 `/meta/webhook` |
+| Tenant 層 | `LINE_CHANNEL_ID` | 是 | tenant webhook 綁定 |
+| Tenant 層 | `LINE_CHANNEL_SECRET` | 是 | webhook / postback 驗簽 |
+| Tenant 層 | `LINE_CHANNEL_ACCESS_TOKEN` | 是 | push onboarding / approval / FAQ 回覆 |
+| Tenant 層 | `BOSS_LINE_USER_ID` | 是 | 初始 owner 綁定 |
+| Tenant 層 | Google `account_id` | Google 發布時必填 | Google Business target account |
+| Tenant 層 | Google `location_id` | Google 發布時必填 | Google Business target location |
+| Tenant 層 | Google `access_token` | Google 發布時必填 | review / local post API |
+| Tenant 層 | Google `refresh_token` | 強烈建議 | access token 過期後刷新 |
+| Tenant 層 | Meta `access_token` | Meta 發布/insights 時必填 | Instagram Graph API |
+| Tenant 層 | Meta `fb_page_id` | Meta 發布/insights 時必填 | Facebook Page target |
+| Tenant 層 | Meta `ig_user_id` | IG 發布/insights 時建議必填 | Instagram Business target |
+| Tenant 層 | Meta `fb_access_token` | 選填 | 若 Facebook 與 IG token 分離時使用 |
+
+> 補充：photo content 若要真的帶圖發布到 Meta，還需要「可公開抓取的圖片 URL」。目前只有 LINE 原始圖時，系統會先退回文字發布，不額外需要新的 API key，但後續若要正式上線建議補一層物件儲存。
+
+### 步驟 2：執行一鍵部署腳本
 
 ```bash
-docker compose -f docker-compose.prod.yml ps
+cd /Users/yuchuchen/Desktop/Kachu+
+python scripts/deploy.py --host root@172.234.85.159
 ```
 
-預期所有服務狀態為 `healthy` 或 `running`：
+腳本會依序執行 8 個步驟：
 
-```
-NAME        STATUS              PORTS
-postgres    healthy
-agentos     healthy
-kachu       healthy
-gateway     running             0.0.0.0:80->80, 0.0.0.0:443->443
-certbot     running
-```
+| # | 步驟 | 說明 |
+|---|------|------|
+| 1 | rsync Kachu+ | 同步程式碼到 /opt/kachu-plus |
+| 2 | rsync AgentOS | 同步到 /opt/AgentOS_real |
+| 3 | docker build | 建構兩個映像檔 |
+| 4 | docker up | 啟動所有容器 |
+| 5 | alembic migrate | 跑 9 個 migration（建立所有 tables） |
+| 6 | 申請 SSL 憑證 | certbot for plus.kachu.tw |
+| 7 | 更新 nginx | 在 v2 nginx 加入 plus.kachu.tw server block |
+| 8 | Smoke test | health check + HTTPS curl 驗證 |
 
-如果某個服務反覆 restart，查看 log：
+### 步驟 3：設定第一個商家 tenant
 
 ```bash
-docker compose -f docker-compose.prod.yml logs kachu --tail=50
-docker compose -f docker-compose.prod.yml logs agentos --tail=50
+# 3-1. 產生 FIELD_ENCRYPTION_KEY 加密後的 channel credentials
+#      （若 FIELD_ENCRYPTION_KEY 為空，直接填明文）
+
+# 3-2. 呼叫 Admin API 建立 tenant
+curl -X POST https://plus.kachu.tw/admin/tenants \
+  -H "Authorization: Bearer <ADMIN_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "U1f7215a15f956a462bd196b19cc30f87",
+    "display_name": "我的商店",
+    "line_channel_id": "<LINE_CHANNEL_ID>",
+    "line_channel_secret": "<LINE_CHANNEL_SECRET>",
+    "line_channel_access_token": "<LINE_CHANNEL_ACCESS_TOKEN>",
+    "boss_line_user_id": "<BOSS_LINE_USER_ID>",
+    "industry": "food",
+    "sleep_threshold_days": 60
+  }'
+```
+
+### 步驟 4：更新 LINE Webhook URL
+
+登入 [LINE Developers Console](https://developers.line.biz/) → Messaging API → Webhook URL：
+
+```
+https://plus.kachu.tw/webhooks/line/<tenant_id>
 ```
 
 ---
 
-## 步驟四：執行資料庫 Migration
+## 日常維運
 
-> 只有第一次部署或有 schema 變動時需要執行。
-
-```bash
-# 進入 kachu 容器執行 migration
-docker compose -f docker-compose.prod.yml exec kachu \
-  alembic upgrade head
-```
-
-預期輸出：
-
-```
-INFO  [alembic.runtime.migration] Running upgrade  -> 20260427_0001, baseline schema
-```
-
-若看到 `Target database is not up to date` 或 migration 失敗，查看：
+### 查看 log
 
 ```bash
-docker compose -f docker-compose.prod.yml exec kachu alembic history
-docker compose -f docker-compose.prod.yml exec kachu alembic current
+# Kachu+ 應用 log
+ssh root@172.234.85.159 'docker logs --tail=100 -f kachu-plus-kachu-plus-1'
+
+# AgentOS log
+ssh root@172.234.85.159 'docker logs --tail=50 kachu-plus-agentos-1'
+
+# 所有容器狀態
+ssh root@172.234.85.159 'docker compose -f /opt/kachu-plus/docker-compose.prod.yml ps'
 ```
 
----
-
-## 步驟五：設定 LINE Webhook URL
-
-1. 前往 [LINE Developers Console](https://developers.line.biz/)
-2. 進入 Kachu 對應的 Channel → **Messaging API** 頁籤
-3. 將 Webhook URL 設為：`https://app.kachu.tw/webhooks/line`
-4. 點擊 **Verify** — 應看到 `200 OK`
-5. 確認 **Use webhook** 已啟用
-
----
-
-## 步驟六：健康確認
+### 只更新 Kachu+（快速部署）
 
 ```bash
-# 從外部打 health endpoint
-curl -sf https://app.kachu.tw/health && echo "OK"
+python scripts/deploy.py --host root@172.234.85.159 \
+    --services kachu-plus \
+    --skip-agentos-sync --skip-ssl --skip-nginx
 ```
 
-回應應為：`{"status":"ok"}` 或類似結構。
-
----
-
-## 日常更新流程（之後每次 deploy）
+### 查詢 DB
 
 ```bash
-git pull
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build kachu
-# 若有 schema 變動：
-docker compose -f docker-compose.prod.yml exec kachu alembic upgrade head
+# 對話紀錄
+ssh root@172.234.85.159 "docker exec kachu-plus-postgres-1 psql -U kachu_plus -d kachu_plus \
+  -c \"SELECT tenant_id, actor_role, LEFT(content_text,80), created_at FROM kachu_conversations ORDER BY created_at DESC LIMIT 20;\""
+
+# 顧客 profile
+ssh root@172.234.85.159 "docker exec kachu-plus-postgres-1 psql -U kachu_plus -d kachu_plus \
+  -c 'SELECT * FROM kachu_customer_profiles LIMIT 10;'"
+
+# 主動建議
+ssh root@172.234.85.159 "docker exec kachu-plus-postgres-1 psql -U kachu_plus -d kachu_plus \
+  -c 'SELECT * FROM kachu_suggestions ORDER BY created_at DESC LIMIT 10;'"
 ```
+
+### 手動執行 migration
+
+```bash
+ssh root@172.234.85.159 'bash /opt/kachu-plus/infra/run_migration.sh'
+```
+
+### 啟用 Meta OAuth
+
+1. 編輯 `/opt/kachu-plus/.env.prod`，至少確認以下值已填入：
+
+```bash
+META_APP_ID=<META_APP_ID>
+META_APP_SECRET=<META_APP_SECRET>
+META_WEBHOOK_VERIFY_TOKEN=<META_WEBHOOK_VERIFY_TOKEN>
+META_OAUTH_REDIRECT_URI=https://plus.kachu.tw/meta/oauth/callback
+META_OAUTH_SCOPES=pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish
+```
+
+2. 到 Meta App 後台確認 OAuth redirect allowlist 包含：
+
+```text
+https://plus.kachu.tw/meta/oauth/callback
+```
+
+3. 到 Meta App 後台確認 Webhook 設定：
+
+```text
+Callback URL: https://plus.kachu.tw/meta/webhook
+Verify Token: <META_WEBHOOK_VERIFY_TOKEN>
+```
+
+4. 重新部署 `kachu-plus` 或至少重啟容器讓新 env 生效：
+
+```bash
+ssh root@172.234.85.159 'docker compose -f /opt/kachu-plus/docker-compose.prod.yml up -d --build kachu-plus'
+```
+
+5. 執行 migration，讓 `kachu_meta_oauth_sessions`、`kachu_content_plans`、`kachu_content_plan_items`、`kachu_external_engagements` 等 table 建立完成：
+
+```bash
+ssh root@172.234.85.159 'bash /opt/kachu-plus/infra/run_migration.sh'
+```
+
+6. 驗證 Meta 管理頁、OAuth callback 與 webhook verify：
+
+```bash
+curl -I https://plus.kachu.tw/tenants/<tenant_id>/meta/manage
+curl -I 'https://plus.kachu.tw/meta/oauth/callback?state=dummy&error=test'
+curl 'https://plus.kachu.tw/meta/webhook?hub.mode=subscribe&hub.verify_token=<META_WEBHOOK_VERIFY_TOKEN>&hub.challenge=12345'
+```
+
+預期結果：
+
+- 第一個 URL 回 `200 OK`
+- 第二個 URL 回 `409` 頁面或 `200` HTML 錯誤頁，代表 route 已上線
+- 第三個 URL 直接回 `12345`，代表 Meta webhook verify 正常
 
 ---
 
 ## 常見問題
 
-| 症狀 | 可能原因 | 處理方式 |
-|---|---|---|
-| `kachu` 容器啟動後立即退出 | `.env.prod` 有 `REPLACE_WITH_*` 未填，production guard 攔截 | 查看 `docker logs kachu`，確認是哪個設定缺漏 |
-| `agentos` 容器 `unhealthy` | build context 路徑不對，或 AgentOS 本身有問題 | 確認 `../agentOS-v2/Dockerfile` 存在 |
-| LINE Webhook Verify 失敗 | nginx 尚未跑起來，或 DNS 未生效 | `curl http://app.kachu.tw/health` 確認 80 port 是否通 |
-| Alembic 報 `Can't locate revision` | baseline 版本不在 DB 版本表 | `alembic stamp head` 後重試（僅限全新 DB） |
-| `TOKEN_ENCRYPTION_KEY` 錯誤 | 不是有效的 Fernet key | 重新用 `Fernet.generate_key()` 產生 |
+| 現象 | 可能原因 | 處理方式 |
+|------|---------|---------|
+| kachu-plus 容器 unhealthy | `.env.prod` 少填 key | `docker logs kachu-plus-kachu-plus-1` 確認錯誤 |
+| AgentOS 啟動失敗 | agent_platform DB 未建立 | 確認 `/opt/kachu-plus/infra/init-db.sql` 有被執行（重建 postgres volume 後重啟） |
+| SSL 申請失敗 | DNS 尚未生效 | `dig plus.kachu.tw` 確認 A record；最多等 5 分鐘後重試 `--skip-agentos-sync --skip-nginx` |
+| nginx 設定已存在 | 重複部署 | `--skip-nginx` 跳過，或手動確認 `/opt/kachu-v2/infra/nginx/nginx.prod.conf` |
+| LINE webhook 403 | channel_secret 不符 | Admin API 重新 patch tenant 的 channel_secret |
+
+---
+
+## Rollback
+
+Kachu+ 與 v2 完全獨立，rollback 只需：
+
+```bash
+ssh root@172.234.85.159 'docker compose -f /opt/kachu-plus/docker-compose.prod.yml down'
+```
+
+v2 (`app.kachu.tw`) 不受影響。

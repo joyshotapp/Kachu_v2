@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kachu"
+name = "kachu_plus"
 version = "0.1.0"
-description = "Kachu v2 — Agent-native 數位營運幕僚（微型創業者）"
+description = "Kachu+ — SMB AI 商業夥伴，品牌陣地 + 顧客關係二合一"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -19,27 +19,18 @@ dependencies = [
   "alembic>=1.14.0",
   "line-bot-sdk>=3.12.0",
   "litellm>=1.0.0",
-  "langfuse>=2.52.0",
-  "apscheduler>=3.10.0",
-  "redis>=5.2.0",
-  "google-auth>=2.0.0",
-  "google-auth-httplib2>=0.2.0",
-  "google-api-python-client>=2.0.0",
+  "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.3.0",
   "pytest-asyncio>=0.24.0",
-  "respx>=0.21.0",
   "httpx>=0.27.0",
 ]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-
-[tool.setuptools.package-data]
-kachu = ["static/*", "static/**/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

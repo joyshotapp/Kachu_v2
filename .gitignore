@@ -1,18 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment / secrets
 .env
 .env.*
-!.env.example
-credentials/
+!.env.prod.example
+
+# Local DB & temp
+.tmp/
 *.db
-__pycache__/
-*.pyc
+*.db-shm
+*.db-wal
+
+# Alembic temp
+.tmp-alembic-verify.db
+
+# Tests / coverage
 .pytest_cache/
-.venv/
-.mypy_cache/
-.ruff_cache/
-.benchmarks/
-htmlcov/
-coverage.xml
 .coverage
-dist/
-*.egg-info/
+htmlcov/
+*.cover
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Logs
+*.log

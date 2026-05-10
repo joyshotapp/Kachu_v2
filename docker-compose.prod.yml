@@ -1,40 +1,40 @@
+# Kachu+ Production Docker Compose
+#
+# 獨立 stack，部署在 /opt/kachu-plus。
+# kachu-plus 容器在 host 的 127.0.0.1:8002 提供服務，
+# 由 v2 的 nginx 以 plus.kachu.tw 反向代理過來。
+#
+# 啟動前必須：
+#   1. 建立 .env.prod（從 .env.prod.example 複製填寫）
+#   2. DNS 已將 plus.kachu.tw 指向本機 IP
+#   3. SSL 憑證已取得（見 deploy-runbook.md §SSL 章節）
+
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: kachu
+      POSTGRES_USER: kachu_plus
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: kachu
+      POSTGRES_DB: kachu_plus
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U kachu"]
+      test: ["CMD-SHELL", "pg_isready -U kachu_plus"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   agentos:
     build:
-      context: ../agentOS-v2
+      context: ../AgentOS_real
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env.prod
     environment:
-      DATABASE_URL: postgresql+psycopg://kachu:${POSTGRES_PASSWORD}@postgres:5432/agent_platform
-      KACHU_BASE_URL: http://kachu:8001
+      DATABASE_URL: postgresql+psycopg://kachu_plus:${POSTGRES_PASSWORD}@postgres:5432/agent_platform
+      KACHU_BASE_URL: http://kachu-plus:8001
     depends_on:
       postgres:
         condition: service_healthy
@@ -44,64 +44,34 @@ services:
       timeout: 5s
       retries: 6
 
-  kachu:
+  kachu-plus:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env.prod
     environment:
-      DATABASE_URL: postgresql+psycopg://kachu:${POSTGRES_PASSWORD}@postgres:5432/kachu
+      DATABASE_URL: postgresql+psycopg://kachu_plus:${POSTGRES_PASSWORD}@postgres:5432/kachu_plus
       AGENTOS_BASE_URL: http://agentos:8000
-      REDIS_URL: redis://redis:6379/0
+      KACHU_BASE_URL: https://plus.kachu.tw
     depends_on:
       postgres:
         condition: service_healthy
       agentos:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./credentials:/app/credentials:ro
+    networks:
+      - default
+      - kachu_shared
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6
 
-  gateway:
-    image: nginx:alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./infra/nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
-      - certbot_certs:/etc/letsencrypt:ro
-      - certbot_www:/var/www/certbot:ro
-    depends_on:
-      - kachu
-    healthcheck:
-      test: ["CMD-SHELL", "nginx -t && curl -sf http://localhost/health || exit 1"]
-      interval: 30s
-      retries: 3
-
-  certbot:
-    image: certbot/certbot:latest
-    volumes:
-      - certbot_certs:/etc/letsencrypt
-      - certbot_www:/var/www/certbot
-    entrypoint: >
-      /bin/sh -c "
-        trap exit TERM;
-        while :; do
-          certbot renew --webroot --webroot-path=/var/www/certbot --quiet;
-          sleep 12h & wait $${!};
-        done
-      "
-
 volumes:
   postgres_data:
-  certbot_certs:
-  certbot_www:
-  redis_data:
+
+networks:
+  default: {}
+  kachu_shared:
+    external: true
