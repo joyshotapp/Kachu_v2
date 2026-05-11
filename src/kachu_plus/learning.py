@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
 import json
+import logging
 from typing import Any
 
 from kachu_plus.industry_playbook import build_industry_context
+from kachu_plus.memory_promotion import ConversationMemoryPromoter
 from kachu_plus.website_knowledge import select_knowledge_highlights
+
+logger = logging.getLogger(__name__)
 
 
 def _compute_diff_notes(original: str, edited: str) -> str:
@@ -30,6 +36,14 @@ def _actor_label(actor_role: str) -> str:
         "customer": "顧客",
         "platform": "平台",
     }.get(actor_role, actor_role or "未知角色")
+
+
+def _as_utc(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class MemoryManager:
@@ -154,6 +168,100 @@ class ContextBriefManager:
             "active_task_brief": active_task_brief,
             "customer_brief": customer_brief,
         }
+
+
+class ConversationLearningService:
+    def __init__(self, repo: Any, promoter: ConversationMemoryPromoter | None = None) -> None:
+        self._repo = repo
+        self._promoter = promoter or ConversationMemoryPromoter(repo)
+
+    def absorb_conversation(
+        self,
+        *,
+        tenant_id: str,
+        conversation: Any,
+        line_user_id: str = "",
+    ) -> dict[str, Any]:
+        latest_task = None
+        normalized_line_user_id = str(line_user_id or "").strip()
+        if normalized_line_user_id:
+            latest_task = self._repo.get_latest_execute_task_record(
+                tenant_id=tenant_id,
+                line_user_id=normalized_line_user_id,
+            )
+        if latest_task is None:
+            latest_task = self._repo.get_latest_execute_task_for_tenant(tenant_id)
+        return self._promoter.promote_conversation(
+            tenant_id=tenant_id,
+            conversation=conversation,
+            latest_task=latest_task,
+        )
+
+
+class IdleBriefRefreshScheduler:
+    def __init__(self, repo: Any, brief_manager: ContextBriefManager, settings: Any) -> None:
+        self._repo = repo
+        self._brief_manager = brief_manager
+        self._enabled = bool(getattr(settings, "IDLE_BRIEF_REFRESH_ENABLED", True))
+        self._run_on_startup = bool(getattr(settings, "IDLE_BRIEF_REFRESH_RUN_ON_STARTUP", True))
+        self._interval_seconds = max(int(getattr(settings, "IDLE_BRIEF_REFRESH_INTERVAL_SECONDS", 300)), 30)
+        self._idle_seconds = max(int(getattr(settings, "IDLE_BRIEF_REFRESH_IDLE_SECONDS", 300)), 30)
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        if not self._enabled or self._task is not None:
+            return
+        self._task = asyncio.create_task(self._run_loop())
+        logger.info(
+            "IdleBriefRefreshScheduler started interval_seconds=%s idle_seconds=%s",
+            self._interval_seconds,
+            self._idle_seconds,
+        )
+
+    async def shutdown(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+        logger.info("IdleBriefRefreshScheduler shut down")
+
+    async def run_once(self, *, now: datetime | None = None) -> dict[str, Any]:
+        current_time = _as_utc(now) or datetime.now(timezone.utc)
+        refreshed_tenants: list[str] = []
+        for tenant in self._repo.list_active_tenants():
+            tenant_id = str(getattr(tenant, "id", "") or "").strip()
+            if not tenant_id:
+                continue
+            latest_conversation = self._latest_conversation(tenant_id)
+            latest_conversation_at = _as_utc(getattr(latest_conversation, "created_at", None)) if latest_conversation is not None else None
+            if latest_conversation_at is None:
+                continue
+            if (current_time - latest_conversation_at).total_seconds() < self._idle_seconds:
+                continue
+            existing_brief = self._repo.get_context_brief(tenant_id, "conversation_summary_brief")
+            brief_updated_at = _as_utc(getattr(existing_brief, "updated_at", None)) if existing_brief is not None else None
+            if brief_updated_at is not None and brief_updated_at >= latest_conversation_at:
+                continue
+            await self._brief_manager.refresh_briefs(tenant_id, reason="idle_refinement")
+            refreshed_tenants.append(tenant_id)
+        return {"refreshed_count": len(refreshed_tenants), "tenant_ids": refreshed_tenants}
+
+    async def _run_loop(self) -> None:
+        if self._run_on_startup:
+            await self.run_once()
+        while True:
+            await asyncio.sleep(self._interval_seconds)
+            await self.run_once()
+
+    def _latest_conversation(self, tenant_id: str) -> Any | None:
+        conversations = self._repo.list_recent_conversations(tenant_id, limit=1)
+        if not conversations:
+            return None
+        return conversations[0]
 
 
 class PostTaskReviewService:

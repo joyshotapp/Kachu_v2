@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 
 from kachu_plus.config import Settings
+from kachu_plus.crypto import decrypt_field
 from kachu_plus.line.flex_builder import build_external_reply_flex
 from kachu_plus.line.push import meta_insights_report_message, push_line_messages, resolve_tenant_line_recipients, text_message
 
@@ -25,6 +26,14 @@ GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 META_OAUTH_BASE = f"https://www.facebook.com/{GRAPH_API_VERSION}/dialog/oauth"
 
 logger = logging.getLogger(__name__)
+
+_PAGE_TARGET_SCOPES = {
+    "pages_read_engagement",
+    "pages_read_user_content",
+    "pages_manage_posts",
+    "pages_manage_engagement",
+    "pages_manage_metadata",
+}
 
 
 class MetaConnectorError(ValueError):
@@ -503,11 +512,40 @@ def _render_meta_shell(*, title: str, eyebrow: str, body_html: str) -> str:
         .section {{ border-top: 1px solid var(--line); padding: 22px 0; }}
         .section:first-child {{ border-top: 0; }}
         .lead {{ font-size: 16px; line-height: 1.7; color: var(--muted); margin: 10px 0 0; }}
+        .lead.tight {{ margin-top: 6px; max-width: 34rem; }}
         .grid {{ display: grid; gap: 14px; }}
         .grid.two {{ grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
         .tile {{ border: 1px solid var(--line); border-radius: 20px; padding: 16px; background: rgba(255,255,255,0.76); }}
         .tile strong {{ display: block; font-size: 18px; margin-bottom: 6px; }}
         .tile p {{ margin: 0; color: var(--muted); line-height: 1.6; }}
+        .hero-panel {{ display: grid; gap: 16px; grid-template-columns: minmax(0, 1.45fr) minmax(260px, 0.95fr); align-items: stretch; }}
+        .focus-card {{ border-radius: 24px; padding: 22px; background: linear-gradient(135deg, rgba(19,33,43,0.97), rgba(42,111,151,0.88)); color: #fff; box-shadow: 0 20px 45px rgba(19,33,43,0.18); }}
+        .focus-card .mini-label {{ display: inline-block; margin-bottom: 10px; padding: 6px 10px; border-radius: 999px; background: rgba(255,255,255,0.14); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; }}
+        .focus-card h2 {{ margin: 0; font-size: clamp(28px, 4vw, 36px); line-height: 1.08; }}
+        .focus-card p {{ margin: 10px 0 0; color: rgba(255,255,255,0.82); line-height: 1.7; }}
+        .focus-card .small {{ color: rgba(255,255,255,0.72); }}
+        .focus-card .button.primary, .focus-card button.primary {{ background: #fff; color: var(--ink); padding: 15px 22px; font-size: 16px; }}
+        .focus-card .button.secondary, .focus-card button.secondary {{ background: rgba(255,255,255,0.14); color: #fff; border: 1px solid rgba(255,255,255,0.22); }}
+        .focus-card .button.warn, .focus-card button.warn {{ background: #f4b8a6; color: #4c1205; }}
+        .support-card {{ display: grid; gap: 14px; align-content: start; }}
+        .support-card strong {{ margin-bottom: 0; }}
+        .meta-points {{ margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }}
+        .meta-points li {{ position: relative; padding-left: 18px; color: var(--muted); line-height: 1.6; }}
+        .meta-points li::before {{ content: ""; width: 7px; height: 7px; border-radius: 999px; background: var(--accent); position: absolute; left: 0; top: 0.65em; }}
+        .status-stack {{ display: grid; gap: 10px; }}
+        .status-row {{ border-top: 1px solid rgba(19,33,43,0.08); padding-top: 10px; }}
+        .status-row:first-child {{ border-top: 0; padding-top: 0; }}
+        .status-label {{ display: block; font-size: 13px; font-weight: 700; color: var(--ink); margin-bottom: 3px; }}
+        .status-value {{ color: var(--muted); line-height: 1.5; word-break: break-word; }}
+        .resume-card {{ border-radius: 22px; padding: 18px 18px 20px; background: rgba(255,255,255,0.64); border: 1px solid rgba(19,33,43,0.1); }}
+        .resume-card .actions {{ margin-top: 14px; }}
+        .resume-title {{ font-size: 21px; margin: 0; }}
+        .page-choice-grid {{ display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }}
+        .page-choice-card {{ border: 1px solid var(--line); border-radius: 22px; padding: 18px; background: rgba(255,255,255,0.78); }}
+        .page-choice-card h3 {{ margin: 0 0 8px; font-size: 22px; line-height: 1.2; }}
+        .page-choice-card p {{ margin: 0; color: var(--muted); line-height: 1.6; }}
+        .choice-meta {{ display: grid; gap: 8px; margin-top: 14px; }}
+        .choice-meta span {{ display: block; color: var(--muted); font-size: 14px; line-height: 1.5; }}
         .badge {{ display: inline-block; border-radius: 999px; padding: 6px 12px; font-size: 13px; font-weight: 700; }}
         .badge.ok {{ background: rgba(22,101,52,0.12); color: var(--ok); }}
         .badge.warn {{ background: rgba(180,83,9,0.14); color: var(--warn); }}
@@ -526,6 +564,11 @@ def _render_meta_shell(*, title: str, eyebrow: str, body_html: str) -> str:
         .small {{ color: var(--muted); font-size: 14px; line-height: 1.6; }}
         form {{ margin: 0; }}
         .inline-form {{ display: inline; }}
+        @media (max-width: 760px) {{
+            .hero-panel {{ grid-template-columns: 1fr; }}
+            .focus-card {{ padding: 20px; }}
+            .focus-card .button.primary, .focus-card button.primary {{ width: 100%; justify-content: center; text-align: center; }}
+        }}
     </style>
 </head>
 <body>
@@ -544,173 +587,268 @@ def _render_meta_shell(*, title: str, eyebrow: str, body_html: str) -> str:
 
 
 def _render_manage_page(*, tenant_name: str, tenant_id: str, status_payload: dict[str, Any], settings: Settings, line_user_id: str = "", flash: str = "") -> HTMLResponse:
-        connector = status_payload.get("connector") or {}
-        connected = bool(status_payload.get("connected"))
-        active_sessions = status_payload.get("active_sessions") or []
-        ig_user_id = str(connector.get("ig_user_id", "") or "").strip()
-        flash_html = ""
-        if flash == "disconnected":
-                flash_html = '<div class="section"><div class="note">已解除 Meta 連接。若要重新接通，可直接重新授權。</div></div>'
-        elif flash == "connected":
-                flash_html = '<div class="section"><div class="note">Meta 已完成連接，你現在可以直接請 Kachu+ 幫你查 Facebook 成效。</div></div>'
-        elif flash:
-            flash_html = f'<div class="section"><div class="note">{escape(flash)}</div></div>'
+    connector = status_payload.get("connector") or {}
+    connected = bool(status_payload.get("connected"))
+    active_sessions = sorted(
+        status_payload.get("active_sessions") or [],
+        key=lambda item: str(item.get("expires_at", "") or ""),
+        reverse=True,
+    )
+    ig_user_id = str(connector.get("ig_user_id", "") or "").strip()
+    flash_html = ""
+    if flash == "disconnected":
+        flash_html = '<div class="section"><div class="note">已解除 Meta 連接。若要重新接通，可直接重新授權。</div></div>'
+    elif flash == "connected":
+        flash_html = '<div class="section"><div class="note">Meta 已完成連接，你現在可以直接請 Kachu+ 幫你查 Facebook 成效。</div></div>'
+    elif flash:
+        flash_html = f'<div class="section"><div class="note">{escape(flash)}</div></div>'
 
-        launch_url = build_meta_connect_launch_url(settings=settings, tenant_id=tenant_id, line_user_id=line_user_id)
-        disconnect_action = _append_query(f"/tenants/{tenant_id}/meta/disconnect-web", {"line_user_id": line_user_id})
-        session_links = "".join(
-                f'<div class="tile"><strong>授權流程未完成</strong><p>狀態：{escape(str(item.get("status", "")))}。你可以從上次停下的地方繼續。</p><div class="actions"><a class="button secondary" href="{escape(_build_meta_session_page_url(settings=settings, session_id=str(item.get("session_id", ""))))}">回到授權流程</a></div></div>'
-                for item in active_sessions
-                if item.get("session_id")
-        )
+    launch_url = build_meta_connect_launch_url(settings=settings, tenant_id=tenant_id, line_user_id=line_user_id)
+    disconnect_action = _append_query(f"/tenants/{tenant_id}/meta/disconnect-web", {"line_user_id": line_user_id})
+    recent_session = next((item for item in active_sessions if item.get("session_id")), None)
 
-        if connected:
-                current_block = f"""
-                <div class="tile">
-                    <strong>{escape(str(connector.get("account_label", "Meta")) or "Meta")}</strong>
-                    <p>Facebook 粉專 ID：{escape(str(connector.get("fb_page_id", "") or "未記錄"))}</p>
-                    <p>Instagram：{'已連接' if ig_user_id else '尚未連接'}</p>
-                    <div class="actions">
-                        <a class="button primary" href="{escape(launch_url)}">重新授權</a>
-                        <a class="button warn" href="{escape(disconnect_action)}">解除綁定</a>
-                    </div>
-                </div>
-                """
-        else:
-                current_block = f"""
-                <div class="tile">
-                    <strong>目前尚未連接 Meta</strong>
-                    <p>完成授權後，你就可以請 Kachu+ 幫你整理 Facebook 成效、之後也能接上 FB/IG 發文流程。</p>
-                    <div class="actions">
-                        <a class="button primary" href="{escape(launch_url)}">立即開始連接</a>
-                    </div>
-                </div>
-                """
-
-        active_section = ""
-        if session_links:
-                active_section = f'<div class="section"><div class="grid">{session_links}</div></div>'
-
-        body_html = f"""
-        <div class="section">
-            <div class="badge {'ok' if connected else 'info'}">{'已連接' if connected else '尚未連接'}</div>
-            <p class="lead">{escape(tenant_name or '這間店')} 的 Meta 管理中心。這裡可以開始授權、重新授權、解除綁定，並確認目前連到哪個 Facebook 粉專。</p>
+    if connected:
+        current_block = f"""
+        <div class="focus-card">
+            <div class="mini-label">目前已連接</div>
+            <h2>{escape(str(connector.get("account_label", "Meta")) or "Meta")}</h2>
+            <p>你現在可以直接請 Kachu+ 幫你查 Facebook 成效。若要換粉專或補接 Instagram，再重新授權一次即可。</p>
+            <div class="actions">
+                <a class="button primary" href="{escape(launch_url)}">重新授權</a>
+                <a class="button warn" href="{escape(disconnect_action)}">解除綁定</a>
+            </div>
+            <p class="small">目前連接維持不中斷，只有你主動換粉專或解除綁定時才需要再處理。</p>
         </div>
-        {flash_html}
-        <div class="section">
-            <div class="grid two">
-                {current_block}
-                <div class="tile">
-                    <strong>這一輪會完成什麼</strong>
-                    <p>1. 連接 Facebook 粉專</p>
-                    <p>2. 若有綁 Instagram 商業帳號，一起完成 IG 連接</p>
-                    <p>3. 連完後同步回到 LINE 通知你結果</p>
+        """
+        support_block = f"""
+        <div class="tile support-card">
+            <strong>目前狀態</strong>
+            <div class="status-stack">
+                <div class="status-row">
+                    <span class="status-label">Facebook 粉專 ID</span>
+                    <div class="status-value">{escape(str(connector.get("fb_page_id", "") or "未記錄"))}</div>
+                </div>
+                <div class="status-row">
+                    <span class="status-label">Instagram</span>
+                    <div class="status-value">{'Instagram：已連接，可一起帶入 IG 能力' if ig_user_id else 'Instagram：尚未連接，之後補綁 Instagram 商業帳號後可再重新授權'}</div>
                 </div>
             </div>
         </div>
-        {active_section}
         """
-        return HTMLResponse(_render_meta_shell(title="Meta 連接管理", eyebrow="Kachu+ Meta", body_html=body_html))
+    else:
+        current_block = f"""
+        <div class="focus-card">
+            <div class="mini-label">現在先做這一步</div>
+            <h2>先完成 Facebook 授權</h2>
+            <p>整個流程大約 1 分鐘。完成後，Kachu+ 就能幫你查看 Facebook 成效，之後也能接上 FB / IG 發文能力。</p>
+            <div class="actions">
+                <a class="button primary" href="{escape(launch_url)}">立即開始連接</a>
+            </div>
+            <p class="small">完成後會自動回到 LINE 通知你結果，不需要記一堆設定。</p>
+        </div>
+        """
+        support_block = """
+        <div class="tile support-card">
+            <strong>這一輪你會完成什麼</strong>
+            <ul class="meta-points">
+                <li>連接 Facebook 粉專</li>
+                <li>若粉專已綁 Instagram 商業帳號，系統會一起帶入</li>
+                <li>完成後會同步回到 LINE 告訴你結果</li>
+            </ul>
+        </div>
+        """
+
+    active_section = ""
+    if recent_session is not None:
+        session_url = _build_meta_session_page_url(settings=settings, session_id=str(recent_session.get("session_id", "")))
+        pending_note = "你上次的授權流程還沒完成，從這裡繼續就好。"
+        if len(active_sessions) > 1:
+            pending_note = f"目前有 {len(active_sessions)} 筆未完成流程，我們先帶你回到最近一次，避免你被多個入口干擾。"
+        active_section = f"""
+        <div class="section">
+            <div class="resume-card">
+                <h2 class="resume-title">繼續上次授權</h2>
+                <p class="lead tight">{pending_note}</p>
+                <p class="small">目前狀態：{escape(str(recent_session.get("status", "pending")))}。</p>
+                <div class="actions">
+                    <a class="button secondary" href="{escape(session_url)}">繼續授權流程</a>
+                </div>
+            </div>
+        </div>
+        """
+
+    body_html = f"""
+    <div class="section">
+        <div class="badge {'ok' if connected else 'info'}">{'已連接' if connected else '尚未連接'}</div>
+        <p class="lead tight">{escape(tenant_name or '這間店')} 的 Meta 管理頁。主操作只有一個：{('管理現有連接' if connected else '先完成授權')}；其他資訊我幫你收在下面，避免干擾。</p>
+    </div>
+    {flash_html}
+    <div class="section">
+        <div class="hero-panel">
+            {current_block}
+            {support_block}
+        </div>
+    </div>
+    {active_section}
+    """
+    return HTMLResponse(_render_meta_shell(title="Meta 連接管理", eyebrow="Kachu+ Meta", body_html=body_html))
 
 
 def _render_session_page(*, tenant_name: str, session_payload: dict[str, Any], settings: Settings) -> HTMLResponse:
-        pages = session_payload.get("pages") or []
-        session_id = str(session_payload.get("session_id", "") or "")
-        status_value = str(session_payload.get("status", "") or "")
-        selected_page_name = str(session_payload.get("selected_page_name", "") or "")
-        selected_page_id = str(session_payload.get("selected_page_id", "") or "")
-        manage_url = build_meta_manage_url(settings=settings, tenant_id=str(session_payload.get("tenant_id", "") or ""))
+    pages = session_payload.get("pages") or []
+    session_id = str(session_payload.get("session_id", "") or "")
+    status_value = str(session_payload.get("status", "") or "")
+    selected_page_name = str(session_payload.get("selected_page_name", "") or "")
+    selected_page_id = str(session_payload.get("selected_page_id", "") or "")
+    manage_url = build_meta_manage_url(settings=settings, tenant_id=str(session_payload.get("tenant_id", "") or ""))
 
-        if status_value == "completed":
-                return _render_success_page(tenant_name=tenant_name, session_payload=session_payload, settings=settings)
+    if status_value == "completed":
+        return _render_success_page(tenant_name=tenant_name, session_payload=session_payload, settings=settings)
 
-        if status_value in {"failed", "expired"}:
-                return _render_error_page(
-                        title="Meta 連接未完成",
-                        message=str(session_payload.get("error_message", "") or "Meta 授權流程未完成，請重新開始。"),
-                        action_url=manage_url,
-                        action_label="回到管理頁",
-                )
+    if status_value in {"failed", "expired"}:
+        return _render_error_page(
+            title="Meta 連接未完成",
+            message=str(session_payload.get("error_message", "") or "Meta 授權流程未完成，請重新開始。"),
+            action_url=manage_url,
+            action_label="回到管理頁",
+        )
 
-        if status_value == "awaiting_overwrite_confirmation":
-                confirm_url = _append_query(
-                        f"/meta/connect/{session_id}/select-page-web",
-                        {"page_id": selected_page_id, "overwrite_existing": "true"},
-                )
-                body_html = f"""
-                <div class="section">
-                    <div class="badge warn">需要覆蓋確認</div>
-                    <p class="lead">你選擇的粉專是 {escape(selected_page_name or selected_page_id)}。這個商家目前已綁定另一個 Facebook 粉專，若繼續會直接覆蓋舊連接。</p>
-                </div>
-                <div class="section">
-                    <div class="actions">
-                        <a class="button primary" href="{escape(confirm_url)}">確認覆蓋並連接</a>
-                        <a class="button secondary" href="{escape(manage_url)}">取消並回管理頁</a>
-                    </div>
-                </div>
-                """
-                return HTMLResponse(_render_meta_shell(title="確認覆蓋既有連接", eyebrow=f"{tenant_name} / Meta", body_html=body_html))
-
-        page_tiles = []
-        for item in pages:
-                select_url = _append_query(
-                        f"/meta/connect/{session_id}/select-page-web",
-                        {"page_id": str(item.get('page_id', '') or '')},
-                )
-                page_tiles.append(
-                        f"""
-                        <div class="tile">
-                            <strong>{escape(str(item.get('page_name', '') or '未命名粉專'))}</strong>
-                            <p>Facebook Page ID：{escape(str(item.get('page_id', '') or ''))}</p>
-                            <p>Instagram：{'已連接' if str(item.get('ig_user_id', '') or '').strip() else '尚未連接'}</p>
-                            <div class="actions">
-                                <a class="button primary" href="{escape(select_url)}">連接這個粉專</a>
-                            </div>
-                        </div>
-                        """
-                )
+    if status_value == "awaiting_overwrite_confirmation":
+        confirm_url = _append_query(
+            f"/meta/connect/{session_id}/select-page-web",
+            {"page_id": selected_page_id, "overwrite_existing": "true"},
+        )
         body_html = f"""
         <div class="section">
-            <div class="badge info">選擇 Facebook 粉專</div>
-            <p class="lead">為 {escape(tenant_name or '這間店')} 選擇一個要連接的 Facebook 粉專。若該粉專已綁 Instagram 商業帳號，系統會一起帶入。</p>
+            <div class="hero-panel">
+                <div class="focus-card">
+                    <div class="mini-label">最後確認一次</div>
+                    <h2>是否覆蓋目前連接？</h2>
+                    <p>你選擇的是 {escape(selected_page_name or selected_page_id)}。如果繼續，這間店原本綁定的 Facebook 粉專會被新的連接取代。</p>
+                    <div class="actions">
+                        <a class="button primary" href="{escape(confirm_url)}">確認覆蓋並連接</a>
+                        <a class="button secondary" href="{escape(manage_url)}">取消，回管理頁</a>
+                    </div>
+                    <p class="small">只有你現在按下確認時，系統才會真的改掉原本的連接。</p>
+                </div>
+                <div class="tile support-card">
+                    <strong>這代表什麼</strong>
+                    <ul class="meta-points">
+                        <li>原本的粉專連接會被新的粉專取代</li>
+                        <li>之後 Meta 成效與後續能力都會改用新的粉專</li>
+                        <li>如果你還不確定，先取消是比較安全的做法</li>
+                    </ul>
+                </div>
+            </div>
         </div>
-        <div class="section">
-            <div class="grid">{''.join(page_tiles)}</div>
-        </div>
-        <div class="section"><a class="button secondary" href="{escape(manage_url)}">回到管理頁</a></div>
         """
-        return HTMLResponse(_render_meta_shell(title="選擇要連接的粉專", eyebrow=f"{tenant_name} / Meta", body_html=body_html))
+        return HTMLResponse(_render_meta_shell(title="確認覆蓋既有連接", eyebrow=f"{tenant_name} / Meta", body_html=body_html))
+
+    page_tiles = []
+    for item in pages:
+        select_url = _append_query(
+            f"/meta/connect/{session_id}/select-page-web",
+            {"page_id": str(item.get('page_id', '') or '')},
+        )
+        instagram_text = "Instagram：已連接，可一起帶入" if str(item.get("ig_user_id", "") or "").strip() else "Instagram：尚未連接"
+        page_tiles.append(
+            f"""
+            <div class="page-choice-card">
+                <h3>{escape(str(item.get('page_name', '') or '未命名粉專'))}</h3>
+                <p>確認這是你要交給 Kachu+ 使用的 Facebook 粉專。</p>
+                <div class="choice-meta">
+                    <span>Facebook Page ID：{escape(str(item.get('page_id', '') or ''))}</span>
+                    <span>{instagram_text}</span>
+                </div>
+                <div class="actions">
+                    <a class="button primary" href="{escape(select_url)}">連接這個粉專</a>
+                </div>
+            </div>
+            """
+        )
+    body_html = f"""
+    <div class="section">
+        <div class="hero-panel">
+            <div class="focus-card">
+                <div class="mini-label">現在選一個</div>
+                <h2>先選你要連接的 Facebook 粉專</h2>
+                <p>下面每一張卡都代表一個你目前有權限管理的粉專。只要選一個，系統就會完成這次連接。</p>
+                <div class="actions">
+                    <a class="button secondary" href="{escape(manage_url)}">先回管理頁</a>
+                </div>
+                <p class="small">如果粉專本身已綁 Instagram 商業帳號，系統會一起帶入，不需要你多做一步。</p>
+            </div>
+            <div class="tile support-card">
+                <strong>挑選時看這兩件事</strong>
+                <ul class="meta-points">
+                    <li>粉專名稱是不是你現在真的在經營的那一個</li>
+                    <li>若你之後也想用 IG，優先選有顯示已連接 Instagram 的粉專</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    <div class="section">
+        <div class="page-choice-grid">{''.join(page_tiles)}</div>
+    </div>
+    """
+    return HTMLResponse(_render_meta_shell(title="選擇要連接的粉專", eyebrow=f"{tenant_name} / Meta", body_html=body_html))
 
 
 def _render_success_page(*, tenant_name: str, session_payload: dict[str, Any], settings: Settings) -> HTMLResponse:
-        manage_url = _append_query(build_meta_manage_url(settings=settings, tenant_id=str(session_payload.get("tenant_id", "") or "")), {"flash": "connected"})
-        page_name = str(session_payload.get("selected_page_name", "") or "未命名粉專")
-        ig_connected = bool(str(session_payload.get("selected_ig_user_id", "") or "").strip())
-        body_html = f"""
-        <div class="section">
-            <div class="badge ok">授權完成</div>
-            <p class="lead">已成功連接 Facebook 粉專 {escape(page_name)}。{'Instagram 也已一起連接完成。' if ig_connected else '目前尚未偵測到對應的 Instagram 商業帳號，所以這次先完成 Facebook 連接。'}</p>
-        </div>
-        <div class="section">
-            <div class="grid two">
-                <div class="tile"><strong>現在可以做的事</strong><p>你可以直接回到 LINE 說「幫我看 Facebook 成效」。</p></div>
-                <div class="tile"><strong>後續管理</strong><p>如果之後要換粉專、補接 Instagram 或重新授權，都可以回管理頁處理。</p></div>
+    manage_url = _append_query(build_meta_manage_url(settings=settings, tenant_id=str(session_payload.get("tenant_id", "") or "")), {"flash": "connected"})
+    page_name = str(session_payload.get("selected_page_name", "") or "未命名粉專")
+    ig_connected = bool(str(session_payload.get("selected_ig_user_id", "") or "").strip())
+    body_html = f"""
+    <div class="section">
+        <div class="hero-panel">
+            <div class="focus-card">
+                <div class="mini-label">已完成</div>
+                <h2>Meta 已經連好了</h2>
+                <p>已成功連接 Facebook 粉專 {escape(page_name)}。{'Instagram 也已一起連接完成。' if ig_connected else '目前尚未偵測到對應的 Instagram 商業帳號，所以這次先完成 Facebook 連接。'}</p>
+                <div class="actions">
+                    <a class="button primary" href="{escape(manage_url)}">回到管理頁</a>
+                </div>
+                <p class="small">你現在可以直接回到 LINE，開始請 Kachu+ 幫你看 Facebook 成效。</p>
             </div>
-            <div class="actions"><a class="button primary" href="{escape(manage_url)}">回到管理頁</a></div>
+            <div class="tile support-card">
+                <strong>接下來可以做什麼</strong>
+                <ul class="meta-points">
+                    <li>回到 LINE 說「幫我看 Facebook 成效」</li>
+                    <li>之後如果要換粉專或重新授權，都可以回管理頁處理</li>
+                    <li>{'Instagram 已一起接通，後續可延伸到 IG 能力' if ig_connected else '如果之後補好 Instagram 商業帳號，再重新授權一次即可補上'}</li>
+                </ul>
+            </div>
         </div>
-        """
-        return HTMLResponse(_render_meta_shell(title=f"{tenant_name} 已完成 Meta 連接", eyebrow="Kachu+ Meta", body_html=body_html))
+    </div>
+    """
+    return HTMLResponse(_render_meta_shell(title=f"{tenant_name} 已完成 Meta 連接", eyebrow="Kachu+ Meta", body_html=body_html))
 
 
 def _render_error_page(*, title: str, message: str, action_url: str, action_label: str) -> HTMLResponse:
-        body_html = f"""
-        <div class="section">
-            <div class="badge warn">流程未完成</div>
-            <p class="lead">{escape(message)}</p>
+    body_html = f"""
+    <div class="section">
+        <div class="hero-panel">
+            <div class="focus-card">
+                <div class="mini-label">這次沒有完成</div>
+                <h2>{escape(title)}</h2>
+                <p>{escape(message)}</p>
+                <div class="actions">
+                    <a class="button primary" href="{escape(action_url)}">{escape(action_label)}</a>
+                </div>
+                <p class="small">你不需要重頭理解整個流程，回上一頁後直接照著唯一的主按鈕繼續就好。</p>
+            </div>
+            <div class="tile support-card">
+                <strong>通常怎麼處理</strong>
+                <ul class="meta-points">
+                    <li>先回到管理頁重新開始</li>
+                    <li>確認你登入的是正確的 Meta 帳號</li>
+                    <li>若問題持續，再回到 LINE 或工程端協助排查</li>
+                </ul>
+            </div>
         </div>
-        <div class="section"><div class="actions"><a class="button primary" href="{escape(action_url)}">{escape(action_label)}</a></div></div>
-        """
-        return HTMLResponse(_render_meta_shell(title=title, eyebrow="Kachu+ Meta", body_html=body_html), status_code=409)
+    </div>
+    """
+    return HTMLResponse(_render_meta_shell(title=title, eyebrow="Kachu+ Meta", body_html=body_html), status_code=409)
 
 
 async def deliver_meta_connection_result(
@@ -759,7 +897,7 @@ def resolve_line_push_access_token(*, repo: Any, settings: Settings, tenant_id: 
     if config is not None:
         token = str(getattr(config, "channel_access_token", "") or "").strip()
         if token:
-            return token
+            return decrypt_field(token, str(getattr(settings, "FIELD_ENCRYPTION_KEY", "") or ""))
     return str(getattr(settings, "LINE_CHANNEL_ACCESS_TOKEN", "") or "").strip()
 
 
@@ -1093,6 +1231,12 @@ class MetaOAuthFlowService:
         return access_token
 
     def _fetch_page_candidates(self, *, access_token: str) -> list[dict[str, Any]]:
+        pages = self._fetch_page_candidates_from_accounts(access_token=access_token)
+        if pages:
+            return pages
+        return self._fetch_page_candidates_from_granular_scopes(access_token=access_token)
+
+    def _fetch_page_candidates_from_accounts(self, *, access_token: str) -> list[dict[str, Any]]:
         response = httpx.get(
             f"{GRAPH_BASE}/me/accounts",
             params={
@@ -1110,6 +1254,82 @@ class MetaOAuthFlowService:
         if not isinstance(pages, list):
             return []
         return [_normalize_meta_page_candidate(item) for item in pages if isinstance(item, dict)]
+
+    def _fetch_page_candidates_from_granular_scopes(self, *, access_token: str) -> list[dict[str, Any]]:
+        page_ids = self._get_granular_scope_page_ids(access_token=access_token)
+        if not page_ids:
+            return []
+        pages: list[dict[str, Any]] = []
+        for page_id in page_ids:
+            candidate = self._fetch_page_candidate_by_id(page_id=page_id, access_token=access_token)
+            if candidate.get("page_id") and candidate.get("page_access_token"):
+                pages.append(candidate)
+        return pages
+
+    def _get_granular_scope_page_ids(self, *, access_token: str) -> list[str]:
+        app_id = str(self._settings.META_APP_ID or "").strip()
+        app_secret = str(self._settings.META_APP_SECRET or "").strip()
+        if not app_id or not app_secret:
+            return []
+        response = httpx.get(
+            "https://graph.facebook.com/debug_token",
+            params={
+                "input_token": access_token,
+                "access_token": f"{app_id}|{app_secret}",
+            },
+            timeout=20.0,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.warning("meta oauth debug_token fallback failed", exc_info=True)
+            return []
+        payload = response.json()
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        granular_scopes = data.get("granular_scopes", []) if isinstance(data, dict) else []
+        if not isinstance(granular_scopes, list):
+            return []
+        explicit_page_ids: list[str] = []
+        fallback_page_ids: list[str] = []
+        seen: set[str] = set()
+        for scope_payload in granular_scopes:
+            if not isinstance(scope_payload, dict):
+                continue
+            scope_name = str(scope_payload.get("scope", "") or "").strip()
+            if scope_name != "pages_show_list" and scope_name not in _PAGE_TARGET_SCOPES:
+                continue
+            for raw_target_id in scope_payload.get("target_ids", []) or []:
+                target_id = str(raw_target_id or "").strip()
+                if not target_id or target_id in seen:
+                    continue
+                seen.add(target_id)
+                if scope_name == "pages_show_list":
+                    explicit_page_ids.append(target_id)
+                else:
+                    fallback_page_ids.append(target_id)
+        return explicit_page_ids or fallback_page_ids
+
+    def _fetch_page_candidate_by_id(self, *, page_id: str, access_token: str) -> dict[str, Any]:
+        normalized_page_id = str(page_id or "").strip()
+        if not normalized_page_id:
+            return {}
+        response = httpx.get(
+            f"{GRAPH_BASE}/{normalized_page_id}",
+            params={
+                "fields": "id,name,access_token,instagram_business_account{id,username}",
+                "access_token": access_token,
+            },
+            timeout=20.0,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.warning("meta oauth target_id fallback page fetch failed", extra={"page_id": normalized_page_id}, exc_info=True)
+            return {}
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return {}
+        return _normalize_meta_page_candidate(payload)
 
 
 def _meta_service(request: Request) -> MetaInsightsService:

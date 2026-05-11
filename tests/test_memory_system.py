@@ -15,7 +15,7 @@ from kachu_plus.evaluation import (
     compute_retrieval_hit_rate,
     compute_task_follow_up_success_rate,
 )
-from kachu_plus.learning import MemoryManager
+from kachu_plus.learning import ConversationLearningService, MemoryManager
 from kachu_plus.memory_promotion import ConversationMemoryPromoter
 from kachu_plus.models import BossRouteMode
 from kachu_plus.persistence.repository import KachuPlusRepository
@@ -112,6 +112,34 @@ def test_memory_promoter_promotes_fact_preference_and_episode() -> None:
     assert any(item.category == "basic_info" for item in knowledge)
     assert any("更口語" in item.edited_draft for item in preferences)
     assert any(item.outcome == "accepted" for item in episodes)
+
+
+def test_conversation_learning_service_promotes_safety_concern_into_knowledge() -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    with Session(engine) as session:
+        session.add(TenantTable(id="tenant-1", name="測試店"))
+        session.commit()
+
+    conversation = repo.save_conversation(
+        tenant_id="tenant-1",
+        line_user_id="U1",
+        actor_role="boss",
+        channel_type="line",
+        conversation_kind="boss_consult",
+        content_text="最近很多客人都很在意安全性，也會追問有沒有副作用。",
+    )
+
+    result = ConversationLearningService(repo).absorb_conversation(
+        tenant_id="tenant-1",
+        line_user_id="U1",
+        conversation=conversation,
+    )
+
+    knowledge = repo.list_knowledge_entries("tenant-1", limit=10)
+    assert result["knowledge"] == 1
+    assert any(item.category == "pain_point" and "安全性" in item.content for item in knowledge)
 
 
 def test_dialogue_state_resolver_carries_status_and_consult_followups() -> None:

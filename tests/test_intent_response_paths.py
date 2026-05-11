@@ -216,6 +216,35 @@ def test_execute_draft_status_returns_task_progress_without_dispatch() -> None:
     execute_dispatcher.get_task.assert_awaited_once()
 
 
+def test_execute_draft_status_resends_pending_approval_card_when_waiting_approval() -> None:
+    app, repo, execute_dispatcher, _ = _make_app(onboarding_complete=True)
+    client = TestClient(app)
+    repo.get_latest_execute_task_record.return_value = SimpleNamespace(
+        task_id="task-1",
+        run_id="run-1",
+        status="waiting_approval",
+        intent_label="photo_content",
+    )
+    repo.get_pending_approval_by_run_id.return_value = SimpleNamespace(
+        status="delivery_failed",
+        workflow_type="kachu_photo_content",
+        agentos_run_id="run-1",
+        tenant_id=_TENANT_ID,
+        draft_content=json.dumps({"ig_fb": "IG 草稿", "google": "Google 草稿"}, ensure_ascii=False),
+    )
+    execute_dispatcher.get_task = AsyncMock(return_value=SimpleNamespace(task={"status": "waiting_approval", "current_run_id": "run-1"}))
+    execute_dispatcher.get_run = AsyncMock(return_value=SimpleNamespace(run={"status": "waiting_approval"}))
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()) as push_mock:
+        resp = _post_event(client, "草稿好了嗎")
+
+    assert resp.status_code == 200
+    execute_dispatcher.dispatch.assert_not_called()
+    messages = push_mock.await_args.kwargs["messages"]
+    assert "通知沒有成功送達" in messages[0]["text"]
+    assert messages[1]["type"] == "flex"
+
+
 def test_execute_website_ingest_returns_summary_without_dispatch() -> None:
     app, _, execute_dispatcher, _ = _make_app(onboarding_complete=True)
     client = TestClient(app)

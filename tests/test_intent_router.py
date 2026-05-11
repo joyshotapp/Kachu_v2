@@ -206,6 +206,7 @@ def test_website_url_message_returns_website_ingest_intent() -> None:
     ("text", "intent_label"),
     [
         ("我要連接 FB/IG", "meta_connect"),
+        ("我要串接meta帳號", "meta_connect"),
         ("我要重新授權 FB/IG", "meta_reauth"),
         ("我現在連的是哪個粉專", "meta_status"),
         ("我要解除 Meta 連接", "meta_disconnect"),

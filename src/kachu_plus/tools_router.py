@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import importlib
 import json
+import sys
 from datetime import datetime, timezone
 from typing import Any
+
+try:
+    import litellm as _litellm_mod
+    _LITELLM_AVAILABLE = True
+except Exception as _litellm_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger(__name__).warning("litellm import failed: %s", _litellm_err)
+    _litellm_mod = None  # type: ignore[assignment]
+    _LITELLM_AVAILABLE = False
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -248,6 +259,25 @@ def _select_llm_api_key(*, model: str, google_api_key: str, openai_api_key: str)
     return google_api_key or openai_api_key
 
 
+def _get_litellm_module() -> Any:
+    cached = sys.modules.get("litellm")
+    if cached is not None:
+        return cached
+    if _litellm_mod is not None:
+        return _litellm_mod
+    try:
+        return importlib.import_module("litellm")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_hard_fact_faq(*, message: str, best_entry: dict[str, Any]) -> bool:
+    category = str(best_entry.get("category") or "")
+    if category in {"basic_info", "offer"}:
+        return True
+    return any(token in message for token in ("幾點", "營業", "地址", "電話", "多少錢", "價格"))
+
+
 async def _llm(
     *,
     prompt: str,
@@ -256,7 +286,9 @@ async def _llm(
     openai_api_key: str = "",
     image_url: str = "",
 ) -> str:
-    import litellm
+    litellm_module = _get_litellm_module()
+    if litellm_module is None:
+        raise ImportError("litellm not installed")
 
     user_content: Any = prompt
     if image_url:
@@ -264,7 +296,7 @@ async def _llm(
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": image_url}},
         ]
-    response = await litellm.acompletion(
+    response = await litellm_module.acompletion(
         model=model,
         messages=[
             {"role": "system", "content": "你是 Kachu+ 的商家內容分析助手。若被要求輸出 JSON，就只能輸出 JSON 物件本身。"},
@@ -325,7 +357,7 @@ async def retrieve_faq_answer(*, repo: Any, settings: Any, tenant_id: str, messa
         return {"answer": "", "confidence": 0.2, "should_escalate": True, "escalate_reason": "知識庫沒有相符內容"}
 
     answer_text = str(best_entry.get("content", "") or "")
-    if settings.GOOGLE_AI_API_KEY or settings.OPENAI_API_KEY:
+    if (settings.GOOGLE_AI_API_KEY or settings.OPENAI_API_KEY) and not _is_hard_fact_faq(message=message, best_entry=best_entry):
         prompt = (
             "根據以下品牌知識，用繁體中文簡短回答顧客問題，80 字內。"
             f"產業語氣：{industry_context.get('recommended_tone', '親切真誠')}。"
@@ -661,9 +693,24 @@ def fetch_review(body: FetchReviewRequest, request: Request) -> dict[str, Any]:
 
 @router.post("/analyze-photo")
 async def analyze_photo(body: AnalyzePhotoRequest, request: Request) -> dict[str, Any]:
-    if not body.photo_url:
+    return await analyze_photo_payload(
+        photo_url=body.photo_url,
+        line_message_id=body.line_message_id,
+        run_id=body.run_id,
+        settings=_settings(request),
+    )
+
+
+async def analyze_photo_payload(
+    *,
+    photo_url: str,
+    line_message_id: str = "",
+    run_id: str = "",
+    settings: Any,
+) -> dict[str, Any]:
+    if not photo_url:
         return {
-            "analysis_id": f"analysis-{body.line_message_id or body.run_id}",
+            "analysis_id": f"analysis-{line_message_id or run_id}",
             "scene_description": "照片未提供，請重新上傳後再試一次。",
             "upload_intent": "日常分享",
             "detected_objects": [],
@@ -673,7 +720,6 @@ async def analyze_photo(body: AnalyzePhotoRequest, request: Request) -> dict[str
             "needs_manual_review": True,
         }
 
-    settings = _settings(request)
     if settings.GOOGLE_AI_API_KEY or settings.OPENAI_API_KEY:
         prompt = (
             "請分析這張商家上傳照片，並只輸出 JSON。"
@@ -687,14 +733,14 @@ async def analyze_photo(body: AnalyzePhotoRequest, request: Request) -> dict[str
                 model=settings.LITELLM_MODEL,
                 api_key=settings.GOOGLE_AI_API_KEY,
                 openai_api_key=settings.OPENAI_API_KEY,
-                image_url=body.photo_url,
+                image_url=photo_url,
             )
             payload = _parse_json_object(raw)
             quality_score = max(0.0, min(1.0, float(payload.get("quality_score", 0.0))))
             detected_objects = [str(item).strip() for item in payload.get("detected_objects", []) if str(item).strip()]
             suggested_tags = [str(item).strip() for item in payload.get("suggested_tags", []) if str(item).strip()]
             return {
-                "analysis_id": f"analysis-{body.line_message_id or body.run_id}",
+                "analysis_id": f"analysis-{line_message_id or run_id}",
                 "scene_description": str(payload.get("scene_description") or "老闆剛上傳一張可用於社群貼文的照片。"),
                 "upload_intent": str(payload.get("upload_intent") or "日常分享"),
                 "detected_objects": detected_objects,
@@ -707,7 +753,7 @@ async def analyze_photo(body: AnalyzePhotoRequest, request: Request) -> dict[str
             pass
 
     return {
-        "analysis_id": f"analysis-{body.line_message_id or body.run_id}",
+        "analysis_id": f"analysis-{line_message_id or run_id}",
         "scene_description": "老闆剛上傳一張可用於社群貼文的照片。",
         "upload_intent": "日常分享",
         "detected_objects": ["店內商品"],
@@ -915,7 +961,14 @@ async def notify_approval(body: NotifyApprovalRequest, request: Request) -> dict
     )
     settings = _settings(request)
     recipients = resolve_tenant_line_recipients(repo=repo, settings=settings, tenant_id=body.tenant_id)
-    if recipients and settings.LINE_CHANNEL_ACCESS_TOKEN:
+    line_access_token = resolve_line_push_access_token(repo=repo, settings=settings, tenant_id=body.tenant_id)
+    push_errors: list[str] = []
+    delivered_count = 0
+    if not recipients:
+        push_errors.append("no active LINE recipients")
+    if recipients and not line_access_token:
+        push_errors.append("missing LINE access token")
+    if recipients and line_access_token:
         review_payload = body.drafts.get("reply_draft", "")
         review_text = review_payload.get("reply_draft", "") if isinstance(review_payload, dict) else str(review_payload)
         google_text = str(body.drafts.get("post_text") or body.drafts.get("google") or "")
@@ -971,11 +1024,33 @@ async def notify_approval(body: NotifyApprovalRequest, request: Request) -> dict
             messages = [
                 {"type": "flex", "altText": alt_text, "contents": flex_content}
             ] if flex_content is not None else [text_message(f"有一項待確認草稿\n請到系統確認。 run_id={body.run_id}")]
-            await push_line_messages(
-                to=recipient,
-                messages=messages,
-                access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
-            )
+            try:
+                await push_line_messages(
+                    to=recipient,
+                    messages=messages,
+                    access_token=line_access_token,
+                )
+                delivered_count += 1
+            except Exception as exc:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "notify_approval: LINE push failed for recipient=%s run_id=%s: %s",
+                    recipient, body.run_id, exc,
+                )
+                push_errors.append(str(exc))
+    if push_errors and delivered_count == 0:
+        repo.update_pending_approval_status(
+            agentos_run_id=body.run_id,
+            status="delivery_failed",
+            actor_line_id="system",
+            decision_payload={
+                "stage": "notify_approval",
+                "push_warnings": push_errors,
+                "recipient_count": len(recipients),
+            },
+        )
+    if push_errors:
+        return {"status": "notified", "approval_record_id": pending.id, "push_warnings": push_errors}
     return {"status": "notified", "approval_record_id": pending.id}
 
 

@@ -9,7 +9,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, Session, create_engine
 
 from kachu_plus.config import Settings
-from kachu_plus.meta import MetaInsightsService, router
+from kachu_plus.meta import MetaInsightsService, MetaOAuthFlowService, router
 from kachu_plus.persistence.repository import KachuPlusRepository
 from kachu_plus.persistence.tables import TenantTable
 
@@ -237,6 +237,72 @@ def test_meta_oauth_select_page_requires_overwrite_confirmation() -> None:
     assert updated_session.selected_page_id == "fb-page-new"
 
 
+def test_meta_oauth_callback_falls_back_to_granular_scope_page_targets() -> None:
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed_tenant(repo)
+    settings = Settings()
+    settings.META_APP_ID = "meta-app-id"
+    settings.META_APP_SECRET = "meta-app-secret"
+    service = MetaOAuthFlowService(repo, settings)
+    oauth_session = repo.create_meta_oauth_session(
+        tenant_id="tenant-1",
+        line_user_id="U-owner-1",
+        state="state-1",
+    )
+
+    with patch.object(service, "_exchange_code_for_user_token", return_value="user-token"):
+        with patch(
+            "kachu_plus.meta.httpx.get",
+            side_effect=[
+                _FakeResponse({"data": []}),
+                _FakeResponse(
+                    {
+                        "data": {
+                            "granular_scopes": [
+                                {"scope": "pages_show_list", "target_ids": ["940149472511909"]},
+                                {"scope": "pages_read_engagement", "target_ids": ["940149472511909"]},
+                            ]
+                        }
+                    }
+                ),
+                _FakeResponse(
+                    {
+                        "id": "940149472511909",
+                        "name": "四時循養堂（原坐骨新經）",
+                        "access_token": "page-token-1",
+                    }
+                ),
+            ],
+        ):
+            payload = service.handle_callback(state="state-1", code="oauth-code")
+
+    assert payload["status"] == "selecting_page"
+    assert payload["pages"] == [
+        {
+            "page_id": "940149472511909",
+            "page_name": "四時循養堂（原坐骨新經）",
+            "page_access_token": "page-token-1",
+            "ig_user_id": "",
+            "ig_username": "",
+        }
+    ]
+    updated_session = repo.get_meta_oauth_session(oauth_session.id)
+    assert updated_session is not None
+    assert updated_session.status == "selecting_page"
+
+
 def test_meta_disconnect_deactivates_connector() -> None:
     engine = _make_engine()
     SQLModel.metadata.create_all(engine)
@@ -286,6 +352,34 @@ def test_meta_manage_page_renders_connection_state() -> None:
     assert "Meta 連接管理" in response.text
     assert "四時循養堂" in response.text
     assert "Instagram：已連接" in response.text
+
+
+def test_meta_manage_page_collapses_multiple_pending_sessions() -> None:
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed_tenant(repo)
+    settings = Settings()
+    settings.KACHU_BASE_URL = "https://plus.kachu.tw"
+    service = MetaInsightsService(repo, settings, client_factory=lambda **kwargs: _FakeMetaClient(**kwargs))
+    client = TestClient(_make_app(repo, settings, service))
+
+    repo.create_meta_oauth_session(
+        tenant_id="tenant-1",
+        line_user_id="U-owner-1",
+        state="state-1",
+    )
+    repo.create_meta_oauth_session(
+        tenant_id="tenant-1",
+        line_user_id="U-owner-1",
+        state="state-2",
+    )
+
+    response = client.get("/tenants/tenant-1/meta/manage")
+
+    assert response.status_code == 200
+    assert "目前有 2 筆未完成流程" in response.text
+    assert response.text.count("繼續授權流程") == 1
 
 
 def test_meta_callback_redirects_to_session_page_after_fetching_pages() -> None:
@@ -366,6 +460,78 @@ def test_meta_select_page_web_returns_success_html() -> None:
     assert response.status_code == 200
     assert "已成功連接 Facebook 粉專" in response.text
     assert "四時循養堂" in response.text
+
+
+def test_meta_connect_session_page_renders_simplified_page_selection() -> None:
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed_tenant(repo)
+    settings = Settings()
+    settings.KACHU_BASE_URL = "https://plus.kachu.tw"
+    service = MetaInsightsService(repo, settings, client_factory=lambda **kwargs: _FakeMetaClient(**kwargs))
+    client = TestClient(_make_app(repo, settings, service))
+
+    oauth_session = repo.create_meta_oauth_session(
+        tenant_id="tenant-1",
+        line_user_id="",
+        state="state-selection-page",
+    )
+    repo.update_meta_oauth_session(
+        session_id=oauth_session.id,
+        status="selecting_page",
+        user_access_token="user-token",
+        page_candidates=[
+            {
+                "page_id": "fb-page-1",
+                "page_name": "四時循養堂",
+                "page_access_token": "page-token-1",
+                "ig_user_id": "ig-user-1",
+                "ig_username": "seasonwell",
+            },
+            {
+                "page_id": "fb-page-2",
+                "page_name": "備用粉專",
+                "page_access_token": "page-token-2",
+                "ig_user_id": "",
+                "ig_username": "",
+            },
+        ],
+    )
+
+    response = client.get(f"/meta/connect/{oauth_session.id}/page")
+
+    assert response.status_code == 200
+    assert "先選你要連接的 Facebook 粉專" in response.text
+    assert response.text.count("連接這個粉專") == 2
+
+
+def test_meta_connect_session_page_renders_simplified_error_page() -> None:
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed_tenant(repo)
+    settings = Settings()
+    settings.KACHU_BASE_URL = "https://plus.kachu.tw"
+    service = MetaInsightsService(repo, settings, client_factory=lambda **kwargs: _FakeMetaClient(**kwargs))
+    client = TestClient(_make_app(repo, settings, service))
+
+    oauth_session = repo.create_meta_oauth_session(
+        tenant_id="tenant-1",
+        line_user_id="",
+        state="state-error-page",
+    )
+    repo.update_meta_oauth_session(
+        session_id=oauth_session.id,
+        status="failed",
+        error_message="Meta 授權流程未完成，請重新開始。",
+    )
+
+    response = client.get(f"/meta/connect/{oauth_session.id}/page")
+
+    assert response.status_code == 409
+    assert "這次沒有完成" in response.text
+    assert "通常怎麼處理" in response.text
 
 
 def test_meta_webhook_verification_returns_challenge() -> None:

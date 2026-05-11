@@ -3,6 +3,43 @@ from __future__ import annotations
 from typing import Any
 
 
+def build_asset_intent_prompt_message(
+    *,
+    asset_intent_id: str,
+    tenant_id: str,
+    analysis: dict[str, Any],
+) -> dict[str, Any]:
+    scene = str(analysis.get("scene_description") or "這張照片").strip()
+    upload_intent = str(analysis.get("upload_intent") or "").strip()
+    text = f"我收到這張照片了。看起來是：{scene}"
+    if upload_intent:
+        text += f"\n我目前推測它比較適合拿來做「{upload_intent}」。"
+    text += "\n你要我怎麼處理這張圖？"
+
+    def _item(label: str, decision: str, display_text: str) -> dict[str, Any]:
+        return {
+            "type": "action",
+            "action": {
+                "type": "postback",
+                "label": label,
+                "data": f"action=asset_intent&decision={decision}&asset_intent_id={asset_intent_id}&tenant_id={tenant_id}",
+                "displayText": display_text,
+            },
+        }
+
+    return {
+        "type": "text",
+        "text": text,
+        "quickReply": {
+            "items": [
+                _item("寫貼文", "photo_content", "用這張圖寫貼文"),
+                _item("進知識庫", "knowledge_update", "把這張圖收進知識庫"),
+                _item("先討論", "consult", "先討論這張圖怎麼用"),
+            ]
+        },
+    }
+
+
 def build_photo_content_flex(
     run_id: str,
     tenant_id: str,

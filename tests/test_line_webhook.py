@@ -24,7 +24,8 @@ from sqlalchemy.pool import StaticPool
 
 from kachu_plus.line.webhook import _handle_tag_management, router
 from kachu_plus.persistence.repository import KachuPlusRepository
-from kachu_plus.persistence.tables import CustomerProfileTable, LineChannelConfigTable, TenantTable
+from kachu_plus.config import Settings
+from kachu_plus.persistence.tables import CustomerProfileTable, LineChannelConfigTable, OnboardingStateTable, TenantTable
 
 _TENANT_ID = "tenant-abc"
 _CHANNEL_SECRET = "test_channel_secret"
@@ -261,6 +262,55 @@ def test_line_webhook_records_event_envelope_metadata() -> None:
     assert stored[0].external_thread_id == "mid-1"
     assert stored[0].occurred_at is not None
     assert stored[0].received_at is not None
+
+
+def test_boss_message_auto_promotes_into_knowledge_entries() -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    with Session(engine) as session:
+        session.add(TenantTable(id=_TENANT_ID, name="測試店", industry_type="保健食品"))
+        session.add(OnboardingStateTable(tenant_id=_TENANT_ID, step="completed"))
+        session.add(_valid_config())
+        session.commit()
+
+    app = FastAPI()
+    app.state.repository = repo
+    app.state.settings = Settings()
+    app.include_router(router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    body = _make_body(
+        [
+            {
+                "type": "message",
+                "timestamp": 1714895904000,
+                "source": {"type": "user", "userId": "U-owner-1"},
+                "message": {
+                    "id": "mid-knowledge-1",
+                    "type": "text",
+                    "text": "最近很多客人都在意安全性，也會追問有沒有副作用。",
+                },
+            }
+        ]
+    )
+    sig = _make_signature(body, _CHANNEL_SECRET)
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()):
+        response = client.post(
+            f"/webhooks/line/{_TENANT_ID}",
+            content=body,
+            headers={"X-Line-Signature": sig, "Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    knowledge = repo.list_knowledge_entries(_TENANT_ID, limit=10)
+    assert any(item.category == "pain_point" for item in knowledge)
+    assert any("安全性" in item.content for item in knowledge)
 
 
 @pytest.mark.asyncio

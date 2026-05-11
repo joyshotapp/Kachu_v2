@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -20,6 +20,7 @@ from kachu_plus.crypto import decrypt_field
 from kachu_plus.dialogue_state import DialogueStateResolver
 from kachu_plus.intent_router import classify_boss_message
 from kachu_plus.line.flex_builder import (
+    build_asset_intent_prompt_message,
     build_external_reply_flex,
     build_google_post_flex,
     build_photo_content_flex,
@@ -40,10 +41,11 @@ from kachu_plus.onboarding.flow import OnboardingFlow
 from kachu_plus.line.push import push_line_messages, resolve_tenant_line_recipients, text_message
 from kachu_plus.suggestions import handle_suggestion_action
 from kachu_plus.publishing import publish_content_bundle, publish_content_bundle_succeeded, publish_meta_reply
-from kachu_plus.tools_router import build_content_drafts, build_content_plan_payload, run_line_faq_flow
+from kachu_plus.tools_router import analyze_photo_payload, build_content_drafts, build_content_plan_payload, run_line_faq_flow
 from kachu_plus.services import (
     AgentOSTaskDispatcher,
     ContextBriefManager,
+    ConversationLearningService,
     LLMConsultant,
     MemoryManager,
     PostTaskReviewService,
@@ -55,6 +57,8 @@ from kachu_plus.website_knowledge import WebsiteKnowledgeIngestionService, forma
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["line"])
+
+_PENDING_ASSET_INTENT_TTL = timedelta(minutes=30)
 
 
 def _extract_text_messages(messages: list[dict[str, Any]]) -> list[str]:
@@ -70,6 +74,7 @@ def _extract_text_messages(messages: list[dict[str, Any]]) -> list[str]:
 
 def _record_inbound_conversation(
     *,
+    app: Any | None = None,
     repo: Any,
     tenant_id: str,
     line_user_id: str,
@@ -83,7 +88,7 @@ def _record_inbound_conversation(
     content_text = text.strip()
     if not content_text:
         content_text = f"[line {msg_type or 'message'}:{line_message_id or 'no-id'}]"
-    return repo.save_conversation(
+    conversation = repo.save_conversation(
         tenant_id=tenant_id,
         line_user_id=line_user_id,
         actor_role=actor_role,
@@ -93,6 +98,13 @@ def _record_inbound_conversation(
         source_message_id=line_message_id,
         metadata=metadata,
     )
+    if app is not None and actor_role == "boss":
+        _get_conversation_learning_service(app, repo).absorb_conversation(
+            tenant_id=tenant_id,
+            line_user_id=line_user_id,
+            conversation=conversation,
+        )
+    return conversation
 
 
 async def _push_and_record_texts(
@@ -228,6 +240,14 @@ def _get_memory_manager(app: Any, repo: Any) -> MemoryManager:
         memory = MemoryManager(repo, app.state.settings)
         app.state.memory_manager = memory
     return memory
+
+
+def _get_conversation_learning_service(app: Any, repo: Any) -> ConversationLearningService:
+    service = getattr(app.state, "conversation_learning_service", None)
+    if service is None:
+        service = ConversationLearningService(repo, _get_memory_promoter(app, repo))
+        app.state.conversation_learning_service = service
+    return service
 
 
 def _get_context_brief_manager(app: Any, repo: Any) -> ContextBriefManager:
@@ -550,6 +570,184 @@ def _build_pending_approval_flex(*, pending: Any, drafts: dict[str, Any]) -> dic
     return None
 
 
+def _build_pending_approval_follow_up_messages(*, artifact: str, pending: Any) -> list[dict[str, Any]]:
+    try:
+        drafts = json.loads(pending.draft_content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        drafts = {}
+
+    if pending.status == "delivery_failed":
+        lead_text = f"上一個{artifact}其實已經整理好了，只是剛剛通知沒有成功送達。我現在把草稿再貼給你確認。"
+    else:
+        lead_text = f"上一個{artifact}已經整理好了，我把草稿再貼給你確認一次。"
+
+    messages: list[dict[str, Any]] = [text_message(lead_text)]
+    flex_content = _build_pending_approval_flex(pending=pending, drafts=drafts)
+    if flex_content is not None:
+        messages.append({"type": "flex", "altText": "待確認草稿", "contents": flex_content})
+        return messages
+
+    fallback_summary = str(
+        drafts.get("post_text")
+        or drafts.get("ig_fb")
+        or drafts.get("google")
+        or drafts.get("reply_draft")
+        or ""
+    ).strip()
+    if fallback_summary:
+        messages.append(text_message(f"目前草稿重點如下：\n{fallback_summary[:1000]}"))
+    return messages
+
+
+def _is_pending_asset_intent_active(pending_asset: Any | None) -> bool:
+    if pending_asset is None or str(getattr(pending_asset, "status", "") or "") != "pending":
+        return False
+    expires_at = getattr(pending_asset, "expires_at", None)
+    if expires_at is None:
+        return True
+    # SQLite 回傳的是 naive datetime；統一當成 UTC 比較
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at > datetime.now(timezone.utc)
+
+
+def _parse_pending_asset_payload(pending_asset: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(getattr(pending_asset, "payload_json", "{}") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_pending_asset_decision_from_text(text: str) -> str:
+    normalized = "".join(str(text or "").split())
+    if not normalized:
+        return ""
+    if any(token in normalized for token in ("先討論", "想討論", "討論一下", "聊聊", "先不要發")):
+        return "consult"
+    if any(token in normalized for token in ("進知識庫", "知識庫", "記住這張", "收進品牌資料", "吸收這張")):
+        return "knowledge_update"
+    if any(token in normalized for token in ("寫貼文", "發貼文", "用這張圖寫", "拿來發文", "幫我發", "貼文")):
+        return "photo_content"
+    return ""
+
+
+def _build_asset_knowledge_entry_content(payload: dict[str, Any]) -> str:
+    analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
+    scene = str(analysis.get("scene_description") or "老闆上傳了一張品牌素材圖片。")
+    upload_intent = str(analysis.get("upload_intent") or "")
+    detected_objects = analysis.get("detected_objects") if isinstance(analysis.get("detected_objects"), list) else []
+    segments = [f"品牌素材圖片：{scene}"]
+    if upload_intent:
+        segments.append(f"建議用途：{upload_intent}")
+    cleaned_objects = [str(item).strip() for item in detected_objects if str(item).strip()]
+    if cleaned_objects:
+        segments.append("畫面元素：" + "、".join(cleaned_objects[:6]))
+    line_message_id = str(payload.get("line_message_id") or "").strip()
+    if line_message_id:
+        segments.append(f"來源：LINE 圖片 {line_message_id}")
+    return "\n".join(segments)
+
+
+async def _process_pending_asset_intent(
+    *,
+    app: Any,
+    repo: Any,
+    tenant_id: str,
+    line_user_id: str,
+    pending_asset: Any,
+    decision: str,
+    execute_dispatcher: AgentOSTaskDispatcher,
+    consultant: LLMConsultant,
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    payload = _parse_pending_asset_payload(pending_asset)
+    analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
+    line_message_id = str(payload.get("line_message_id") or "").strip()
+    photo_url = str(payload.get("photo_url") or "").strip()
+    source_conversation_id = str(payload.get("source_conversation_id") or "").strip()
+
+    if decision == "photo_content":
+        task = await execute_dispatcher.dispatch(
+            tenant_id=tenant_id,
+            text=f"photo:{line_message_id or pending_asset.id}",
+            intent_label="photo_content",
+            workflow_input_patch={
+                "tenant_id": tenant_id,
+                "line_message_id": line_message_id,
+                "photo_url": photo_url,
+                "analysis": analysis,
+                "trigger_source": "boss_photo_asset_choice",
+            },
+        )
+        repo.save_execute_task_record(
+            tenant_id=tenant_id,
+            line_user_id=line_user_id,
+            intent_label="photo_content",
+            source_text=f"photo:{line_message_id or pending_asset.id}",
+            objective=task.objective,
+            task_id=task.task_id,
+            run_id=task.current_run_id or "",
+            related_conversation_id=source_conversation_id,
+            status=task.status,
+        )
+        repo.resolve_pending_asset_intent(
+            intent_id=pending_asset.id,
+            status="resolved",
+            selected_decision=decision,
+        )
+        return [text_message(_build_execute_ack(intent_label="photo_content", task=task))], "execute_ack", task.task_id, task.current_run_id or ""
+
+    if decision == "knowledge_update":
+        repo.save_knowledge_entry(
+            tenant_id=tenant_id,
+            category="brand_material",
+            content=_build_asset_knowledge_entry_content(payload),
+            source_type="image_upload",
+            source_conversation_id=source_conversation_id,
+        )
+        repo.resolve_pending_asset_intent(
+            intent_id=pending_asset.id,
+            status="resolved",
+            selected_decision=decision,
+        )
+        scene = str(analysis.get("scene_description") or "這張圖")
+        return [
+            text_message(
+                f"好，我先把這張圖收進品牌知識庫了。\n我會把「{scene}」當成品牌素材一起參考。\n如果你要，我下一步也可以直接用它寫貼文或幫你整理重點。"
+            )
+        ], "execute_result", "", ""
+
+    if decision == "consult":
+        tenant = repo.get_tenant(tenant_id)
+        scene = str(analysis.get("scene_description") or "這張照片")
+        upload_intent = str(analysis.get("upload_intent") or "")
+        context_bundle = await _get_consult_context_builder(app, repo).build_bundle(
+            tenant_id=tenant_id,
+            message=f"先討論這張照片怎麼用：{scene}",
+            line_user_id=line_user_id,
+        )
+        prompt = (
+            f"老闆剛上傳一張照片，畫面內容是：{scene}。"
+            + (f" 系統目前推測用途偏向：{upload_intent}。" if upload_intent else "")
+            + " 老闆想先討論這張圖適合怎麼用。"
+            "請用繁體中文先給 2 到 3 個可行方向，語氣像商業夥伴，最後補一句追問。"
+        )
+        reply = await consultant.build_reply(
+            tenant_name=getattr(tenant, "name", "") if tenant is not None else "",
+            industry_type=getattr(tenant, "industry_type", "") if tenant is not None else "",
+            message=prompt,
+            context_bundle=context_bundle,
+        )
+        repo.resolve_pending_asset_intent(
+            intent_id=pending_asset.id,
+            status="resolved",
+            selected_decision=decision,
+        )
+        return [text_message(reply)], "boss_consult", "", ""
+
+    raise ValueError(f"unsupported asset intent decision: {decision}")
+
+
 async def _revise_pending_approval_draft(
     *,
     repo: Any,
@@ -747,10 +945,10 @@ async def _refresh_execute_task_reply(
     line_user_id: str,
     repo: Any,
     execute_dispatcher: AgentOSTaskDispatcher,
-) -> str:
+) -> list[dict[str, Any]]:
     record = repo.get_latest_execute_task_record(tenant_id=tenant_id, line_user_id=line_user_id)
     if record is None:
-        return "目前找不到你最近的草稿任務。你可以直接再說一次「幫我寫一篇貼文」或「幫我回覆評論」。"
+        return [text_message("目前找不到你最近的草稿任務。你可以直接再說一次「幫我寫一篇貼文」或「幫我回覆評論」。")]
 
     artifact = _describe_execute_artifact(record.intent_label)
     task_view = await execute_dispatcher.get_task(record.task_id)
@@ -760,26 +958,26 @@ async def _refresh_execute_task_reply(
 
     if not run_id:
         if task_status == "created":
-            return f"上一個{artifact}任務已建立，但還沒開始執行。請直接再說一次原需求，我會重新幫你起草。"
-        return f"上一個{artifact}目前狀態是 {task_status}，我還沒拿到可回推的內容。"
+            return [text_message(f"上一個{artifact}任務已建立，但還沒開始執行。請直接再說一次原需求，我會重新幫你起草。")]
+        return [text_message(f"上一個{artifact}目前狀態是 {task_status}，我還沒拿到可回推的內容。")]
 
     run_view = await execute_dispatcher.get_run(run_id)
     run_status = str(run_view.run.get("status", task_status) or task_status)
     repo.update_execute_task_record(task_id=record.task_id, run_id=run_id, status=run_status)
 
     pending = repo.get_pending_approval_by_run_id(run_id)
-    if pending is not None and pending.status == "pending":
-        return f"上一個{artifact}已經準備好了，正在等你確認，應該已經推播到 LINE 給你。"
+    if pending is not None and pending.status in {"pending", "delivery_failed"}:
+        return _build_pending_approval_follow_up_messages(artifact=artifact, pending=pending)
 
     if run_status in {"created", "queued", "running", "in_progress"}:
-        return f"我還在整理上一個{artifact}，完成後會推播給你確認。"
+        return [text_message(f"我還在整理上一個{artifact}，完成後會推播給你確認。")] 
     if run_status == "waiting_approval":
-        return f"上一個{artifact}已經整理好，正在等你確認。"
+        return [text_message(f"上一個{artifact}已經整理好，正在等你確認。")] 
     if run_status in {"completed", "succeeded"}:
-        return f"上一個{artifact}已完成；如果你還沒收到 LINE 草稿，代表結果沒有成功回推，請直接再說一次原需求。"
+        return [text_message(f"上一個{artifact}已完成；如果你還沒收到 LINE 草稿，代表結果沒有成功回推，請直接再說一次原需求。")] 
     if run_status in {"failed", "error", "cancelled"}:
-        return f"上一個{artifact}沒有成功完成。請直接再說一次原需求，我會重新幫你起草。"
-    return f"上一個{artifact}目前狀態是 {run_status}。"
+        return [text_message(f"上一個{artifact}沒有成功完成。請直接再說一次原需求，我會重新幫你起草。")] 
+    return [text_message(f"上一個{artifact}目前狀態是 {run_status}。")]
 
 
 def _verify_line_signature(body: bytes, channel_secret: str, signature: str) -> bool:
@@ -878,6 +1076,7 @@ async def _handle_event(
     # ── Onboarding path ───────────────────────────────────────────────────────
     if onboarding_flow.is_in_onboarding(tenant_id):
         source_conversation = _record_inbound_conversation(
+            app=app,
             repo=repo,
             tenant_id=tenant_id,
             line_user_id=line_user_id,
@@ -954,6 +1153,7 @@ async def _handle_event(
 
     if msg_type == "image" and line_message_id and channel_access_token:
         source_conversation = _record_inbound_conversation(
+            app=app,
             repo=repo,
             tenant_id=tenant_id,
             line_user_id=line_user_id,
@@ -967,45 +1167,36 @@ async def _handle_event(
         try:
             content_bytes = await _download_line_message_content(line_message_id, channel_access_token)
             photo_url = "data:image/jpeg;base64," + base64.b64encode(content_bytes).decode("ascii")
-            task = await execute_dispatcher.dispatch(
-                tenant_id=tenant_id,
-                text=f"photo:{line_message_id}",
-                intent_label="photo_content",
-                workflow_input_patch={
-                    "tenant_id": tenant_id,
-                    "line_message_id": line_message_id,
-                    "photo_url": photo_url,
-                    "trigger_source": "boss_photo_upload",
-                },
+            analysis = await analyze_photo_payload(
+                photo_url=photo_url,
+                line_message_id=line_message_id,
+                settings=app.state.settings,
             )
-            logger.info(
-                "tenant=%s [EXECUTE] intent=%s task_id=%s domain=%s status=%s",
-                tenant_id,
-                "photo_content",
-                task.task_id,
-                task.domain,
-                task.status,
-            )
-            repo.save_execute_task_record(
+            pending_asset = repo.save_pending_asset_intent(
                 tenant_id=tenant_id,
                 line_user_id=line_user_id,
-                intent_label="photo_content",
-                source_text=f"photo:{line_message_id}",
-                objective=task.objective,
-                task_id=task.task_id,
-                run_id=task.current_run_id or "",
-                related_conversation_id=getattr(source_conversation, "id", ""),
-                status=task.status,
+                line_message_id=line_message_id,
+                payload={
+                    "line_message_id": line_message_id,
+                    "photo_url": photo_url,
+                    "analysis": analysis,
+                    "source_conversation_id": getattr(source_conversation, "id", ""),
+                },
+                expires_at=datetime.now(timezone.utc) + _PENDING_ASSET_INTENT_TTL,
             )
             await _push_and_record_texts(
                 repo=repo,
                 tenant_id=tenant_id,
                 line_user_id=line_user_id,
-                conversation_kind="execute_ack",
-                messages=[text_message(_build_execute_ack(intent_label="photo_content", task=task))],
+                conversation_kind="follow_up",
+                messages=[
+                    build_asset_intent_prompt_message(
+                        asset_intent_id=pending_asset.id,
+                        tenant_id=tenant_id,
+                        analysis=analysis,
+                    )
+                ],
                 access_token=channel_access_token,
-                related_task_id=task.task_id,
-                related_run_id=task.current_run_id or "",
             )
         except httpx.HTTPError:
             logger.exception("tenant=%s [EXECUTE] LINE image download failed", tenant_id)
@@ -1026,6 +1217,67 @@ async def _handle_event(
         logger.info("tenant=%s non-text message, no intent routing", tenant_id)
         return
 
+    pending_asset = repo.get_latest_pending_asset_intent(
+        tenant_id=tenant_id,
+        line_user_id=line_user_id,
+    )
+    pending_asset_decision = _resolve_pending_asset_decision_from_text(text) if _is_pending_asset_intent_active(pending_asset) else ""
+    if pending_asset is not None and pending_asset_decision:
+        _record_inbound_conversation(
+            app=app,
+            repo=repo,
+            tenant_id=tenant_id,
+            line_user_id=line_user_id,
+            actor_role="boss",
+            conversation_kind="follow_up",
+            msg_type=msg_type,
+            text=text,
+            line_message_id=line_message_id,
+            metadata={
+                "asset_intent_id": pending_asset.id,
+                "asset_decision": pending_asset_decision,
+            },
+        )
+        try:
+            reply_messages, conversation_kind, related_task_id, related_run_id = await _process_pending_asset_intent(
+                app=app,
+                repo=repo,
+                tenant_id=tenant_id,
+                line_user_id=line_user_id,
+                pending_asset=pending_asset,
+                decision=pending_asset_decision,
+                execute_dispatcher=execute_dispatcher,
+                consultant=consultant,
+            )
+        except UnsupportedExecutionIntentError:
+            logger.exception("tenant=%s [ASSET_INTENT] unsupported execute route", tenant_id)
+            reply_messages = [text_message("這張圖目前還不能直接走這條流程，你可以改成先討論或換張圖。")]
+            conversation_kind = "execute_result"
+            related_task_id = ""
+            related_run_id = ""
+        except httpx.HTTPError:
+            logger.exception("tenant=%s [ASSET_INTENT] downstream HTTP error", tenant_id)
+            reply_messages = [text_message("系統暫時無法接手這張圖，請稍後再試一次。")]
+            conversation_kind = "execute_result"
+            related_task_id = ""
+            related_run_id = ""
+        logger.info(
+            "tenant=%s [ASSET_INTENT] decision=%s",
+            tenant_id,
+            pending_asset_decision,
+        )
+        await _push_and_record_texts(
+            repo=repo,
+            tenant_id=tenant_id,
+            line_user_id=line_user_id,
+            conversation_kind=conversation_kind,
+            messages=reply_messages,
+            access_token=channel_access_token,
+            related_task_id=related_task_id,
+            related_run_id=related_run_id,
+        )
+        return
+
     latest_content_plan = _get_latest_content_plan(
         repo,
         tenant_id=tenant_id,
@@ -1033,6 +1285,7 @@ async def _handle_event(
     )
     if latest_content_plan is not None and _looks_like_plan_to_draft_request(text):
         source_conversation = _record_inbound_conversation(
+            app=app,
             repo=repo,
             tenant_id=tenant_id,
             line_user_id=line_user_id,
@@ -1090,6 +1343,7 @@ async def _handle_event(
     )
     if _is_active_editing_pending(editing_pending):
         _record_inbound_conversation(
+            app=app,
             repo=repo,
             tenant_id=tenant_id,
             line_user_id=line_user_id,
@@ -1162,6 +1416,7 @@ async def _handle_event(
     elif decision.mode == BossRouteMode.CLARIFY:
         conversation_kind = "follow_up"
     source_conversation = _record_inbound_conversation(
+        app=app,
         repo=repo,
         tenant_id=tenant_id,
         line_user_id=line_user_id,
@@ -1179,13 +1434,6 @@ async def _handle_event(
             "carry_over_run_id": dialogue_state.carry_over_run_id,
         },
     )
-    latest_task = repo.get_latest_execute_task_record(tenant_id=tenant_id, line_user_id=line_user_id)
-    _get_memory_promoter(app, repo).promote_conversation(
-        tenant_id=tenant_id,
-        conversation=source_conversation,
-        latest_task=latest_task,
-    )
-
     if decision.mode == BossRouteMode.EXECUTE:
         if decision.intent_label == "content_plan":
             tenant = repo.get_tenant(tenant_id)
@@ -1263,17 +1511,18 @@ async def _handle_event(
             )
             return
         if decision.intent_label == "draft_status":
-            reply = await _refresh_execute_task_reply(
+            reply_messages = await _refresh_execute_task_reply(
                 tenant_id=tenant_id,
                 line_user_id=line_user_id,
                 repo=repo,
                 execute_dispatcher=execute_dispatcher,
             )
+            reply_texts = _extract_text_messages(reply_messages)
             logger.info(
                 "tenant=%s [EXECUTE] intent=%s reply=%s",
                 tenant_id,
                 decision.intent_label,
-                reply[:160],
+                (reply_texts[0] if reply_texts else "(non-text reply)")[:160],
             )
             latest_record = repo.get_latest_execute_task_record(tenant_id=tenant_id, line_user_id=line_user_id)
             await _push_and_record_texts(
@@ -1281,7 +1530,7 @@ async def _handle_event(
                 tenant_id=tenant_id,
                 line_user_id=line_user_id,
                 conversation_kind="follow_up",
-                messages=[text_message(reply)],
+                messages=reply_messages,
                 access_token=channel_access_token,
                 related_task_id=getattr(latest_record, "task_id", "") if latest_record is not None else "",
                 related_run_id=getattr(latest_record, "run_id", "") if latest_record is not None else "",
@@ -1597,8 +1846,67 @@ async def _handle_postback_event(
     data = parse_qs(event.get("postback", {}).get("data", ""), keep_blank_values=True)
     run_id = (data.get("run_id") or [""])[0]
     suggestion_id = (data.get("suggestion_id") or [""])[0]
+    asset_intent_id = (data.get("asset_intent_id") or [""])[0]
+    asset_decision = (data.get("decision") or [""])[0]
     action_raw = (data.get("action") or [""])[0]
     pending = repo.get_pending_approval_by_run_id(run_id) if run_id else None
+
+    if action_raw == "asset_intent":
+        pending_asset = repo.get_pending_asset_intent(asset_intent_id) if asset_intent_id else repo.get_latest_pending_asset_intent(
+            tenant_id=tenant_id,
+            line_user_id=actor_line_id,
+        )
+        if (
+            pending_asset is None
+            or str(getattr(pending_asset, "tenant_id", "") or "") != tenant_id
+            or str(getattr(pending_asset, "line_user_id", "") or "") != actor_line_id
+            or not _is_pending_asset_intent_active(pending_asset)
+        ):
+            if asset_intent_id:
+                repo.resolve_pending_asset_intent(intent_id=asset_intent_id, status="expired")
+            await _push_and_record_texts(
+                repo=repo,
+                tenant_id=tenant_id,
+                line_user_id=actor_line_id,
+                conversation_kind="follow_up",
+                messages=[text_message("這張照片的引導選項已過期，請重新傳一次圖片，我就會再帶你選一次。")],
+                access_token=channel_access_token,
+            )
+            return {"status": "processed", "action": action_raw, "result": "expired"}
+        try:
+            reply_messages, conversation_kind, related_task_id, related_run_id = await _process_pending_asset_intent(
+                app=request.app,
+                repo=repo,
+                tenant_id=tenant_id,
+                line_user_id=actor_line_id,
+                pending_asset=pending_asset,
+                decision=asset_decision,
+                execute_dispatcher=_get_execute_dispatcher(request),
+                consultant=_get_consultant(request),
+            )
+        except UnsupportedExecutionIntentError:
+            logger.exception("tenant=%s [ASSET_INTENT_POSTBACK] unsupported execute route", tenant_id)
+            reply_messages = [text_message("這張圖目前還不能直接走這條流程，你可以改成先討論或換張圖。")]
+            conversation_kind = "execute_result"
+            related_task_id = ""
+            related_run_id = ""
+        except httpx.HTTPError:
+            logger.exception("tenant=%s [ASSET_INTENT_POSTBACK] downstream HTTP error", tenant_id)
+            reply_messages = [text_message("系統暫時無法接手這張圖，請稍後再試一次。")]
+            conversation_kind = "execute_result"
+            related_task_id = ""
+            related_run_id = ""
+        await _push_and_record_texts(
+            repo=repo,
+            tenant_id=tenant_id,
+            line_user_id=actor_line_id,
+            conversation_kind=conversation_kind,
+            messages=reply_messages,
+            access_token=channel_access_token,
+            related_task_id=related_task_id,
+            related_run_id=related_run_id,
+        )
+        return {"status": "processed", "action": action_raw, "decision": asset_decision}
 
     if action_raw in {"approve", "reject", "edit", "schedule_publish"}:
         result_message = ""
@@ -1764,6 +2072,15 @@ async def line_webhook(
         ):
             logger.info("tenant=%s duplicate LINE webhook skipped dedupe_key=%s", tenant_id, dedupe_key)
             continue
+        if str(event.get("type", "") or "") == "postback":
+            await _handle_postback_event(
+                request=request,
+                tenant_id=tenant_id,
+                event=event,
+                repo=repo,
+                channel_access_token=channel_access_token,
+            )
+            continue
         background_tasks.add_task(
             _handle_event_logged,
             app=request.app,
@@ -1815,60 +2132,13 @@ async def line_postback(tenant_id: str, request: Request) -> dict[str, str]:
             continue
         if event.get("type") != "postback":
             continue
-        source = event.get("source", {})
-        actor_line_id = source.get("userId", "")
-        data = parse_qs(event.get("postback", {}).get("data", ""), keep_blank_values=True)
-        run_id = (data.get("run_id") or [""])[0]
-        suggestion_id = (data.get("suggestion_id") or [""])[0]
-        action_raw = (data.get("action") or [""])[0]
-        pending = repo.get_pending_approval_by_run_id(run_id) if run_id else None
-        if action_raw in {"approve", "reject", "edit", "schedule_publish"}:
-            result_message = ""
-            if _is_local_pending_workflow(pending) and action_raw in {"approve", "reject"}:
-                result_message = await _handle_local_pending_approval(
-                    app=request.app,
-                    repo=repo,
-                    tenant_id=tenant_id,
-                    pending=pending,
-                    action=ApprovalAction(action_raw),
-                    actor_line_id=actor_line_id,
-                )
-            elif _is_local_pending_workflow(pending) and action_raw == "schedule_publish":
-                result_message = "這類本地草稿目前不支援二次排程，請先修改或直接發布。"
-            else:
-                bridge = _get_approval_bridge(request, repo)
-                result = await bridge.handle_postback(
-                    run_id=run_id,
-                    tenant_id=tenant_id,
-                    action=ApprovalAction(action_raw),
-                    actor_line_id=actor_line_id,
-                )
-                result_message = result.message
-            if result_message and actor_line_id:
-                access_token = channel_access_token or request.app.state.settings.LINE_CHANNEL_ACCESS_TOKEN
-                if access_token:
-                    await push_line_messages(
-                        to=actor_line_id,
-                        messages=[text_message(result_message + ("\n\n" + _build_approval_edit_prompt(repo.get_pending_approval_by_run_id(run_id).workflow_type) if action_raw == "edit" and repo.get_pending_approval_by_run_id(run_id) is not None else ""))],
-                        access_token=access_token,
-                    )
-        elif action_raw == "suggestion_accept" and suggestion_id:
-            await handle_suggestion_action(
-                request=request,
-                tenant_id=tenant_id,
-                suggestion_id=suggestion_id,
-                action="accept",
-                actor_line_id=actor_line_id,
-                execute_now=True,
-            )
-        elif action_raw == "suggestion_dismiss" and suggestion_id:
-            await handle_suggestion_action(
-                request=request,
-                tenant_id=tenant_id,
-                suggestion_id=suggestion_id,
-                action="dismiss",
-                actor_line_id=actor_line_id,
-            )
+        await _handle_postback_event(
+            request=request,
+            tenant_id=tenant_id,
+            event=event,
+            repo=repo,
+            channel_access_token=channel_access_token,
+        )
     return {"status": "ok"}
 
 

@@ -26,6 +26,8 @@ def _infer_knowledge_category(text: str) -> str:
         return "core_value"
     if _contains_any(text, ("目標", "希望", "想要", "今年", "本月")):
         return "goal"
+    if _contains_any(text, ("安全", "安心", "副作用", "天然", "西藥", "農藥", "重金屬")):
+        return "pain_point"
     if _contains_any(text, ("困擾", "痛點", "卡住", "抱怨", "問題")):
         return "pain_point"
     return ""

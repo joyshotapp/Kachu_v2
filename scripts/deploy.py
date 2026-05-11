@@ -90,7 +90,35 @@ def _compose_cmd(remote_root: str) -> str:
 def step_rsync_kachu_plus(host: str, remote_root: str) -> None:
     print("\n━━ [1/8] rsync Kachu+ → 伺服器 ━━")
     local_root = str(Path(__file__).parent.parent)
-    _rsync(local_root, host, remote_root, exclude=["tests", "docs", ".git"])
+    _ssh(
+        host,
+        " ".join(
+            [
+                f"rm -rf {shlex.quote(remote_root)}/src/kachu",
+                f"rm -f {shlex.quote(remote_root)}/alembic/versions/202604*.py",
+                f"rm -f {shlex.quote(remote_root)}/alembic/versions/20260502_*.py",
+                f"rm -f {shlex.quote(remote_root)}/alembic/versions/20260503_*.py",
+                f"rm -f {shlex.quote(remote_root)}/alembic/versions/20260505_*.py",
+            ]
+        ),
+    )
+    _rsync(
+        local_root,
+        host,
+        remote_root,
+        exclude=[
+            "tests",
+            "docs",
+            ".git",
+            ".pytest_cache",
+            ".tmp",
+            "src/kachu",
+            "alembic/versions/202604*.py",
+            "alembic/versions/20260502_*.py",
+            "alembic/versions/20260503_*.py",
+            "alembic/versions/20260505_*.py",
+        ],
+    )
     print("✓ Kachu+ 程式碼已同步")
 
 

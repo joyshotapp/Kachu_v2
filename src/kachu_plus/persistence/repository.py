@@ -28,6 +28,7 @@ from kachu_plus.persistence.tables import (
     LineChannelConfigTable,
     MetaOAuthSessionTable,
     OnboardingStateTable,
+    PendingAssetIntentTable,
     PendingApprovalTable,
     PreferenceMemoryTable,
     ProfileLinkTable,
@@ -1523,6 +1524,92 @@ class KachuPlusRepository:
             session.refresh(record)
             return record
 
+    # ── Pending Asset Intents ──────────────────────────────────────────────
+
+    def save_pending_asset_intent(
+        self,
+        *,
+        tenant_id: str,
+        line_user_id: str,
+        line_message_id: str,
+        payload: dict[str, object],
+        asset_type: str = "image",
+        expires_at: datetime | None = None,
+    ) -> PendingAssetIntentTable:
+        from kachu_plus.persistence.tables import utcnow
+
+        with Session(self._engine) as session:
+            now = utcnow()
+            stmt = select(PendingAssetIntentTable).where(
+                PendingAssetIntentTable.tenant_id == tenant_id,
+                PendingAssetIntentTable.line_user_id == line_user_id,
+                PendingAssetIntentTable.status == "pending",
+            )
+            for existing in session.exec(stmt).all():
+                existing.status = "superseded"
+                existing.updated_at = now
+                existing.resolved_at = now
+                session.add(existing)
+
+            pending = PendingAssetIntentTable(
+                tenant_id=tenant_id,
+                line_user_id=line_user_id,
+                line_message_id=line_message_id,
+                asset_type=asset_type,
+                payload_json=json.dumps(payload, ensure_ascii=False),
+                expires_at=self._as_utc(expires_at),
+                updated_at=now,
+            )
+            session.add(pending)
+            session.commit()
+            session.refresh(pending)
+            return pending
+
+    def get_pending_asset_intent(self, intent_id: str) -> Optional[PendingAssetIntentTable]:
+        with Session(self._engine) as session:
+            return session.get(PendingAssetIntentTable, intent_id)
+
+    def get_latest_pending_asset_intent(
+        self,
+        *,
+        tenant_id: str,
+        line_user_id: str,
+    ) -> Optional[PendingAssetIntentTable]:
+        now = datetime.now(timezone.utc)
+        with Session(self._engine) as session:
+            stmt = (
+                select(PendingAssetIntentTable)
+                .where(PendingAssetIntentTable.tenant_id == tenant_id)
+                .where(PendingAssetIntentTable.line_user_id == line_user_id)
+                .where(PendingAssetIntentTable.status == "pending")
+                .where((PendingAssetIntentTable.expires_at.is_(None)) | (PendingAssetIntentTable.expires_at > now))
+                .order_by(PendingAssetIntentTable.updated_at.desc(), PendingAssetIntentTable.created_at.desc())
+            )
+            return session.exec(stmt).first()
+
+    def resolve_pending_asset_intent(
+        self,
+        *,
+        intent_id: str,
+        status: str,
+        selected_decision: str = "",
+    ) -> Optional[PendingAssetIntentTable]:
+        from kachu_plus.persistence.tables import utcnow
+
+        with Session(self._engine) as session:
+            pending = session.get(PendingAssetIntentTable, intent_id)
+            if pending is None:
+                return None
+            now = utcnow()
+            pending.status = status
+            pending.selected_decision = selected_decision
+            pending.updated_at = now
+            pending.resolved_at = now if status != "pending" else None
+            session.add(pending)
+            session.commit()
+            session.refresh(pending)
+            return pending
+
     # ── Pending Approvals / Publishing ──────────────────────────────────────
 
     def save_pending_approval(
@@ -1625,6 +1712,33 @@ class KachuPlusRepository:
             pending.decision_payload_json = json.dumps(decision_payload or {}, ensure_ascii=False)
             pending.updated_at = now
             pending.decided_at = now
+            session.add(pending)
+            session.commit()
+            session.refresh(pending)
+            return pending
+
+    def update_pending_approval_status(
+        self,
+        *,
+        agentos_run_id: str,
+        status: str,
+        actor_line_id: str = "",
+        decision_payload: dict[str, object] | None = None,
+    ) -> Optional[PendingApprovalTable]:
+        from kachu_plus.persistence.tables import utcnow
+
+        with Session(self._engine) as session:
+            stmt = select(PendingApprovalTable).where(PendingApprovalTable.agentos_run_id == agentos_run_id)
+            pending = session.exec(stmt).first()
+            if pending is None:
+                return None
+            pending.status = status
+            if actor_line_id:
+                pending.actor_line_id = actor_line_id
+            if decision_payload is not None:
+                pending.decision_payload_json = json.dumps(decision_payload, ensure_ascii=False)
+            pending.updated_at = utcnow()
+            pending.decided_at = None
             session.add(pending)
             session.commit()
             session.refresh(pending)

@@ -9,9 +9,9 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, Session, create_engine, select
 
 from kachu_plus.config import Settings
-from kachu_plus.learning import ContextBriefManager, MemoryManager, PostTaskReviewService
+from kachu_plus.learning import ContextBriefManager, IdleBriefRefreshScheduler, MemoryManager, PostTaskReviewService
 from kachu_plus.persistence.repository import KachuPlusRepository
-from kachu_plus.persistence.tables import CustomerProfileTable, KnowledgeEntryTable, SuggestionTable, TenantTable
+from kachu_plus.persistence.tables import ContextBriefTable, CustomerProfileTable, KnowledgeEntryTable, SuggestionTable, TenantTable
 from kachu_plus.proactive import (
     KachuExecutionPolicyResolver,
     META_INSIGHTS_REPORT_JOB,
@@ -191,6 +191,58 @@ def test_learning_and_brief_refresh_persists_examples() -> None:
     examples = memory.get_preference_examples("tenant-1", "google", limit=3)
     assert len(examples) == 1
     assert examples[0]["edited"] == "修正版貼文！"
+
+
+def test_idle_brief_refresh_scheduler_refreshes_after_conversation_idle_window() -> None:
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed_tenant(repo)
+    settings = Settings(
+        IDLE_BRIEF_REFRESH_ENABLED=True,
+        IDLE_BRIEF_REFRESH_RUN_ON_STARTUP=False,
+        IDLE_BRIEF_REFRESH_INTERVAL_SECONDS=60,
+        IDLE_BRIEF_REFRESH_IDLE_SECONDS=60,
+    )
+    memory = MemoryManager(repo, settings)
+    briefs = ContextBriefManager(repo, memory)
+    scheduler = IdleBriefRefreshScheduler(repo, briefs, settings)
+
+    conversation = repo.save_conversation(
+        tenant_id="tenant-1",
+        line_user_id="U-owner-1",
+        actor_role="boss",
+        channel_type="line",
+        conversation_kind="boss_consult",
+        content_text="最近客人會特別問安全性與成分來源。",
+    )
+
+    with Session(repo._engine) as session:  # noqa: SLF001
+        stored_conversation = session.get(type(conversation), conversation.id)
+        assert stored_conversation is not None
+        stored_conversation.created_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        session.add(stored_conversation)
+        session.add(
+            ContextBriefTable(
+                tenant_id="tenant-1",
+                brief_type="conversation_summary_brief",
+                content_json=json.dumps({"summary": "舊摘要"}, ensure_ascii=False),
+                updated_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+                expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            )
+        )
+        session.commit()
+
+    result = asyncio.run(scheduler.run_once(now=datetime.now(timezone.utc)))
+    updated_brief = repo.get_context_brief("tenant-1", "conversation_summary_brief")
+
+    assert result["refreshed_count"] == 1
+    assert result["tenant_ids"] == ["tenant-1"]
+    assert updated_brief is not None
+    assert "安全性" in (updated_brief.content_json or "")
+
+    second = asyncio.run(scheduler.run_once(now=datetime.now(timezone.utc)))
+    assert second["refreshed_count"] == 0
 
 
 def test_proactive_engine_pushes_to_owner_membership() -> None:

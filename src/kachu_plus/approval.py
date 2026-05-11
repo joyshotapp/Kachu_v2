@@ -254,7 +254,7 @@ class PendingApprovalSyncService:
 
     async def sync_open_approvals(self, *, limit: int = 50) -> dict[str, int]:
         pending_items = self._repo.list_pending_approvals(
-            statuses=["pending"],
+            statuses=["pending", "delivery_failed"],
             exclude_workflow_types=["kachu_planned_content", "kachu_meta_reply"],
             limit=limit,
         )

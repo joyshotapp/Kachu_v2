@@ -28,6 +28,7 @@ _EXECUTE_KW = frozenset([
     "IG成效", "IG 成效", "Instagram成效", "Instagram 成效", "社群成效", "社群 成效", "Meta成效", "Meta 成效",
     "連接FB", "連接 FB", "連接IG", "連接 IG", "連接Meta", "連接 Meta", "連接Facebook", "連接 Facebook",
     "綁定FB", "綁定 FB", "綁定IG", "綁定 IG", "綁定Meta", "綁定 Meta",
+    "串接FB", "串接 FB", "串接IG", "串接 IG", "串接Meta", "串接 Meta", "串接Facebook", "串接 Facebook",
     "重新授權FB", "重新授權 FB", "重新授權IG", "重新授權 IG", "重新授權Meta", "重新授權 Meta",
     "解除Meta", "解除 Meta", "解除FB", "解除 FB", "解除綁定Meta", "解除綁定 Meta",
     "目前連的是", "現在連的是", "哪個粉專", "Meta 狀態", "Meta狀態", "查看Meta", "查看 Meta",
@@ -74,6 +75,11 @@ _ACTION_PATTERN = re.compile(r"回|回覆|處理|看|查看|檢查")
 _TAG_PATTERN = re.compile(r"標籤")
 
 
+def _contains_any(text: str, keywords: frozenset[str]) -> bool:
+    normalized = text.lower()
+    return any(keyword.lower() in normalized for keyword in keywords)
+
+
 def classify_boss_message(text: str) -> BossRouteDecision:
     """
     Keyword-based BossRouteMode 分類（v1 同步版，零延遲）。
@@ -86,8 +92,8 @@ def classify_boss_message(text: str) -> BossRouteDecision:
 
     參考：Kachu_v2 intent_router.py classify_text 的 keyword fast-path 設計。
     """
-    has_consult = any(kw in text for kw in _CONSULT_KW)
-    has_execute = any(kw in text for kw in _EXECUTE_KW)
+    has_consult = _contains_any(text, _CONSULT_KW)
+    has_execute = _contains_any(text, _EXECUTE_KW)
 
     if not has_execute and _looks_like_execute(text):
         has_execute = True
@@ -146,43 +152,47 @@ def _derive_intent_label(text: str) -> str:
         return "draft_status"
     if _looks_like_website_ingest(text):
         return "website_ingest"
-    if any(kw in text for kw in ("內容企劃", "貼文企劃", "發文企劃", "先給企劃")):
+    if _contains_any(text, frozenset(("內容企劃", "貼文企劃", "發文企劃", "先給企劃"))):
         return "content_plan"
     if "規劃" in text and any(kw in text for kw in ("貼文", "發文", "商家動態", "內容", "文案")):
         return "content_plan"
-    if any(kw in text for kw in ("重新授權FB", "重新授權 FB", "重新授權IG", "重新授權 IG", "重新授權Meta", "重新授權 Meta")):
+    if _contains_any(text, frozenset(("重新授權FB", "重新授權 FB", "重新授權IG", "重新授權 IG", "重新授權Meta", "重新授權 Meta"))):
         return "meta_reauth"
-    if any(kw in text for kw in ("解除Meta", "解除 Meta", "解除FB", "解除 FB", "解除綁定Meta", "解除綁定 Meta")):
+    if _contains_any(text, frozenset(("解除Meta", "解除 Meta", "解除FB", "解除 FB", "解除綁定Meta", "解除綁定 Meta"))):
         return "meta_disconnect"
-    if any(kw in text for kw in ("目前連的是", "現在連的是", "哪個粉專", "Meta 狀態", "Meta狀態", "查看Meta", "查看 Meta")):
+    if _contains_any(text, frozenset(("目前連的是", "現在連的是", "哪個粉專", "Meta 狀態", "Meta狀態", "查看Meta", "查看 Meta"))):
         return "meta_status"
-    if any(kw in text for kw in ("連接FB", "連接 FB", "連接IG", "連接 IG", "連接Meta", "連接 Meta", "連接Facebook", "連接 Facebook", "綁定FB", "綁定 FB", "綁定IG", "綁定 IG", "綁定Meta", "綁定 Meta")):
+    if _contains_any(text, frozenset((
+        "連接FB", "連接 FB", "連接IG", "連接 IG", "連接Meta", "連接 Meta", "連接Facebook", "連接 Facebook",
+        "綁定FB", "綁定 FB", "綁定IG", "綁定 IG", "綁定Meta", "綁定 Meta",
+        "串接FB", "串接 FB", "串接IG", "串接 IG", "串接Meta", "串接 Meta", "串接Facebook", "串接 Facebook",
+    ))):
         return "meta_connect"
     if any(kw in text for kw in ("哪些客人", "沉睡顧客", "沉睡客人", "查沉睡", "流失顧客", "流失客人", "客人列表")):
         return "sleep_customer_query"
     if "客人" in text and any(kw in text for kw in ("沒來", "多久", "超過", "流失", "沉睡")):
         return "sleep_customer_query"
-    if any(kw in text for kw in (
+    if _contains_any(text, frozenset((
         "FB成效", "FB 成效", "臉書成效", "臉書 成效", "Facebook成效", "Facebook 成效",
         "IG成效", "IG 成效", "Instagram成效", "Instagram 成效", "社群成效", "社群 成效", "Meta成效", "Meta 成效",
-    )):
+    ))):
         return "meta_insights"
-    if any(kw in text for kw in ("回覆評論", "回那個", "回那則", "處理評論", "回負評", "回差評", "回好評", "回評論")):
+    if _contains_any(text, frozenset(("回覆評論", "回那個", "回那則", "處理評論", "回負評", "回差評", "回好評", "回評論"))):
         return "review_reply"
     if _REVIEW_PATTERN.search(text):
         return "review_reply"
-    if any(kw in text for kw in ("發文", "寫一篇", "幫我寫", "幫我發", "商家動態", "活動公告", "寫文案")):
+    if _contains_any(text, frozenset(("發文", "寫一篇", "幫我寫", "幫我發", "商家動態", "活動公告", "寫文案"))):
         return "google_post"
-    if any(kw in text for kw in ("月報", "週報", "查流量", "看流量", "拉報告", "流量報告", "ga4")):
+    if _contains_any(text, frozenset(("月報", "週報", "查流量", "看流量", "拉報告", "流量報告", "ga4"))):
         return "analytics_report"
-    if any(kw in text for kw in ("公休", "店休", "今天休", "今日休", "不營業", "打烊", "暫停營業")):
+    if _contains_any(text, frozenset(("公休", "店休", "今天休", "今日休", "不營業", "打烊", "暫停營業"))):
         return "business_profile_update"
-    if any(kw in text for kw in ("幫我更新", "更新營業", "更新地址", "更新電話", "更新菜單", "更新Google", "更新店家")):
+    if _contains_any(text, frozenset(("幫我更新", "更新營業", "更新地址", "更新電話", "更新菜單", "更新Google", "更新店家"))):
         return "knowledge_update"
-    if any(kw in text for kw in (
+    if _contains_any(text, frozenset((
         "建立標籤", "新增標籤", "新建標籤", "刪除標籤", "移除標籤", "停用標籤",
         "查看標籤", "我的標籤", "標籤列表", "顯示標籤", "有什麼標籤",
-    )):
+    ))):
         return "tag_management"
     if _TAG_PATTERN.search(text):
         return "tag_management"

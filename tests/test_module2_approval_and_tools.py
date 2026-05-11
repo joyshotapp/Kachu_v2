@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import httpx
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, Session, create_engine
 
@@ -127,6 +128,9 @@ def _make_app(repo: KachuPlusRepository) -> FastAPI:
     app = FastAPI()
     settings = Settings()
     settings.LINE_CHANNEL_ACCESS_TOKEN = "push-token"
+    settings.GOOGLE_AI_API_KEY = ""
+    settings.OPENAI_API_KEY = ""
+    settings.LITELLM_MODEL = "gemini/gemini-2.0-flash"
     app.state.repository = repo
     app.state.settings = settings
     app.state.consultant = AsyncMock()
@@ -551,6 +555,44 @@ def test_google_post_tools_edit_flow_and_learning_records() -> None:
     assert brief is not None
 
 
+def test_notify_approval_marks_delivery_failed_when_all_pushes_fail() -> None:
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed(repo)
+    repo.update_onboarding_step("tenant-1", "completed")
+    app = _make_app(repo)
+    client = TestClient(app)
+
+    import kachu_plus.tools_router as tools_router_module
+
+    request = httpx.Request("POST", "https://api.line.me/v2/bot/message/push")
+    response = httpx.Response(429, request=request, text='{"message":"Too Many Requests"}')
+    original_push = tools_router_module.push_line_messages
+    tools_router_module.push_line_messages = AsyncMock(
+        side_effect=httpx.HTTPStatusError("rate limited", request=request, response=response)
+    )
+    try:
+        notify = client.post(
+            "/tools/notify-approval",
+            json={
+                "tenant_id": "tenant-1",
+                "run_id": "run-delivery-failed-1",
+                "task_id": "task-delivery-failed-1",
+                "workflow": "kachu_photo_content",
+                "drafts": {"ig_fb": "IG 草稿", "google": "Google 草稿"},
+            },
+        )
+        assert notify.status_code == 200
+    finally:
+        tools_router_module.push_line_messages = original_push
+
+    pending = repo.get_pending_approval_by_run_id("run-delivery-failed-1")
+    assert pending is not None
+    assert pending.status == "delivery_failed"
+    assert "push_warnings" in notify.json()
+
+
 def test_publish_google_post_marks_delivery_failed_when_connector_expired() -> None:
     engine = _make_engine()
     SQLModel.metadata.create_all(engine)
@@ -706,14 +748,206 @@ def test_image_webhook_dispatches_photo_content_workflow() -> None:
         webhook_module._download_line_message_content = original_download
         webhook_module.push_line_messages = original_push
 
+    app.state.execute_dispatcher.dispatch.assert_not_awaited()
+    pending_asset = repo.get_latest_pending_asset_intent(tenant_id="tenant-1", line_user_id="U-owner-2")
+    assert pending_asset is not None
+    assert len(pushed) == 1
+    assert pushed[0]["to"] == "U-owner-2"
+    message = pushed[0]["messages"][0]
+    assert "你要我怎麼處理這張圖" in message["text"]
+    assert [item["action"]["label"] for item in message["quickReply"]["items"]] == ["寫貼文", "進知識庫", "先討論"]
+
+
+def test_asset_intent_postback_via_main_webhook_dispatches_photo_content() -> None:
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed(repo)
+    repo.update_onboarding_step("tenant-1", "completed")
+    pending_asset = repo.save_pending_asset_intent(
+        tenant_id="tenant-1",
+        line_user_id="U-owner-2",
+        line_message_id="img-asset-1",
+        payload={
+            "line_message_id": "img-asset-1",
+            "photo_url": "data:image/jpeg;base64,ZmFrZQ==",
+            "analysis": {"scene_description": "一張茶飲商品照", "upload_intent": "新品分享"},
+            "source_conversation_id": "conv-asset-1",
+        },
+    )
+    app = _make_app(repo)
+    app.state.execute_dispatcher = MagicMock()
+    app.state.execute_dispatcher.dispatch = AsyncMock(
+        return_value=ExecutionTaskResult(
+            task_id="task-photo-asset-1",
+            domain="kachu_photo_content",
+            status="created",
+            objective="Generate social post drafts from the boss photo upload",
+        )
+    )
+    client = TestClient(app)
+
+    import kachu_plus.line.webhook as webhook_module
+
+    original_push = webhook_module.push_line_messages
+    pushed: list[dict] = []
+
+    async def _fake_push(*, to: str, messages, access_token: str) -> None:
+        pushed.append({"to": to, "messages": messages, "access_token": access_token})
+
+    webhook_module.push_line_messages = _fake_push
+    try:
+        body = json.dumps(
+            {
+                "events": [
+                    {
+                        "type": "postback",
+                        "source": {"type": "user", "userId": "U-owner-2"},
+                        "postback": {
+                            "data": f"action=asset_intent&decision=photo_content&asset_intent_id={pending_asset.id}&tenant_id=tenant-1"
+                        },
+                    }
+                ]
+            }
+        ).encode()
+        signature = _make_signature(body, "secret")
+        response = client.post(
+            "/webhooks/line/tenant-1",
+            content=body,
+            headers={"X-Line-Signature": signature, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200
+    finally:
+        webhook_module.push_line_messages = original_push
+
     app.state.execute_dispatcher.dispatch.assert_awaited_once()
     kwargs = app.state.execute_dispatcher.dispatch.await_args.kwargs
     assert kwargs["intent_label"] == "photo_content"
-    assert kwargs["workflow_input_patch"]["line_message_id"] == "img-1"
-    assert kwargs["workflow_input_patch"]["photo_url"].startswith("data:image/jpeg;base64,")
-    assert len(pushed) == 1
-    assert pushed[0]["to"] == "U-owner-2"
+    assert kwargs["workflow_input_patch"]["line_message_id"] == "img-asset-1"
+    assert kwargs["workflow_input_patch"]["analysis"]["scene_description"] == "一張茶飲商品照"
+    assert repo.get_pending_asset_intent(pending_asset.id).status == "resolved"
     assert "收到照片了" in pushed[0]["messages"][0]["text"]
+
+
+def test_asset_intent_text_follow_up_saves_knowledge_entry() -> None:
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed(repo)
+    repo.update_onboarding_step("tenant-1", "completed")
+    repo.save_pending_asset_intent(
+        tenant_id="tenant-1",
+        line_user_id="U-owner-2",
+        line_message_id="img-asset-2",
+        payload={
+            "line_message_id": "img-asset-2",
+            "photo_url": "data:image/jpeg;base64,ZmFrZQ==",
+            "analysis": {
+                "scene_description": "一張店內漢方茶包展示照",
+                "upload_intent": "品牌素材",
+                "detected_objects": ["茶包", "木盤"],
+            },
+            "source_conversation_id": "conv-asset-2",
+        },
+    )
+    app = _make_app(repo)
+    app.state.execute_dispatcher = MagicMock()
+    app.state.execute_dispatcher.dispatch = AsyncMock()
+    client = TestClient(app)
+
+    import kachu_plus.line.webhook as webhook_module
+
+    original_push = webhook_module.push_line_messages
+    pushed: list[dict] = []
+
+    async def _fake_push(*, to: str, messages, access_token: str) -> None:
+        pushed.append({"to": to, "messages": messages, "access_token": access_token})
+
+    webhook_module.push_line_messages = _fake_push
+    try:
+        body = json.dumps(
+            {
+                "events": [
+                    {
+                        "type": "message",
+                        "source": {"type": "user", "userId": "U-owner-2"},
+                        "message": {"id": "msg-asset-text-1", "type": "text", "text": "進知識庫"},
+                    }
+                ]
+            }
+        ).encode()
+        signature = _make_signature(body, "secret")
+        response = client.post(
+            "/webhooks/line/tenant-1",
+            content=body,
+            headers={"X-Line-Signature": signature, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200
+    finally:
+        webhook_module.push_line_messages = original_push
+
+    app.state.execute_dispatcher.dispatch.assert_not_called()
+    knowledge_entries = repo.list_knowledge_entries("tenant-1", limit=5)
+    assert any("店內漢方茶包展示照" in entry.content for entry in knowledge_entries)
+    assert "收進品牌知識庫" in pushed[0]["messages"][0]["text"]
+
+
+def test_asset_intent_postback_consult_returns_guided_reply() -> None:
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed(repo)
+    repo.update_onboarding_step("tenant-1", "completed")
+    pending_asset = repo.save_pending_asset_intent(
+        tenant_id="tenant-1",
+        line_user_id="U-owner-2",
+        line_message_id="img-asset-3",
+        payload={
+            "line_message_id": "img-asset-3",
+            "photo_url": "data:image/jpeg;base64,ZmFrZQ==",
+            "analysis": {"scene_description": "一張門市櫃台與招牌商品照", "upload_intent": "店內日常"},
+            "source_conversation_id": "conv-asset-3",
+        },
+    )
+    app = _make_app(repo)
+    app.state.consultant.build_reply = AsyncMock(return_value="這張圖可以走新品介紹、門市氛圍、熟客互動三個方向。你這次最想主打哪一個？")
+    client = TestClient(app)
+
+    import kachu_plus.line.webhook as webhook_module
+
+    original_push = webhook_module.push_line_messages
+    pushed: list[dict] = []
+
+    async def _fake_push(*, to: str, messages, access_token: str) -> None:
+        pushed.append({"to": to, "messages": messages, "access_token": access_token})
+
+    webhook_module.push_line_messages = _fake_push
+    try:
+        body = json.dumps(
+            {
+                "events": [
+                    {
+                        "type": "postback",
+                        "source": {"type": "user", "userId": "U-owner-2"},
+                        "postback": {
+                            "data": f"action=asset_intent&decision=consult&asset_intent_id={pending_asset.id}&tenant_id=tenant-1"
+                        },
+                    }
+                ]
+            }
+        ).encode()
+        signature = _make_signature(body, "secret")
+        response = client.post(
+            "/webhooks/line/tenant-1/postback",
+            content=body,
+            headers={"X-Line-Signature": signature, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200
+    finally:
+        webhook_module.push_line_messages = original_push
+
+    assert repo.get_pending_asset_intent(pending_asset.id).status == "resolved"
+    assert "新品介紹" in pushed[0]["messages"][0]["text"]
 
 
 def test_analyze_photo_uses_llm_when_key_is_available() -> None:

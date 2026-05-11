@@ -24,6 +24,8 @@ from kachu_plus.persistence.repository import KachuPlusRepository
 from kachu_plus.services import (
     AgentOSTaskDispatcher,
     ContextBriefManager,
+    ConversationLearningService,
+    IdleBriefRefreshScheduler,
     LLMConsultant,
     MemoryManager,
     PostTaskReviewService,
@@ -56,8 +58,10 @@ def create_app() -> FastAPI:
         app.state.repository = repository
         memory_manager = MemoryManager(repository, settings)
         context_brief_manager = ContextBriefManager(repository, memory_manager)
+        conversation_learning_service = ConversationLearningService(repository)
         app.state.memory_manager = memory_manager
         app.state.context_brief_manager = context_brief_manager
+        app.state.conversation_learning_service = conversation_learning_service
         app.state.post_task_review = PostTaskReviewService(repository, memory_manager, context_brief_manager)
         app.state.google_review_service = GoogleReviewService(repository, settings)
         app.state.approval_bridge = ApprovalBridge(app.state.execute_dispatcher, repository, app.state.post_task_review)
@@ -92,8 +96,11 @@ def create_app() -> FastAPI:
         sleep_profile_sync_service = SleepProfileSyncService(repository)
         app.state.sleep_profile_sync_service = sleep_profile_sync_service
         sleep_sync_scheduler = SleepSyncScheduler(sleep_profile_sync_service, settings)
+        idle_brief_refresh_scheduler = IdleBriefRefreshScheduler(repository, context_brief_manager, settings)
         app.state.sleep_sync_scheduler = sleep_sync_scheduler
+        app.state.idle_brief_refresh_scheduler = idle_brief_refresh_scheduler
         sleep_sync_scheduler.start()
+        idle_brief_refresh_scheduler.start()
         content_plan_scheduler.start()
         proactive_scheduler.start()
         scheduled_approval_scheduler.start()
@@ -105,6 +112,9 @@ def create_app() -> FastAPI:
         scheduler = getattr(app.state, "sleep_sync_scheduler", None)
         if scheduler is not None:
             await scheduler.shutdown()
+        idle_brief_refresh_scheduler = getattr(app.state, "idle_brief_refresh_scheduler", None)
+        if idle_brief_refresh_scheduler is not None:
+            await idle_brief_refresh_scheduler.shutdown()
         content_plan_scheduler = getattr(app.state, "content_plan_scheduler", None)
         if content_plan_scheduler is not None:
             await content_plan_scheduler.shutdown()

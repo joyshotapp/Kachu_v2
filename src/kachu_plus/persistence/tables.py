@@ -354,6 +354,23 @@ class ExecuteTaskRecordTable(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
+class PendingAssetIntentTable(SQLModel, table=True):
+    __tablename__ = "kachu_pending_asset_intents"
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    tenant_id: str = Field(index=True)
+    line_user_id: str = Field(default="", index=True)
+    line_message_id: str = Field(default="", index=True)
+    asset_type: str = Field(default="image", index=True)
+    payload_json: str = Field(default="{}", sa_column=Column(Text, nullable=False))
+    status: str = Field(default="pending", index=True)
+    selected_decision: str = Field(default="", index=True)
+    expires_at: Optional[datetime] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    updated_at: datetime = Field(default_factory=utcnow, index=True)
+    resolved_at: Optional[datetime] = Field(default=None, index=True)
+
+
 class PendingApprovalTable(SQLModel, table=True):
     __tablename__ = "kachu_pending_approvals"
 

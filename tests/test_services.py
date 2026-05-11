@@ -114,7 +114,7 @@ async def test_agentos_task_dispatcher_without_auto_run_keeps_created_task() -> 
 
 @pytest.mark.asyncio
 async def test_llm_consultant_fallback_reply_without_api_keys() -> None:
-    consultant = LLMConsultant(Settings())
+    consultant = LLMConsultant(Settings(GOOGLE_AI_API_KEY="", OPENAI_API_KEY=""))
     reply = await consultant.build_reply(
         tenant_name="測試店",
         industry_type="咖啡廳",

@@ -10,9 +10,22 @@ from typing import Any
 
 import httpx
 
+try:
+    import litellm as _litellm_mod
+    _LITELLM_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    _litellm_mod = None  # type: ignore[assignment]
+    _LITELLM_AVAILABLE = False
+
 from kachu_plus.agentos_client import AgentOSWorkflowClient
 from kachu_plus.config import Settings
-from kachu_plus.learning import ContextBriefManager, MemoryManager, PostTaskReviewService
+from kachu_plus.learning import (
+    ContextBriefManager,
+    ConversationLearningService,
+    IdleBriefRefreshScheduler,
+    MemoryManager,
+    PostTaskReviewService,
+)
 from kachu_plus.models import AgentOSApprovalDecision, AgentOSRunView, AgentOSTaskView, ExecutionTaskResult
 from kachu_plus.proactive import KachuExecutionPolicyResolver, ProactiveSuggestionEngine
 
@@ -134,7 +147,8 @@ class LLMConsultant:
     ) -> str:
         if self._google_api_key or self._openai_api_key:
             try:
-                import litellm
+                if _litellm_mod is None:
+                    raise ImportError("litellm not installed")
 
                 system = (
                     "你是 Kachu+，是 SMB 老闆的 AI 商業顧問。"
@@ -163,7 +177,7 @@ class LLMConsultant:
                     + f"老闆問題：{message}\n"
                     "請用 120 到 220 字回覆。"
                 )
-                response = await litellm.acompletion(
+                response = await _litellm_mod.acompletion(
                     model=self._model,
                     messages=[
                         {"role": "system", "content": system},
@@ -174,6 +188,7 @@ class LLMConsultant:
                         google_api_key=self._google_api_key,
                         openai_api_key=self._openai_api_key,
                     ),
+                    max_tokens=2000,
                 )
                 content = response.choices[0].message.content or ""
                 if content.strip():
