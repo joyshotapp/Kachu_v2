@@ -16,13 +16,14 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, AsyncMock, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine
 from sqlalchemy.pool import StaticPool
 
-from kachu_plus.line.webhook import _handle_tag_management, router
+from kachu_plus.line.webhook import _handle_tag_management, _push_and_record_texts, router
 from kachu_plus.persistence.repository import KachuPlusRepository
 from kachu_plus.config import Settings
 from kachu_plus.persistence.tables import CustomerProfileTable, LineChannelConfigTable, OnboardingStateTable, TenantTable
@@ -157,6 +158,77 @@ def test_empty_events_returns_ok() -> None:
     )
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_push_and_record_texts_records_only_after_successful_push() -> None:
+    repo = MagicMock()
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()) as mock_push:
+        await _push_and_record_texts(
+            repo=repo,
+            tenant_id=_TENANT_ID,
+            line_user_id="Uabc123",
+            conversation_kind="follow_up",
+            messages=[{"type": "text", "text": "已成功送出"}],
+            access_token="token",
+        )
+
+    mock_push.assert_awaited_once()
+    assert repo.save_conversation.call_count == 2
+    audit_call = repo.save_conversation.call_args_list[0].kwargs
+    ai_call = repo.save_conversation.call_args_list[1].kwargs
+    assert audit_call["actor_role"] == "system"
+    assert audit_call["conversation_kind"] == "delivery_audit"
+    assert audit_call["metadata"]["delivery_status"] == "success"
+    assert ai_call["actor_role"] == "ai"
+
+
+@pytest.mark.asyncio
+async def test_push_and_record_texts_skips_record_when_push_fails() -> None:
+    repo = MagicMock()
+    request = httpx.Request("POST", "https://api.line.me/v2/bot/message/push")
+    response = httpx.Response(500, request=request, text="boom")
+
+    with patch(
+        "kachu_plus.line.webhook.push_line_messages",
+        new=AsyncMock(side_effect=httpx.HTTPStatusError("push failed", request=request, response=response)),
+    ):
+        await _push_and_record_texts(
+            repo=repo,
+            tenant_id=_TENANT_ID,
+            line_user_id="Uabc123",
+            conversation_kind="follow_up",
+            messages=[{"type": "text", "text": "不該先記錄"}],
+            access_token="token",
+        )
+
+    repo.save_conversation.assert_called_once()
+    audit_call = repo.save_conversation.call_args.kwargs
+    assert audit_call["actor_role"] == "system"
+    assert audit_call["conversation_kind"] == "delivery_audit"
+    assert audit_call["metadata"]["delivery_status"] == "failed"
+    assert audit_call["metadata"]["delivery_detail"] == "http_500"
+
+
+@pytest.mark.asyncio
+async def test_push_and_record_texts_records_skipped_delivery_audit() -> None:
+    repo = MagicMock()
+
+    await _push_and_record_texts(
+        repo=repo,
+        tenant_id=_TENANT_ID,
+        line_user_id="Uabc123",
+        conversation_kind="follow_up",
+        messages=[{"type": "text", "text": "會被跳過"}],
+        access_token="",
+    )
+
+    repo.save_conversation.assert_called_once()
+    audit_call = repo.save_conversation.call_args.kwargs
+    assert audit_call["actor_role"] == "system"
+    assert audit_call["conversation_kind"] == "delivery_audit"
+    assert audit_call["metadata"]["delivery_status"] == "skipped"
 
 
 def test_valid_request_resolves_existing_line_profile_without_duplicate_creation() -> None:

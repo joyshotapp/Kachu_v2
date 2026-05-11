@@ -119,6 +119,35 @@ async def _push_and_record_texts(
     related_run_id: str = "",
     metadata: dict[str, object] | None = None,
 ) -> None:
+    delivered, delivery_status, delivery_detail = await _push_safe(
+        to=line_user_id,
+        messages=messages,
+        access_token=access_token,
+        tenant_id=tenant_id,
+    )
+    preview_texts = [text[:160] for text in _extract_text_messages(messages)[:3]]
+    message_types = [str(message.get("type", "unknown") or "unknown") for message in messages[:5] if isinstance(message, dict)]
+    preview = preview_texts[0] if preview_texts else ", ".join(message_types) or "no-message"
+    repo.save_conversation(
+        tenant_id=tenant_id,
+        line_user_id=line_user_id,
+        actor_role="system",
+        channel_type="line",
+        conversation_kind="delivery_audit",
+        content_text=f"LINE push {delivery_status}: {preview}"[:500],
+        related_task_id=related_task_id,
+        related_run_id=related_run_id,
+        metadata={
+            "delivery_status": delivery_status,
+            "delivery_detail": delivery_detail,
+            "message_count": len(messages),
+            "message_types": message_types,
+            "preview_texts": preview_texts,
+            "source_metadata": metadata or {},
+        },
+    )
+    if not delivered:
+        return
     for text in _extract_text_messages(messages):
         repo.save_conversation(
             tenant_id=tenant_id,
@@ -131,12 +160,6 @@ async def _push_and_record_texts(
             related_run_id=related_run_id,
             metadata=metadata,
         )
-    await _push_safe(
-        to=line_user_id,
-        messages=messages,
-        access_token=access_token,
-        tenant_id=tenant_id,
-    )
 
 
 def _line_event_dedupe_key(tenant_id: str, event: dict[str, Any]) -> str:
@@ -292,24 +315,28 @@ async def _push_safe(
     messages: list[dict[str, Any]],
     access_token: str,
     tenant_id: str,
-) -> None:
+) -> tuple[bool, str, str]:
     """
     推播 LINE 訊息；失敗時只記錄 warning，不拋出例外。
     空的 to 或 access_token 時直接略過（dev/test 環境）。
     """
     if not to or not access_token or not messages:
-        return
+        return False, "skipped", "missing_recipient_or_access_token_or_messages"
     try:
         await push_line_messages(to=to, messages=messages, access_token=access_token)
+        return True, "success", ""
     except httpx.HTTPStatusError as exc:
         logger.warning(
             "tenant=%s push HTTP error %s: %s",
             tenant_id, exc.response.status_code, exc.response.text[:200],
         )
+        return False, "failed", f"http_{exc.response.status_code}"
     except httpx.RequestError as exc:
         logger.warning("tenant=%s push request error: %s", tenant_id, exc)
+        return False, "failed", exc.__class__.__name__
     except Exception as exc:
         logger.warning("tenant=%s push unexpected error: %s", tenant_id, exc)
+        return False, "failed", exc.__class__.__name__
 
 
 async def _download_line_message_content(line_message_id: str, access_token: str) -> bytes:
@@ -864,7 +891,6 @@ async def _handle_local_pending_approval(
     if action == ApprovalAction.REJECT:
         repo.decide_pending_approval(
             agentos_run_id=run_id,
-            decision="rejected",
             actor_line_id=actor_line_id or "owner",
             decision_payload={"reason": "rejected_from_line"},
         )
