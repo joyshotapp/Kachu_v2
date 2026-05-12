@@ -31,6 +31,7 @@ import shlex
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 # ── 常數 ──────────────────────────────────────────────────────────────────────
@@ -84,6 +85,30 @@ def _compose_cmd(remote_root: str) -> str:
     env_file = f"{remote_root}/.env.prod"
     compose_file = f"{remote_root}/docker-compose.prod.yml"
     return f"docker compose --env-file {env_file} -f {compose_file}"
+
+
+def _wait_for_container_healthy(host: str, container: str, *, timeout_seconds: int = 120) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        result = subprocess.run(
+            [
+                "ssh",
+                host,
+                f"docker inspect -f '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}' {container}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        status = (result.stdout or "").strip()
+        if status == "healthy":
+            print(f"✓ {container} health=healthy")
+            return
+        if status:
+            print(f"  waiting for {container} health, current={status}")
+        time.sleep(2)
+    print(f"✗ {container} 未在 {timeout_seconds} 秒內變成 healthy", file=sys.stderr)
+    sys.exit(1)
 
 
 # ── 部署步驟 ──────────────────────────────────────────────────────────────────
@@ -219,6 +244,7 @@ def step_nginx(host: str, remote_root: str) -> None:
 
 def step_smoke(host: str) -> None:
     print("\n━━ [8/8] Smoke test ━━")
+    _wait_for_container_healthy(host, KACHU_CONTAINER)
     _ssh(
         host,
         f"docker exec -i {KACHU_CONTAINER} python -",

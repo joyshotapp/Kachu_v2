@@ -125,6 +125,12 @@ def classify_boss_message(text: str) -> BossRouteDecision:
             consult_reply=_GREETING_REPLY,
         )
 
+    if _looks_like_content_consult_question(text):
+        return BossRouteDecision(
+            mode=BossRouteMode.CONSULT,
+            intent_label="content_consult",
+        )
+
     has_consult = _contains_any(text, _CONSULT_KW)
     has_execute = _contains_any(text, _EXECUTE_KW)
 
@@ -187,6 +193,27 @@ def _looks_like_greeting(text: str) -> bool:
         "hi",
         "在嗎",
     }
+
+
+def _looks_like_content_consult_question(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    if not any(token in normalized for token in ("貼文", "發文", "內容", "企劃", "主題", "角度", "文案", "母親節")):
+        return False
+    consult_signals = (
+        "怎麼切角度",
+        "切角度",
+        "不知道怎麼切",
+        "不知道怎麼做",
+        "不知道如何做",
+        "不知道怎麼寫",
+        "不知道怎麼規劃",
+        "怎麼抓方向",
+        "怎麼切",
+        "什麼角度",
+    )
+    return any(signal in normalized for signal in consult_signals)
 
 
 def _looks_like_draft_status(text: str) -> bool:

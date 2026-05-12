@@ -4,6 +4,14 @@
 日期：2026-05-12
 用途：production smoke、人工驗收、對話品質回歸比較
 
+執行方式：
+
+python scripts/smoke_conversation_prod.py
+
+若要指定 tenant 或 LINE user：
+
+python scripts/smoke_conversation_prod.py --tenant-id <tenant_id> --line-user-id <line_user_id>
+
 ## 1. 評測原則
 
 每題都要同時檢查：

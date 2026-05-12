@@ -250,6 +250,12 @@ def test_greeting_returns_consult_greeting_reply() -> None:
     assert d.consult_reply.startswith("你好，我在")
 
 
+def test_content_angle_question_returns_consult() -> None:
+    d = classify_boss_message("我想做母親節，但不知道怎麼切角度")
+    assert d.mode == BossRouteMode.CONSULT
+    assert d.intent_label == "content_consult"
+
+
 def test_clarify_returns_question() -> None:
     d = classify_boss_message("最近生意")
     assert d.mode == BossRouteMode.CLARIFY

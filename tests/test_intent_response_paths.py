@@ -311,6 +311,19 @@ def test_greeting_uses_router_consult_reply_without_consultant() -> None:
     assert messages[0]["text"].startswith("你好，我在")
 
 
+def test_content_angle_question_routes_to_consultant() -> None:
+    app, _, _, consultant = _make_app(onboarding_complete=True)
+    client = TestClient(app)
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()) as push_mock:
+        resp = _post_event(client, "我想做母親節，但不知道怎麼切角度")
+
+    assert resp.status_code == 200
+    consultant.build_reply.assert_awaited_once()
+    messages = push_mock.await_args.kwargs["messages"]
+    assert len(messages[0]["text"]) > 0
+
+
 # ── CLARIFY path ──────────────────────────────────────────────────────────────
 
 
