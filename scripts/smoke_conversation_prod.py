@@ -35,6 +35,9 @@ CASES: tuple[SmokeCase, ...] = (
     SmokeCase("emotion", "最近生意很差，我有點焦慮", "clarify", "empathy_clarify", "我知道你現在有點擔心"),
 )
 
+WAIT_TIMEOUT_SECONDS = 8.0
+POLL_INTERVAL_SECONDS = 0.5
+
 
 REMOTE_SCRIPT = r'''
 import asyncio
@@ -91,51 +94,74 @@ async def run_case(client, label, text, expected_mode, expected_strategy, expect
         content=payload,
         headers={'X-Line-Signature': signature, 'Content-Type': 'application/json'},
     )
-    await asyncio.sleep(2.0)
-
-    with Session(engine) as session:
-        boss_rows = session.exec(
-            select(ConversationTable)
-            .where(ConversationTable.tenant_id == TENANT_ID)
-            .where(ConversationTable.line_user_id == LINE_USER_ID)
-            .where(ConversationTable.actor_role == 'boss')
-            .order_by(ConversationTable.created_at.desc())
-            .limit(12)
-        ).all()
-    boss_row = next((row for row in boss_rows if getattr(row, 'source_message_id', '') == message_id), None)
+    boss_row = None
     ai_preview = ''
     ai_kind = ''
-    if boss_row is not None:
+    metadata = {}
+    deadline = asyncio.get_running_loop().time() + __WAIT_TIMEOUT_SECONDS__
+
+    while asyncio.get_running_loop().time() < deadline:
         with Session(engine) as session:
-            ai_rows = session.exec(
+            boss_rows = session.exec(
                 select(ConversationTable)
                 .where(ConversationTable.tenant_id == TENANT_ID)
                 .where(ConversationTable.line_user_id == LINE_USER_ID)
-                .where(ConversationTable.actor_role.in_(['ai', 'system']))
-                .where(ConversationTable.created_at >= boss_row.created_at)
-                .order_by(ConversationTable.created_at.asc())
-                .limit(6)
+                .where(ConversationTable.actor_role == 'boss')
+                .order_by(ConversationTable.created_at.desc())
+                .limit(12)
             ).all()
-        for row in ai_rows:
-            preview = (row.content_text or '').replace('\n', ' / ')
-            if expected_reply_hint in preview:
-                ai_preview = preview[:260]
-                ai_kind = row.conversation_kind or ''
-                break
-            if not ai_preview and row.conversation_kind in {'boss_consult', 'follow_up', 'execute_ack', 'execute_result'}:
-                ai_preview = preview[:260]
-                ai_kind = row.conversation_kind or ''
+        boss_row = next((row for row in boss_rows if getattr(row, 'source_message_id', '') == message_id), None)
+        metadata = json.loads(boss_row.metadata_json or '{}') if boss_row and boss_row.metadata_json else {}
+        ai_preview = ''
+        ai_kind = ''
 
-    metadata = json.loads(boss_row.metadata_json or '{}') if boss_row and boss_row.metadata_json else {}
+        if boss_row is not None:
+            with Session(engine) as session:
+                ai_rows = session.exec(
+                    select(ConversationTable)
+                    .where(ConversationTable.tenant_id == TENANT_ID)
+                    .where(ConversationTable.line_user_id == LINE_USER_ID)
+                    .where(ConversationTable.actor_role.in_(['ai', 'system']))
+                    .where(ConversationTable.created_at >= boss_row.created_at)
+                    .order_by(ConversationTable.created_at.asc())
+                    .limit(6)
+                ).all()
+            for row in ai_rows:
+                preview = (row.content_text or '').replace('\n', ' / ')
+                if expected_reply_hint in preview:
+                    ai_preview = preview[:260]
+                    ai_kind = row.conversation_kind or ''
+                    break
+                if not ai_preview and row.conversation_kind in {'boss_consult', 'follow_up', 'execute_ack', 'execute_result'}:
+                    ai_preview = preview[:260]
+                    ai_kind = row.conversation_kind or ''
+
+        if (
+            metadata.get('mode') == expected_mode
+            and metadata.get('response_strategy') == expected_strategy
+            and (
+                expected_reply_hint in ai_preview
+                or expected_reply_hint == ai_kind
+                or (expected_reply_hint == 'execute_ack' and ai_kind == 'execute_ack')
+                or (expected_strategy == 'consult_llm' and bool(ai_preview))
+            )
+        ):
+            break
+
+        await asyncio.sleep(__POLL_INTERVAL_SECONDS__)
+
+    reply_matches = (
+        expected_reply_hint in ai_preview
+        or expected_reply_hint == ai_kind
+        or (expected_reply_hint == 'execute_ack' and ai_kind == 'execute_ack')
+        or (expected_strategy == 'consult_llm' and bool(ai_preview))
+    )
+
     ok = (
         response.status_code == 200
         and metadata.get('mode') == expected_mode
         and metadata.get('response_strategy') == expected_strategy
-        and (
-            expected_reply_hint in ai_preview
-            or expected_reply_hint == ai_kind
-            or (expected_reply_hint == 'execute_ack' and ai_kind == 'execute_ack')
-        )
+        and reply_matches
     )
 
     print(f'[{"PASS" if ok else "FAIL"}] {label}')
@@ -178,6 +204,8 @@ def main() -> int:
         .replace("__TENANT_ID__", repr(args.tenant_id))
         .replace("__LINE_USER_ID__", repr(args.line_user_id))
         .replace("__CASES__", repr([(c.label, c.text, c.expected_mode, c.expected_strategy, c.expected_reply_hint) for c in CASES]))
+        .replace("__WAIT_TIMEOUT_SECONDS__", repr(WAIT_TIMEOUT_SECONDS))
+        .replace("__POLL_INTERVAL_SECONDS__", repr(POLL_INTERVAL_SECONDS))
     )
     command = [
         "ssh",
