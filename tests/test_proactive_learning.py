@@ -25,6 +25,32 @@ from kachu_plus.proactive import (
 )
 
 
+class _FakeProactiveDispatcher:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def dispatch(self, *, tenant_id: str, text: str, intent_label: str, workflow_input_patch=None):
+        from kachu_plus.models import ExecutionTaskResult
+
+        self.calls.append(
+            {
+                "tenant_id": tenant_id,
+                "text": text,
+                "intent_label": intent_label,
+                "workflow_input_patch": workflow_input_patch or {},
+            }
+        )
+        return ExecutionTaskResult(
+            task_id="task-1",
+            domain="kachu_google_post",
+            status="waiting_approval",
+            objective=text,
+            current_run_id="run-1",
+            waiting_approval=True,
+            approval_count=1,
+        )
+
+
 def _make_engine():
     return create_engine(
         "sqlite://",
@@ -274,6 +300,42 @@ def test_proactive_engine_pushes_to_owner_membership() -> None:
     assert len(pushed) == 1
     assert pushed[0]["to"] == "U-owner-1"
     assert pushed[0]["messages"][0]["type"] == "flex"
+
+
+def test_proactive_content_gap_auto_dispatches_to_rich_approval_flow() -> None:
+    engine = _make_engine()
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    _seed_tenant(repo)
+    repo.create_tenant_membership(tenant_id="tenant-1", line_user_id="U-owner-1", role="owner")
+
+    settings = Settings()
+    settings.LINE_CHANNEL_ACCESS_TOKEN = "push-token"
+    dispatcher = _FakeProactiveDispatcher()
+    pushed: list[dict] = []
+
+    async def _fake_push(*, to: str, messages, access_token: str) -> None:
+        pushed.append({"to": to, "messages": messages, "access_token": access_token})
+
+    import kachu_plus.proactive as proactive_module
+
+    original_push = proactive_module.push_line_messages
+    proactive_module.push_line_messages = _fake_push
+    try:
+        proactive = ProactiveSuggestionEngine(repo, settings, dispatcher=dispatcher)
+        created = proactive.run_once_for_tenant("tenant-1")
+    finally:
+        proactive_module.push_line_messages = original_push
+
+    assert created is not None
+    stored = repo.get_suggestion(created["id"])
+    assert stored is not None
+    assert stored.status == "sent"
+    snapshot = json.loads(stored.result_snapshot_json or "{}")
+    assert snapshot["execution"]["workflow"] == "kachu_google_post"
+    assert dispatcher.calls[0]["intent_label"] == "google_post"
+    assert dispatcher.calls[0]["workflow_input_patch"]["suggestion_id"] == created["id"]
+    assert pushed == []
 
 
 def test_proactive_engine_persists_card_fields_and_reuses_active_suggestion() -> None:

@@ -76,6 +76,7 @@ def create_app() -> FastAPI:
             settings,
             consultant=app.state.consultant,
             meta_service=app.state.meta_insights_service,
+            dispatcher=app.state.execute_dispatcher,
         )
         from kachu_plus.proactive import ProactiveSuggestionScheduler
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -15,6 +16,8 @@ NUDGE_STALE_KNOWLEDGE = "stale_knowledge_base"
 NUDGE_SLEEPING_CUSTOMERS = "recover_sleeping"
 PROACTIVE_SCAN_JOB = "daily_proactive_scan"
 META_INSIGHTS_REPORT_JOB = "daily_meta_insights_report"
+
+logger = logging.getLogger(__name__)
 
 
 class KachuExecutionPolicyResolver:
@@ -56,11 +59,13 @@ class ProactiveSuggestionEngine:
         *,
         consultant: Any | None = None,
         meta_service: MetaInsightsService | None = None,
+        dispatcher: Any | None = None,
     ) -> None:
         self._repo = repo
         self._settings = settings
         self._consultant = consultant
         self._meta_service = meta_service
+        self._dispatcher = dispatcher
 
     def detect_nudge(self, tenant_id: str) -> str | None:
         now = datetime.now(timezone.utc)
@@ -152,34 +157,105 @@ class ProactiveSuggestionEngine:
             payload={"detected_at": now.isoformat()},
             expires_at=now + timedelta(hours=24),
         )
+        recipients: list[str] = []
         if self._settings is not None and self._settings.LINE_CHANNEL_ACCESS_TOKEN:
             recipients = resolve_tenant_line_recipients(repo=self._repo, settings=self._settings, tenant_id=tenant_id)
-            if recipients:
-                expires_label = suggestion.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if suggestion.expires_at else "24 小時內"
-                async def _push_all() -> None:
-                    for recipient in recipients:
-                        await push_line_messages(
-                            to=recipient,
-                            messages=[
-                                suggestion_card_message(
-                                    suggestion_id=suggestion.id,
-                                    title=title_map[suggestion_type],
-                                    reason=reason_map[suggestion_type],
-                                    suggested_action=action_map[suggestion_type],
-                                    draft_message=draft_map[suggestion_type],
-                                    profile_count=profile_count,
-                                    expires_at=expires_label,
-                                )
-                            ],
-                            access_token=self._settings.LINE_CHANNEL_ACCESS_TOKEN,
-                        )
 
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(_push_all())
-                except RuntimeError:
-                    asyncio.run(_push_all())
+        if suggestion_type == NUDGE_NO_POST and recipients and self._dispatcher is not None:
+            self._schedule_content_gap_preparation(suggestion_id=suggestion.id)
+            stored = self._repo.get_suggestion(suggestion.id)
+            return self._serialize_suggestion(stored or suggestion)
+
+        if recipients and self._settings is not None and self._settings.LINE_CHANNEL_ACCESS_TOKEN:
+            expires_label = suggestion.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if suggestion.expires_at else "24 小時內"
+
+            async def _push_all() -> None:
+                for recipient in recipients:
+                    await push_line_messages(
+                        to=recipient,
+                        messages=[
+                            suggestion_card_message(
+                                suggestion_id=suggestion.id,
+                                title=title_map[suggestion_type],
+                                reason=reason_map[suggestion_type],
+                                suggested_action=action_map[suggestion_type],
+                                draft_message=draft_map[suggestion_type],
+                                profile_count=profile_count,
+                                expires_at=expires_label,
+                            )
+                        ],
+                        access_token=self._settings.LINE_CHANNEL_ACCESS_TOKEN,
+                    )
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_push_all())
+            except RuntimeError:
+                asyncio.run(_push_all())
         return self._serialize_suggestion(suggestion)
+
+    def _schedule_content_gap_preparation(self, *, suggestion_id: str) -> None:
+        async def _prepare() -> None:
+            await self._auto_prepare_content_gap_suggestion(suggestion_id=suggestion_id)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_prepare())
+        except RuntimeError:
+            asyncio.run(_prepare())
+
+    async def _auto_prepare_content_gap_suggestion(self, *, suggestion_id: str) -> None:
+        if self._dispatcher is None:
+            return
+        suggestion = self._repo.get_suggestion(suggestion_id)
+        if suggestion is None or suggestion.status != "pending":
+            return
+
+        try:
+            result = await self._dispatcher.dispatch(
+                tenant_id=suggestion.tenant_id,
+                text=suggestion.suggested_action,
+                intent_label="google_post",
+                workflow_input_patch={
+                    "suggestion_id": suggestion.id,
+                    "trigger_source": "proactive_suggestion",
+                    "proactive_reason": suggestion.reason,
+                    "draft_message": suggestion.draft_message,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to auto-prepare proactive content suggestion %s: %s", suggestion_id, exc)
+            return
+
+        suggestion.related_run_id = result.current_run_id or result.task_id
+        suggestion = self._repo.save_suggestion(suggestion)
+        snapshot = json.loads(suggestion.result_snapshot_json or "{}")
+        actor_id = "system:auto_proactive"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        snapshot.update(
+            {
+                "accepted_at": now_iso,
+                "accepted_by": actor_id,
+                "sending_at": now_iso,
+                "sending_by": actor_id,
+                "sent_at": now_iso,
+                "sent_by": actor_id,
+                "execution": {
+                    "mode": "agentos",
+                    "workflow": "kachu_google_post",
+                    "task_id": result.task_id,
+                    "run_id": result.current_run_id,
+                    "status": result.status,
+                    "waiting_approval": result.waiting_approval,
+                },
+            }
+        )
+        self._repo.update_suggestion_status(
+            suggestion_id=suggestion.id,
+            status="sent",
+            result_snapshot=snapshot,
+            allowed_current_statuses=["pending"],
+        )
 
     def run_once_all_tenants(self) -> dict[str, dict[str, Any]]:
         summary: dict[str, dict[str, Any]] = {}
