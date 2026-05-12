@@ -71,23 +71,10 @@ class ApprovalBridge:
                 return ApprovalResult(run_status="not_found", decision="missing")
             tenant = self._repo.get_tenant(tenant_id)
             scheduled_at, timezone_name = _resolve_scheduled_publish_at(getattr(tenant, "timezone", "Asia/Taipei"))
-            self._repo.decide_pending_approval(
-                agentos_run_id=run_id,
-                decision="scheduled",
+            return await self.defer_with_schedule(
+                run_id=run_id,
+                tenant_id=tenant_id,
                 actor_line_id=actor_line_id,
-                decision_payload={
-                    "scheduled_for": scheduled_at.isoformat(),
-                    "scheduled_timezone": timezone_name,
-                },
-            )
-            try:
-                label = scheduled_at.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m-%d %H:%M")
-            except Exception:  # noqa: BLE001
-                label = scheduled_at.strftime("%Y-%m-%d %H:%M UTC")
-            return ApprovalResult(
-                run_status="scheduled",
-                decision="scheduled",
-                message=f"已排程於 {label} 自動發布。",
                 scheduled_for=scheduled_at.isoformat(),
             )
 
@@ -131,6 +118,47 @@ class ApprovalBridge:
         return ApprovalResult(
             run_status=str(run_view.run.get("status", "unknown")),
             decision=agentos_decision,
+        )
+
+    async def defer_with_schedule(
+        self,
+        *,
+        run_id: str,
+        tenant_id: str,
+        actor_line_id: str,
+        scheduled_for: str,
+    ) -> ApprovalResult:
+        pending = self._repo.get_pending_approval_by_run_id(run_id)
+        if pending is None:
+            return ApprovalResult(run_status="not_found", decision="missing")
+
+        tenant = self._repo.get_tenant(tenant_id)
+        timezone_name = str(getattr(tenant, "timezone", "Asia/Taipei") or "Asia/Taipei")
+        try:
+            scheduled_at = datetime.fromisoformat(str(scheduled_for).replace("Z", "+00:00"))
+        except ValueError:
+            return ApprovalResult(run_status="invalid_schedule", decision="missing", message="排程時間格式錯誤，請重新設定。")
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+
+        self._repo.update_pending_approval_status(
+            agentos_run_id=run_id,
+            status="scheduled",
+            actor_line_id=actor_line_id,
+            decision_payload={
+                "scheduled_for": scheduled_at.astimezone(timezone.utc).isoformat(),
+                "scheduled_timezone": timezone_name,
+            },
+        )
+        try:
+            label = scheduled_at.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m-%d %H:%M")
+        except Exception:  # noqa: BLE001
+            label = scheduled_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return ApprovalResult(
+            run_status="scheduled",
+            decision="scheduled",
+            message=f"已排程於 {label} 自動發布。",
+            scheduled_for=scheduled_at.astimezone(timezone.utc).isoformat(),
         )
 
     async def complete_edit_and_approve(

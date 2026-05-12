@@ -300,6 +300,7 @@ def test_review_reply_edit_session_rewrites_and_requeues() -> None:
         account_label="GBP",
         credentials_json=json.dumps({"account_id": "123", "location_id": "locations/456", "access_token": "token", "expires_at": 9999999999}),
     )
+    repo.update_onboarding_step("tenant-1", "completed")
     app = _make_app(repo)
     app.state.consultant.build_reply = AsyncMock(return_value="這是改寫後的回覆")
     client = TestClient(app)
@@ -1020,6 +1021,7 @@ def test_schedule_publish_postback_and_due_scheduler_flow() -> None:
         account_label="GBP",
         credentials_json=json.dumps({"account_id": "123", "location_id": "locations/456", "access_token": "token", "expires_at": 9999999999}),
     )
+    repo.update_onboarding_step("tenant-1", "completed")
     app = _make_app(repo)
     enc_key = Fernet.generate_key().decode()
     app.state.settings.FIELD_ENCRYPTION_KEY = enc_key
@@ -1072,15 +1074,59 @@ def test_schedule_publish_postback_and_due_scheduler_flow() -> None:
             headers={"X-Line-Signature": signature, "Content-Type": "application/json"},
         )
         assert response.status_code == 200
+
+        schedule_text_body = json.dumps(
+            {
+                "events": [
+                    {
+                        "type": "message",
+                        "source": {"userId": "U-owner-1"},
+                        "message": {"id": "msg-schedule-1", "type": "text", "text": "5月3日晚上8點"},
+                    }
+                ]
+            }
+        ).encode()
+        schedule_text_signature = _make_signature(schedule_text_body, "secret")
+        schedule_text_response = client.post(
+            "/webhooks/line/tenant-1",
+            content=schedule_text_body,
+            headers={"X-Line-Signature": schedule_text_signature, "Content-Type": "application/json"},
+        )
+        assert schedule_text_response.status_code == 200
+
+        confirm_body = json.dumps(
+            {
+                "events": [
+                    {
+                        "type": "postback",
+                        "source": {"userId": "U-owner-1"},
+                        "postback": {"data": "run_id=run-schedule-1&action=confirm_schedule_publish"},
+                    }
+                ]
+            }
+        ).encode()
+        confirm_signature = _make_signature(confirm_body, "secret")
+        confirm_response = client.post(
+            "/webhooks/line/tenant-1/postback",
+            content=confirm_body,
+            headers={"X-Line-Signature": confirm_signature, "Content-Type": "application/json"},
+        )
+        assert confirm_response.status_code == 200
     finally:
         webhook_module.push_line_messages = original_push
 
     pending = repo.get_pending_approval_by_run_id("run-schedule-1")
     assert pending is not None
     assert pending.status == "scheduled"
-    assert len(pushed) == 1
+    assert len(pushed) == 3
     assert pushed[0]["to"] == "U-owner-1"
-    assert "已排程於" in pushed[0]["messages"][0]["text"]
+    assert "請直接告訴我預計發布時間" in pushed[0]["messages"][0]["text"]
+    assert "確認排程" in pushed[1]["messages"][0]["text"]
+    assert "已排程於" in pushed[2]["messages"][0]["text"]
+
+    payload = json.loads(pending.decision_payload_json or "{}")
+    assert payload["scheduled_for"]
+    assert payload["scheduled_timezone"]
 
     with Session(repo._engine) as session:  # noqa: SLF001
         pending_row = session.get(type(pending), pending.id)

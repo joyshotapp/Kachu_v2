@@ -9,6 +9,7 @@ import logging
 import re
 from urllib.parse import parse_qs
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
@@ -60,6 +61,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks", tags=["line"])
 
 _PENDING_ASSET_INTENT_TTL = timedelta(minutes=30)
+_SCHEDULE_ACTIVE_STATUSES = frozenset({"schedule_requested", "schedule_confirmation"})
 
 
 def _extract_text_messages(messages: list[dict[str, Any]]) -> list[str]:
@@ -566,6 +568,127 @@ def _build_approval_edit_summary(workflow_type: str) -> str:
     return mapping.get(workflow_type, "我已依照你的指示重寫草稿，請再確認一次。")
 
 
+def _schedule_prompt_message() -> dict[str, Any]:
+    return text_message(
+        "請直接告訴我預計發布時間，例如：5月3日晚上8點 或 5/3 20:30。\n"
+        "你必須完整說出幾月、幾日、幾時；如果沒有講幾分，我會當作整點。"
+    )
+
+
+def _format_schedule_time(dt: datetime) -> str:
+    weekday_map = "一二三四五六日"
+    return f"{dt.month}月{dt.day}日（週{weekday_map[dt.weekday()]}）{dt.hour:02d}:{dt.minute:02d}"
+
+
+def _build_schedule_confirmation_message(run_id: str, tenant_id: str, scheduled_label: str) -> dict[str, Any]:
+    return {
+        "type": "text",
+        "text": f"我會在 {scheduled_label} 幫你發布。確認無誤後，請點「確認排程」。",
+        "quickReply": {
+            "items": [
+                {
+                    "type": "action",
+                    "action": {
+                        "type": "postback",
+                        "label": "確認排程",
+                        "data": f"action=confirm_schedule_publish&run_id={run_id}&tenant_id={tenant_id}",
+                        "displayText": "確認排程",
+                    },
+                },
+                {
+                    "type": "action",
+                    "action": {
+                        "type": "postback",
+                        "label": "重新輸入",
+                        "data": f"action=cancel_schedule_publish&run_id={run_id}&tenant_id={tenant_id}",
+                        "displayText": "重新輸入排程時間",
+                    },
+                },
+            ]
+        },
+    }
+
+
+def _normalize_schedule_text(text: str) -> str:
+    translation = str.maketrans(
+        {
+            "０": "0",
+            "１": "1",
+            "２": "2",
+            "３": "3",
+            "４": "4",
+            "５": "5",
+            "６": "6",
+            "７": "7",
+            "８": "8",
+            "９": "9",
+            "：": ":",
+            "／": "/",
+            "－": "-",
+            "　": " ",
+        }
+    )
+    return str(text or "").translate(translation).strip()
+
+
+def _tenant_now(repo: Any, tenant_id: str) -> datetime:
+    tenant = repo.get_tenant(tenant_id)
+    timezone_name = getattr(tenant, "timezone", "Asia/Taipei") if tenant is not None else "Asia/Taipei"
+    try:
+        tzinfo = ZoneInfo(str(timezone_name or "Asia/Taipei"))
+    except Exception:  # noqa: BLE001
+        tzinfo = ZoneInfo("Asia/Taipei")
+    return datetime.now(tzinfo)
+
+
+def _parse_schedule_datetime(text: str, *, now_local: datetime) -> tuple[datetime | None, str | None]:
+    normalized = _normalize_schedule_text(text)
+    date_match = re.search(r"(?P<month>\d{1,2})\s*(?:月|/|-)\s*(?P<day>\d{1,2})\s*(?:日)?", normalized)
+    if not date_match:
+        return None, "請完整說出幾月幾日幾時，例如 5月3日晚上8點。"
+
+    remainder = normalized[date_match.end():]
+    time_match = re.search(
+        r"(?P<period>凌晨|早上|上午|中午|下午|晚上|晚間)?\s*(?P<hour>\d{1,2})\s*(?:(?:[:：]\s*(?P<minute_colon>\d{1,2}))|(?:\s*(?:點|時)\s*(?P<minute_text>\d{1,2})?\s*(?:分)?))",
+        remainder,
+    )
+    if not time_match:
+        return None, "我還缺少發布時段，請用像 5月3日晚上8點 或 5/3 20:30 這樣的格式。"
+
+    month = int(date_match.group("month"))
+    day = int(date_match.group("day"))
+    hour = int(time_match.group("hour"))
+    minute = int(time_match.group("minute_colon") or time_match.group("minute_text") or 0)
+    period = time_match.group("period") or ""
+
+    if not 1 <= month <= 12:
+        return None, "月份不對，請再說一次。"
+    if not 0 <= hour <= 23:
+        return None, "小時要在 0 到 23 之間，請再說一次。"
+    if not 0 <= minute <= 59:
+        return None, "分鐘要在 0 到 59 之間，請再說一次。"
+
+    if period in {"下午", "晚上", "晚間"} and hour < 12:
+        hour += 12
+    elif period in {"凌晨", "早上", "上午"} and hour == 12:
+        hour = 0
+    elif period == "中午" and 1 <= hour <= 11:
+        hour += 12
+
+    try:
+        candidate = datetime(now_local.year, month, day, hour, minute, tzinfo=now_local.tzinfo)
+    except ValueError:
+        return None, "日期看起來不對，請再說一次。"
+
+    if candidate <= now_local:
+        if (month, day) < (now_local.month, now_local.day):
+            candidate = candidate.replace(year=now_local.year + 1)
+        else:
+            return None, "這個時間已經過了，請給我一個未來時間。"
+
+    return candidate, None
+
+
 def _build_pending_approval_flex(*, pending: Any, drafts: dict[str, Any]) -> dict[str, Any] | None:
     if pending.workflow_type == "kachu_review_reply":
         reply_payload = drafts.get("reply_draft", "")
@@ -884,6 +1007,54 @@ def _is_active_editing_pending(pending: Any | None) -> bool:
     if pending is None:
         return False
     return str(getattr(pending, "status", "") or "").strip() == "editing"
+
+
+async def _handle_pending_schedule_reply(
+    *,
+    repo: Any,
+    tenant_id: str,
+    line_user_id: str,
+    line_text: str,
+    access_token: str,
+    pending: Any,
+) -> bool:
+    if pending is None or str(getattr(pending, "status", "") or "") not in _SCHEDULE_ACTIVE_STATUSES:
+        return False
+
+    scheduled_for, error_text = _parse_schedule_datetime(line_text, now_local=_tenant_now(repo, tenant_id))
+    if scheduled_for is None:
+        await _push_and_record_texts(
+            repo=repo,
+            tenant_id=tenant_id,
+            line_user_id=line_user_id,
+            conversation_kind="follow_up",
+            messages=[text_message(error_text or "排程時間格式不正確。"), _schedule_prompt_message()],
+            access_token=access_token,
+            related_run_id=getattr(pending, "agentos_run_id", ""),
+        )
+        return True
+
+    scheduled_label = _format_schedule_time(scheduled_for)
+    repo.update_pending_approval_status(
+        agentos_run_id=pending.agentos_run_id,
+        status="schedule_confirmation",
+        actor_line_id=line_user_id,
+        decision_payload={
+            "scheduled_for": scheduled_for.astimezone(timezone.utc).isoformat(),
+            "scheduled_label": scheduled_label,
+            "schedule_requested_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    await _push_and_record_texts(
+        repo=repo,
+        tenant_id=tenant_id,
+        line_user_id=line_user_id,
+        conversation_kind="follow_up",
+        messages=[_build_schedule_confirmation_message(pending.agentos_run_id, tenant_id, scheduled_label)],
+        access_token=access_token,
+        related_run_id=pending.agentos_run_id,
+    )
+    return True
 
 
 async def _handle_local_pending_approval(
@@ -1318,6 +1489,37 @@ async def _handle_event(
         tenant_id=tenant_id,
         line_user_id=line_user_id,
     )
+    schedule_pending = repo.get_latest_schedule_pending_approval(
+        tenant_id=tenant_id,
+        actor_line_id=line_user_id,
+    )
+    if schedule_pending is not None:
+        _record_inbound_conversation(
+            app=app,
+            repo=repo,
+            tenant_id=tenant_id,
+            line_user_id=line_user_id,
+            actor_role="boss",
+            conversation_kind="follow_up",
+            msg_type=msg_type,
+            text=text,
+            line_message_id=line_message_id,
+            metadata={
+                "schedule_run_id": schedule_pending.agentos_run_id,
+                "schedule_status": schedule_pending.status,
+            },
+        )
+        handled = await _handle_pending_schedule_reply(
+            repo=repo,
+            tenant_id=tenant_id,
+            line_user_id=line_user_id,
+            line_text=text,
+            access_token=channel_access_token,
+            pending=schedule_pending,
+        )
+        if handled:
+            return
+
     if latest_content_plan is not None and _looks_like_plan_to_draft_request(text):
         source_conversation = _record_inbound_conversation(
             app=app,
@@ -1961,6 +2163,66 @@ async def _handle_postback_event(
         )
         return {"status": "processed", "action": action_raw, "decision": asset_decision}
 
+    if action_raw == "confirm_schedule_publish" and run_id:
+        pending = repo.get_pending_approval_by_run_id(run_id)
+        if pending is None or str(getattr(pending, "status", "") or "") != "schedule_confirmation":
+            if actor_line_id and channel_access_token:
+                await push_line_messages(
+                    to=actor_line_id,
+                    messages=[text_message("這筆排程確認已失效，請重新點一次排程發布。")],
+                    access_token=channel_access_token,
+                )
+            return {"status": "skipped", "reason": "schedule_confirmation_missing", "run_id": run_id}
+
+        try:
+            payload = json.loads(getattr(pending, "decision_payload_json", "") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        scheduled_for = str(payload.get("scheduled_for", "") or "").strip()
+        if not scheduled_for:
+            if actor_line_id and channel_access_token:
+                await push_line_messages(
+                    to=actor_line_id,
+                    messages=[text_message("排程時間遺失了，請重新點一次排程發布。")],
+                    access_token=channel_access_token,
+                )
+            return {"status": "skipped", "reason": "schedule_time_missing", "run_id": run_id}
+
+        result = await _get_approval_bridge(request, repo).defer_with_schedule(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            actor_line_id=actor_line_id,
+            scheduled_for=scheduled_for,
+        )
+        if actor_line_id and channel_access_token and result.message:
+            await push_line_messages(
+                to=actor_line_id,
+                messages=[text_message(result.message)],
+                access_token=channel_access_token,
+            )
+        return {"status": "processed", "action": action_raw, "run_id": run_id}
+
+    if action_raw == "cancel_schedule_publish" and run_id:
+        pending = repo.get_pending_approval_by_run_id(run_id)
+        if pending is not None and str(getattr(pending, "status", "") or "") in _SCHEDULE_ACTIVE_STATUSES:
+            next_status = "schedule_requested" if str(getattr(pending, "status", "") or "") == "schedule_confirmation" else "pending"
+            repo.update_pending_approval_status(
+                agentos_run_id=run_id,
+                status=next_status,
+                actor_line_id=actor_line_id,
+                decision_payload={},
+            )
+            if actor_line_id and channel_access_token:
+                messages: list[dict[str, Any]] = [text_message("好，先取消這次排程。你可以重新輸入時間，或直接按立即發布。")]
+                if next_status == "schedule_requested":
+                    messages.append(_schedule_prompt_message())
+                await push_line_messages(
+                    to=actor_line_id,
+                    messages=messages,
+                    access_token=channel_access_token,
+                )
+        return {"status": "processed", "action": action_raw, "run_id": run_id}
+
     if action_raw in {"approve", "reject", "edit", "schedule_publish"}:
         result_message = ""
         if _is_local_pending_workflow(pending) and action_raw in {"approve", "reject"}:
@@ -1974,6 +2236,14 @@ async def _handle_postback_event(
             )
         elif _is_local_pending_workflow(pending) and action_raw == "schedule_publish":
             result_message = "這類本地草稿目前不支援二次排程，請先修改或直接發布。"
+        elif action_raw == "schedule_publish" and pending is not None:
+            repo.update_pending_approval_status(
+                agentos_run_id=run_id,
+                status="schedule_requested",
+                actor_line_id=actor_line_id,
+                decision_payload={"schedule_requested_at": datetime.now(timezone.utc).isoformat()},
+            )
+            result_message = _schedule_prompt_message()["text"]
         else:
             bridge = _get_approval_bridge(request, repo)
             result = await bridge.handle_postback(

@@ -1691,6 +1691,26 @@ class KachuPlusRepository:
             )
             return session.exec(stmt).first()
 
+    def get_latest_schedule_pending_approval(
+        self,
+        *,
+        tenant_id: str,
+        actor_line_id: str,
+        statuses: list[str] | None = None,
+    ) -> Optional[PendingApprovalTable]:
+        active_statuses = statuses or ["schedule_requested", "schedule_confirmation"]
+        with Session(self._engine) as session:
+            stmt = (
+                select(PendingApprovalTable)
+                .where(
+                    PendingApprovalTable.tenant_id == tenant_id,
+                    PendingApprovalTable.actor_line_id == actor_line_id,
+                    PendingApprovalTable.status.in_(active_statuses),
+                )
+                .order_by(PendingApprovalTable.updated_at.desc(), PendingApprovalTable.created_at.desc())
+            )
+            return session.exec(stmt).first()
+
     def decide_pending_approval(
         self,
         *,
