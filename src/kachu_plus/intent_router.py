@@ -9,6 +9,25 @@ from kachu_plus.website_knowledge import contains_url
 
 logger = logging.getLogger(__name__)
 
+_CAPABILITY_REPLY = (
+    "我可以直接幫你做幾件事：\n"
+    "1. 寫或發布 Google 商家動態\n"
+    "2. 回覆 Google 評論\n"
+    "3. 看 Meta / Facebook / Instagram 成效\n"
+    "4. 查沉睡或快流失的客人\n"
+    "5. 更新店家資訊或管理標籤\n\n"
+    "你可以直接說，例如：\n"
+    "「幫我寫一篇母親節貼文」\n"
+    "「幫我回覆這則負評」\n"
+    "「哪些客人超過 60 天沒來」"
+)
+
+_GREETING_REPLY = (
+    "你好，我在。\n\n"
+    "你可以直接叫我幫你寫貼文、回評論、看 Meta 成效、查沉睡客人，"
+    "或更新店家資訊。也可以先問我策略建議。"
+)
+
 # ── EXECUTE keywords ──────────────────────────────────────────────────────────
 # 商家明確要求執行某個動作
 
@@ -92,6 +111,20 @@ def classify_boss_message(text: str) -> BossRouteDecision:
 
     參考：Kachu_v2 intent_router.py classify_text 的 keyword fast-path 設計。
     """
+    if _looks_like_capability_question(text):
+        return BossRouteDecision(
+            mode=BossRouteMode.CONSULT,
+            intent_label="capability_overview",
+            consult_reply=_CAPABILITY_REPLY,
+        )
+
+    if _looks_like_greeting(text):
+        return BossRouteDecision(
+            mode=BossRouteMode.CONSULT,
+            intent_label="greeting",
+            consult_reply=_GREETING_REPLY,
+        )
+
     has_consult = _contains_any(text, _CONSULT_KW)
     has_execute = _contains_any(text, _EXECUTE_KW)
 
@@ -126,6 +159,34 @@ def _looks_like_execute(text: str) -> bool:
     if "客人" in text and any(kw in text for kw in ("沒來", "多久", "超過", "流失", "沉睡")):
         return True
     return False
+
+
+def _looks_like_capability_question(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(text or "")).lower()
+    signals = (
+        "你能幫我做什麼",
+        "你能做什麼",
+        "你可以幫我做什麼",
+        "你可以做什麼",
+        "你會做什麼",
+        "你會什麼",
+        "可以幫我什麼",
+        "能幫我什麼",
+    )
+    return any(signal in normalized for signal in signals)
+
+
+def _looks_like_greeting(text: str) -> bool:
+    normalized = re.sub(r"[\s\W_]+", "", str(text or "")).lower()
+    return normalized in {
+        "你好",
+        "您好",
+        "嗨",
+        "哈囉",
+        "hello",
+        "hi",
+        "在嗎",
+    }
 
 
 def _looks_like_draft_status(text: str) -> bool:

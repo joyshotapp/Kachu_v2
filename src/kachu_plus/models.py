@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class BossRouteMode(str, Enum):
@@ -17,6 +17,20 @@ class BossRouteDecision(BaseModel):
     intent_label: str = ""       # 給 EXECUTE 用：描述要執行什麼 action
     clarify_question: str = ""   # 給 CLARIFY 用：追問句
     consult_reply: str = ""      # 給 CONSULT 用：諮詢回覆
+
+
+class ConversationResponsePlan(BaseModel):
+    mode: BossRouteMode
+    intent_label: str = ""
+    response_strategy: str = ""
+    user_goal: str = ""
+    context_summary: str = ""
+    reply_directive: str = ""
+    consult_reply: str = ""
+    clarify_question: str = ""
+    confidence: float = 0.0
+    reasoning_signals: list[str] = Field(default_factory=list)
+    emotional_signals: list[str] = Field(default_factory=list)
 
 
 class ExecutionTaskResult(BaseModel):

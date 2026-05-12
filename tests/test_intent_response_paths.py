@@ -76,6 +76,7 @@ def _make_app(onboarding_complete: bool = True) -> tuple[FastAPI, MagicMock, Mag
     )
     repo.list_recent_conversations.return_value = []
     repo.get_latest_execute_task_for_tenant.return_value = None
+    repo.get_latest_execute_task_record.return_value = None
     repo.list_sleeping_customer_profiles.return_value = [
         CustomerProfileTable(
             id="p1",
@@ -280,6 +281,34 @@ def test_consult_path_logs_reply() -> None:
     log_calls = " ".join(str(c) for c in mock_log.info.call_args_list)
     assert "CONSULT" in log_calls
     consultant.build_reply.assert_awaited_once()
+    assert "reply_directive" in consultant.build_reply.await_args.kwargs
+    assert "直接回答老闆這句話真正想問的事" in consultant.build_reply.await_args.kwargs["reply_directive"]
+
+
+def test_capability_question_uses_router_consult_reply_without_consultant() -> None:
+    app, _, _, consultant = _make_app(onboarding_complete=True)
+    client = TestClient(app)
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()) as push_mock:
+        resp = _post_event(client, "你能做什麼？")
+
+    assert resp.status_code == 200
+    consultant.build_reply.assert_not_called()
+    messages = push_mock.await_args.kwargs["messages"]
+    assert "Google 商家動態" in messages[0]["text"]
+
+
+def test_greeting_uses_router_consult_reply_without_consultant() -> None:
+    app, _, _, consultant = _make_app(onboarding_complete=True)
+    client = TestClient(app)
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()) as push_mock:
+        resp = _post_event(client, "你好")
+
+    assert resp.status_code == 200
+    consultant.build_reply.assert_not_called()
+    messages = push_mock.await_args.kwargs["messages"]
+    assert messages[0]["text"].startswith("你好，我在")
 
 
 # ── CLARIFY path ──────────────────────────────────────────────────────────────
@@ -297,6 +326,50 @@ def test_clarify_path_logs_question() -> None:
     assert "CLARIFY" in log_calls
     execute_dispatcher.dispatch.assert_not_called()
     consultant.build_reply.assert_not_called()
+
+
+def test_clarify_traffic_question_becomes_targeted_question() -> None:
+    app, _, execute_dispatcher, consultant = _make_app(onboarding_complete=True)
+    client = TestClient(app)
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()) as push_mock:
+        resp = _post_event(client, "最近流量掉很多")
+
+    assert resp.status_code == 200
+    execute_dispatcher.dispatch.assert_not_called()
+    consultant.build_reply.assert_not_called()
+    messages = push_mock.await_args.kwargs["messages"]
+    assert "拉報告看數字" in messages[0]["text"]
+    assert "拆可能原因" in messages[0]["text"]
+
+
+def test_clarify_review_question_becomes_targeted_question() -> None:
+    app, _, execute_dispatcher, consultant = _make_app(onboarding_complete=True)
+    client = TestClient(app)
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()) as push_mock:
+        resp = _post_event(client, "有個評論")
+
+    assert resp.status_code == 200
+    execute_dispatcher.dispatch.assert_not_called()
+    consultant.build_reply.assert_not_called()
+    messages = push_mock.await_args.kwargs["messages"]
+    assert "直接幫你回這則評論" in messages[0]["text"]
+    assert "怎麼處理比較好" in messages[0]["text"]
+
+
+def test_emotional_clarify_adds_empathy_prefix() -> None:
+    app, _, execute_dispatcher, consultant = _make_app(onboarding_complete=True)
+    client = TestClient(app)
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()) as push_mock:
+        resp = _post_event(client, "最近生意很差，我有點焦慮")
+
+    assert resp.status_code == 200
+    execute_dispatcher.dispatch.assert_not_called()
+    consultant.build_reply.assert_not_called()
+    messages = push_mock.await_args.kwargs["messages"]
+    assert "我知道你現在有點擔心" in messages[0]["text"]
 
 
 # ── Onboarding path ───────────────────────────────────────────────────────────

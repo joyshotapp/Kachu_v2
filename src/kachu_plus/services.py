@@ -144,6 +144,7 @@ class LLMConsultant:
         industry_type: str,
         message: str,
         context_bundle: dict[str, Any] | None = None,
+        reply_directive: str = "",
     ) -> str:
         if self._google_api_key or self._openai_api_key:
             try:
@@ -162,9 +163,12 @@ class LLMConsultant:
                         "owner_brief",
                         "conversation_summary_brief",
                         "active_task_brief",
+                        "customer_brief",
                         "recent_conversations",
                         "relevant_knowledge",
                         "recent_preferences",
+                        "episodes",
+                        "retrieval_plan",
                     ):
                         value = context_bundle.get(key)
                         if value:
@@ -173,6 +177,7 @@ class LLMConsultant:
                 prompt = (
                     f"品牌：{tenant_name or '未命名店家'}\n"
                     f"行業：{industry_type or '一般服務業'}\n"
+                    + (f"回覆規劃：{reply_directive}\n" if reply_directive else "")
                     + (context_block + "\n" if context_block else "")
                     + f"老闆問題：{message}\n"
                     "請用 120 到 220 字回覆。"

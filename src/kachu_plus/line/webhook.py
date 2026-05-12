@@ -16,6 +16,7 @@ from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 from kachu_plus.approval import ApprovalBridge
 from kachu_plus.consult_context import ConsultContextBuilder
 from kachu_plus.config import get_settings
+from kachu_plus.conversation_planner import ConversationResponsePlanner
 from kachu_plus.crypto import decrypt_field
 from kachu_plus.dialogue_state import DialogueStateResolver
 from kachu_plus.intent_router import classify_boss_message
@@ -299,6 +300,14 @@ def _get_dialogue_state_resolver(app: Any, repo: Any) -> DialogueStateResolver:
         resolver = DialogueStateResolver(repo)
         app.state.dialogue_state_resolver = resolver
     return resolver
+
+
+def _get_response_planner(app: Any, repo: Any) -> ConversationResponsePlanner:
+    planner = getattr(app.state, "conversation_response_planner", None)
+    if planner is None:
+        planner = ConversationResponsePlanner(repo)
+        app.state.conversation_response_planner = planner
+    return planner
 
 
 def _get_memory_promoter(app: Any, repo: Any) -> ConversationMemoryPromoter:
@@ -1436,10 +1445,17 @@ async def _handle_event(
         text=text,
     )
     decision = dialogue_state.apply(classify_boss_message(text))
+    response_plan = _get_response_planner(app, repo).plan(
+        tenant_id=tenant_id,
+        line_user_id=line_user_id,
+        text=text,
+        decision=decision,
+        dialogue_state=dialogue_state,
+    )
     conversation_kind = "boss_command"
-    if decision.mode == BossRouteMode.CONSULT:
+    if response_plan.mode == BossRouteMode.CONSULT:
         conversation_kind = "boss_consult"
-    elif decision.mode == BossRouteMode.CLARIFY:
+    elif response_plan.mode == BossRouteMode.CLARIFY:
         conversation_kind = "follow_up"
     source_conversation = _record_inbound_conversation(
         app=app,
@@ -1452,16 +1468,21 @@ async def _handle_event(
         text=text,
         line_message_id=line_message_id,
         metadata={
-            "intent_label": decision.intent_label,
-            "mode": decision.mode.value,
+            "intent_label": response_plan.intent_label,
+            "mode": response_plan.mode.value,
             "state_reason": dialogue_state.reason,
             "is_follow_up": dialogue_state.is_follow_up,
             "carry_over_task_id": dialogue_state.carry_over_task_id,
             "carry_over_run_id": dialogue_state.carry_over_run_id,
+            "response_strategy": response_plan.response_strategy,
+            "planner_confidence": response_plan.confidence,
+            "context_summary": response_plan.context_summary,
+            "reasoning_signals": response_plan.reasoning_signals,
+            "emotional_signals": response_plan.emotional_signals,
         },
     )
-    if decision.mode == BossRouteMode.EXECUTE:
-        if decision.intent_label == "content_plan":
+    if response_plan.mode == BossRouteMode.EXECUTE:
+        if response_plan.intent_label == "content_plan":
             tenant = repo.get_tenant(tenant_id)
             industry_type = getattr(tenant, "industry_type", "") or "一般服務業"
             context_bundle = await _get_consult_context_builder(app, repo).build_bundle(
@@ -1495,7 +1516,7 @@ async def _handle_event(
                 metadata={"content_plan": plan},
             )
             return
-        if decision.intent_label == "website_ingest":
+        if response_plan.intent_label == "website_ingest":
             repo.save_knowledge_entry(
                 tenant_id=tenant_id,
                 category="brand_material",
@@ -1524,7 +1545,7 @@ async def _handle_event(
             logger.info(
                 "tenant=%s [EXECUTE] intent=%s reply=%s",
                 tenant_id,
-                decision.intent_label,
+                response_plan.intent_label,
                 reply[:160],
             )
             await _push_and_record_texts(
@@ -1536,7 +1557,7 @@ async def _handle_event(
                 access_token=channel_access_token,
             )
             return
-        if decision.intent_label == "draft_status":
+        if response_plan.intent_label == "draft_status":
             reply_messages = await _refresh_execute_task_reply(
                 tenant_id=tenant_id,
                 line_user_id=line_user_id,
@@ -1547,7 +1568,7 @@ async def _handle_event(
             logger.info(
                 "tenant=%s [EXECUTE] intent=%s reply=%s",
                 tenant_id,
-                decision.intent_label,
+                response_plan.intent_label,
                 (reply_texts[0] if reply_texts else "(non-text reply)")[:160],
             )
             latest_record = repo.get_latest_execute_task_record(tenant_id=tenant_id, line_user_id=line_user_id)
@@ -1562,12 +1583,12 @@ async def _handle_event(
                 related_run_id=getattr(latest_record, "run_id", "") if latest_record is not None else "",
             )
             return
-        if decision.intent_label == "sleep_customer_query":
+        if response_plan.intent_label == "sleep_customer_query":
             reply = sleep_query_service.build_reply(tenant_id=tenant_id, text=text)
             logger.info(
                 "tenant=%s [EXECUTE] intent=%s reply=%s",
                 tenant_id,
-                decision.intent_label,
+                response_plan.intent_label,
                 reply[:120],
             )
             await _push_and_record_texts(
@@ -1579,7 +1600,7 @@ async def _handle_event(
                 access_token=channel_access_token,
             )
             return
-        if decision.intent_label == "meta_insights":
+        if response_plan.intent_label == "meta_insights":
             try:
                 insights = _get_meta_insights_service(app, repo).fetch_insights(
                     tenant_id=tenant_id,
@@ -1610,14 +1631,14 @@ async def _handle_event(
                 logger.info(
                     "tenant=%s [EXECUTE] intent=%s reply=%s",
                     tenant_id,
-                    decision.intent_label,
+                    response_plan.intent_label,
                     reply[:120],
                 )
             except MetaConnectorError as exc:
                 logger.info(
                     "tenant=%s [EXECUTE_META_ERROR] intent=%s reason=%s",
                     tenant_id,
-                    decision.intent_label,
+                    response_plan.intent_label,
                     str(exc),
                 )
                 await _push_and_record_texts(
@@ -1629,14 +1650,14 @@ async def _handle_event(
                     access_token=channel_access_token,
                 )
             return
-        if decision.intent_label in {"meta_connect", "meta_reauth"}:
+        if response_plan.intent_label in {"meta_connect", "meta_reauth"}:
             manage_url = build_meta_manage_url(settings=app.state.settings, tenant_id=tenant_id, line_user_id=line_user_id)
             status_payload = _get_meta_oauth_service(app, repo).get_connection_status(tenant_id=tenant_id)
             connector = status_payload.get("connector") or {}
             current_page = str(connector.get("account_label", "") or connector.get("fb_page_id", "") or "")
             prefix = "你目前已連接粉專「%s」。" % current_page if current_page else "目前尚未連接 Meta。"
             reply = f"{prefix} 請點這個連結完成 Meta 授權與管理：{manage_url}"
-            logger.info("tenant=%s [EXECUTE] intent=%s reply=%s", tenant_id, decision.intent_label, reply[:160])
+            logger.info("tenant=%s [EXECUTE] intent=%s reply=%s", tenant_id, response_plan.intent_label, reply[:160])
             await _push_and_record_texts(
                 repo=repo,
                 tenant_id=tenant_id,
@@ -1646,7 +1667,7 @@ async def _handle_event(
                 access_token=channel_access_token,
             )
             return
-        if decision.intent_label == "meta_status":
+        if response_plan.intent_label == "meta_status":
             manage_url = build_meta_manage_url(settings=app.state.settings, tenant_id=tenant_id, line_user_id=line_user_id)
             status_payload = _get_meta_oauth_service(app, repo).get_connection_status(tenant_id=tenant_id)
             connector = status_payload.get("connector") or {}
@@ -1658,7 +1679,7 @@ async def _handle_event(
                 )
             else:
                 reply = f"你目前還沒有連接 Meta。可從這裡開始：{manage_url}"
-            logger.info("tenant=%s [EXECUTE] intent=%s reply=%s", tenant_id, decision.intent_label, reply[:160])
+            logger.info("tenant=%s [EXECUTE] intent=%s reply=%s", tenant_id, response_plan.intent_label, reply[:160])
             await _push_and_record_texts(
                 repo=repo,
                 tenant_id=tenant_id,
@@ -1668,13 +1689,13 @@ async def _handle_event(
                 access_token=channel_access_token,
             )
             return
-        if decision.intent_label == "meta_disconnect":
+        if response_plan.intent_label == "meta_disconnect":
             result = _get_meta_oauth_service(app, repo).disconnect(tenant_id=tenant_id)
             if result.get("status") == "disconnected":
                 reply = "已解除 Meta 連接。之後若要重新接通，直接說「我要重新授權 FB/IG」即可。"
             else:
                 reply = "目前沒有可解除的 Meta 連接。"
-            logger.info("tenant=%s [EXECUTE] intent=%s reply=%s", tenant_id, decision.intent_label, reply[:160])
+            logger.info("tenant=%s [EXECUTE] intent=%s reply=%s", tenant_id, response_plan.intent_label, reply[:160])
             await _push_and_record_texts(
                 repo=repo,
                 tenant_id=tenant_id,
@@ -1684,7 +1705,7 @@ async def _handle_event(
                 access_token=channel_access_token,
             )
             return
-        if decision.intent_label == "tag_management":
+        if response_plan.intent_label == "tag_management":
             await _handle_tag_management(
                 tenant_id=tenant_id,
                 text=text,
@@ -1695,7 +1716,7 @@ async def _handle_event(
             return
         try:
             workflow_input_patch = None
-            if policy_resolver is not None and decision.intent_label in {"review_reply", "google_post"}:
+            if policy_resolver is not None and response_plan.intent_label in {"review_reply", "google_post"}:
                 workflow_input_patch = policy_resolver.resolve(tenant_id)
             if dialogue_state.is_follow_up and dialogue_state.carry_over_task_id:
                 workflow_input_patch = {
@@ -1708,13 +1729,13 @@ async def _handle_event(
             task = await execute_dispatcher.dispatch(
                 tenant_id=tenant_id,
                 text=text,
-                intent_label=decision.intent_label,
+                intent_label=response_plan.intent_label,
                 workflow_input_patch=workflow_input_patch,
             )
             logger.info(
                 "tenant=%s [EXECUTE] intent=%s task_id=%s domain=%s status=%s",
                 tenant_id,
-                decision.intent_label,
+                response_plan.intent_label,
                 task.task_id,
                 task.domain,
                 task.status,
@@ -1722,7 +1743,7 @@ async def _handle_event(
             repo.save_execute_task_record(
                 tenant_id=tenant_id,
                 line_user_id=line_user_id,
-                intent_label=decision.intent_label,
+                intent_label=response_plan.intent_label,
                 source_text=text,
                 objective=task.objective,
                 task_id=task.task_id,
@@ -1735,7 +1756,7 @@ async def _handle_event(
                 tenant_id=tenant_id,
                 line_user_id=line_user_id,
                 conversation_kind="execute_ack",
-                messages=[text_message(_build_execute_ack(intent_label=decision.intent_label, task=task))],
+                messages=[text_message(_build_execute_ack(intent_label=response_plan.intent_label, task=task))],
                 access_token=channel_access_token,
                 related_task_id=task.task_id,
                 related_run_id=task.current_run_id or "",
@@ -1744,7 +1765,7 @@ async def _handle_event(
             logger.info(
                 "tenant=%s [EXECUTE_UNSUPPORTED] intent=%s reason=%s",
                 tenant_id,
-                decision.intent_label,
+                response_plan.intent_label,
                 str(exc),
             )
             await _push_and_record_texts(
@@ -1766,22 +1787,27 @@ async def _handle_event(
                 access_token=channel_access_token,
             )
 
-    elif decision.mode == BossRouteMode.CONSULT:
-        tenant = repo.get_tenant(tenant_id)
-        context_bundle = await _get_consult_context_builder(app, repo).build_bundle(
-            tenant_id=tenant_id,
-            message=text,
-            line_user_id=line_user_id,
-        )
-        reply = await consultant.build_reply(
-            tenant_name=tenant.name if tenant is not None else "",
-            industry_type=tenant.industry_type if tenant is not None else "",
-            message=text,
-            context_bundle=context_bundle,
-        )
+    elif response_plan.mode == BossRouteMode.CONSULT:
+        if response_plan.consult_reply:
+            reply = response_plan.consult_reply
+        else:
+            tenant = repo.get_tenant(tenant_id)
+            context_bundle = await _get_consult_context_builder(app, repo).build_bundle(
+                tenant_id=tenant_id,
+                message=text,
+                line_user_id=line_user_id,
+            )
+            reply = await consultant.build_reply(
+                tenant_name=tenant.name if tenant is not None else "",
+                industry_type=tenant.industry_type if tenant is not None else "",
+                message=text,
+                context_bundle=context_bundle,
+                reply_directive=response_plan.reply_directive,
+            )
         logger.info(
-            "tenant=%s [CONSULT] reply=%s",
+            "tenant=%s [CONSULT] strategy=%s reply=%s",
             tenant_id,
+            response_plan.response_strategy,
             reply[:80],
         )
         await _push_and_record_texts(
@@ -1795,16 +1821,17 @@ async def _handle_event(
 
     else:  # CLARIFY
         logger.info(
-            "tenant=%s [CLARIFY] question=%s",
+            "tenant=%s [CLARIFY] strategy=%s question=%s",
             tenant_id,
-            decision.clarify_question[:80],
+            response_plan.response_strategy,
+            response_plan.clarify_question[:80],
         )
         await _push_and_record_texts(
             repo=repo,
             tenant_id=tenant_id,
             line_user_id=line_user_id,
             conversation_kind="follow_up",
-            messages=[text_message(decision.clarify_question)],
+            messages=[text_message(response_plan.clarify_question)],
             access_token=channel_access_token,
         )
 

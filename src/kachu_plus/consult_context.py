@@ -49,6 +49,7 @@ class ConsultContextBuilder:
             "owner_brief": brief_payloads.get("owner_brief", {}),
             "conversation_summary_brief": brief_payloads.get("conversation_summary_brief", {}),
             "active_task_brief": brief_payloads.get("active_task_brief", {}),
+            "customer_brief": brief_payloads.get("customer_brief", {}),
             "recent_conversations": recent_conversations or [
                 _serialize_conversation(row)
                 for row in self._repo.list_recent_conversations(

@@ -238,6 +238,18 @@ def test_consult_returns_reply() -> None:
     assert len(d.consult_reply) > 0
 
 
+def test_capability_question_returns_consult_capability_reply() -> None:
+    d = classify_boss_message("你能幫我做什麼？")
+    assert d.mode == BossRouteMode.CONSULT
+    assert "Google 商家動態" in d.consult_reply
+
+
+def test_greeting_returns_consult_greeting_reply() -> None:
+    d = classify_boss_message("你好")
+    assert d.mode == BossRouteMode.CONSULT
+    assert d.consult_reply.startswith("你好，我在")
+
+
 def test_clarify_returns_question() -> None:
     d = classify_boss_message("最近生意")
     assert d.mode == BossRouteMode.CLARIFY
