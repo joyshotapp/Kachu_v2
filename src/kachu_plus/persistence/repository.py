@@ -139,6 +139,18 @@ class KachuPlusRepository:
             )
             return list(session.exec(stmt).all())
 
+    def get_active_membership_by_line_user_id(self, line_user_id: str) -> Optional[TenantMembershipTable]:
+        normalized_line_user_id = str(line_user_id or "").strip()
+        if not normalized_line_user_id:
+            return None
+        with Session(self._engine) as session:
+            stmt = (
+                select(TenantMembershipTable)
+                .where(TenantMembershipTable.line_user_id == normalized_line_user_id)
+                .where(TenantMembershipTable.is_active == True)  # noqa: E712
+            )
+            return session.exec(stmt).first()
+
     def get_owner_line_user_ids(self, tenant_id: str) -> list[str]:
         with Session(self._engine) as session:
             stmt = (
@@ -165,6 +177,20 @@ class KachuPlusRepository:
                 if line_user_id and line_user_id not in recipients:
                     recipients.append(line_user_id)
             return recipients
+
+    def deactivate_tenant_membership(self, membership_id: str) -> Optional[TenantMembershipTable]:
+        from kachu_plus.persistence.tables import utcnow
+
+        with Session(self._engine) as session:
+            membership = session.get(TenantMembershipTable, membership_id)
+            if membership is None:
+                return None
+            membership.is_active = False
+            membership.updated_at = utcnow()
+            session.add(membership)
+            session.commit()
+            session.refresh(membership)
+            return membership
 
     def get_recurring_job(self, tenant_id: str, job_type: str) -> Optional[RecurringJobTable]:
         with Session(self._engine) as session:

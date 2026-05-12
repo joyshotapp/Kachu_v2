@@ -62,6 +62,7 @@ router = APIRouter(prefix="/webhooks", tags=["line"])
 
 _PENDING_ASSET_INTENT_TTL = timedelta(minutes=30)
 _SCHEDULE_ACTIVE_STATUSES = frozenset({"schedule_requested", "schedule_confirmation"})
+_INTERNAL_MEMBERSHIP_ROLES = frozenset({"owner", "manager"})
 
 
 def _extract_text_messages(messages: list[dict[str, Any]]) -> list[str]:
@@ -73,6 +74,14 @@ def _extract_text_messages(messages: list[dict[str, Any]]) -> list[str]:
         if text:
             texts.append(text)
     return texts
+
+
+def _membership_role(membership: Any | None) -> str:
+    return str(getattr(membership, "role", "") or "").strip().lower()
+
+
+def _is_internal_actor(membership: Any | None) -> bool:
+    return _membership_role(membership) in _INTERNAL_MEMBERSHIP_ROLES
 
 
 def _record_inbound_conversation(
@@ -1235,27 +1244,19 @@ async def _handle_event(
     if line_user_id:
         memberships = repo.list_active_memberships(tenant_id)
         active_membership = next((item for item in memberships if item.line_user_id == line_user_id), None)
-        try:
-            if active_membership is None:
-                active_membership = repo.create_tenant_membership(
-                    tenant_id=tenant_id,
-                    line_user_id=line_user_id,
-                    role="owner",
-                )
-        except ValueError:
-            logger.info("tenant=%s line_user=%s membership bind skipped due to active conflict", tenant_id, line_user_id)
         profile = repo.resolve_or_create_line_profile(tenant_id, line_user_id)
         logger.info(
-            "tenant=%s line_user=%s profile_id=%s interaction_count=%s",
+            "tenant=%s line_user=%s membership_role=%s profile_id=%s interaction_count=%s",
             tenant_id,
             line_user_id,
+            _membership_role(active_membership) or "external",
             profile.id,
             profile.interaction_count,
         )
 
     if event_type == "follow":
         # A-2：新加好友 → 觸發 onboarding 歡迎訊息並實際推播
-        if onboarding_flow.is_in_onboarding(tenant_id):
+        if onboarding_flow.is_in_onboarding(tenant_id) and _is_internal_actor(active_membership):
             replies = await onboarding_flow.handle_message(tenant_id, "text", "")
             for r in replies:
                 logger.info("tenant=%s [onboarding follow reply] %s", tenant_id, r.get("text", "")[:80])
@@ -1266,6 +1267,12 @@ async def _handle_event(
                 conversation_kind="onboarding",
                 messages=replies,
                 access_token=channel_access_token,
+            )
+        elif onboarding_flow.is_in_onboarding(tenant_id):
+            logger.info(
+                "tenant=%s follow user=%s skipped onboarding because membership is not internal",
+                tenant_id,
+                line_user_id,
             )
         return
 
@@ -1281,6 +1288,13 @@ async def _handle_event(
 
     # ── Onboarding path ───────────────────────────────────────────────────────
     if onboarding_flow.is_in_onboarding(tenant_id):
+        if not _is_internal_actor(active_membership):
+            logger.info(
+                "tenant=%s user=%s skipped onboarding because membership is not internal",
+                tenant_id,
+                line_user_id,
+            )
+            return
         source_conversation = _record_inbound_conversation(
             app=app,
             repo=repo,
@@ -1310,7 +1324,7 @@ async def _handle_event(
         )
         return
 
-    if active_membership is not None and active_membership.role == "customer":
+    if not _is_internal_actor(active_membership):
         if msg_type != "text" or not text.strip():
             logger.info("tenant=%s customer non-text message ignored user=%s", tenant_id, line_user_id)
             return

@@ -4,17 +4,17 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, create_engine
 
-from kachu.persistence.repository import KachuRepository
+from kachu_plus.persistence.repository import KachuPlusRepository
 
 
-def _make_repo() -> KachuRepository:
+def _make_repo() -> KachuPlusRepository:
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     SQLModel.metadata.create_all(engine)
-    return KachuRepository(engine)
+    return KachuPlusRepository(engine)
 
 
 def test_create_and_lookup_active_tenant_membership() -> None:

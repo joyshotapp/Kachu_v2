@@ -115,6 +115,7 @@ def test_forged_signature_returns_403() -> None:
 
 def test_valid_request_returns_ok_and_logs_event() -> None:
     app = _make_app(config=_valid_config())
+    app.state.repository.list_active_memberships.return_value = [SimpleNamespace(line_user_id="Uabc123", role="owner")]
     client = TestClient(app, raise_server_exceptions=False)
 
     events = [
@@ -142,6 +143,7 @@ def test_valid_request_returns_ok_and_logs_event() -> None:
     assert _TENANT_ID in all_calls
     assert "Uabc123" in all_calls
     app.state.repository.resolve_or_create_line_profile.assert_called_once_with(_TENANT_ID, "Uabc123")
+    app.state.repository.create_tenant_membership.assert_not_called()
 
 
 def test_empty_events_returns_ok() -> None:
@@ -233,6 +235,7 @@ async def test_push_and_record_texts_records_skipped_delivery_audit() -> None:
 
 def test_valid_request_resolves_existing_line_profile_without_duplicate_creation() -> None:
     app = _make_app(config=_valid_config())
+    app.state.repository.list_active_memberships.return_value = [SimpleNamespace(line_user_id="Uabc123", role="owner")]
     profile = CustomerProfileTable(id="p1", tenant_id=_TENANT_ID, interaction_count=1)
     app.state.repository.resolve_or_create_line_profile.return_value = profile
     client = TestClient(app, raise_server_exceptions=False)
@@ -348,6 +351,12 @@ def test_boss_message_auto_promotes_into_knowledge_entries() -> None:
         session.add(TenantTable(id=_TENANT_ID, name="測試店", industry_type="保健食品"))
         session.add(OnboardingStateTable(tenant_id=_TENANT_ID, step="completed"))
         session.add(_valid_config())
+        repo.create_tenant_membership(
+            tenant_id=_TENANT_ID,
+            line_user_id="U-owner-1",
+            role="owner",
+            display_name="Boss",
+        )
         session.commit()
 
     app = FastAPI()
@@ -383,6 +392,100 @@ def test_boss_message_auto_promotes_into_knowledge_entries() -> None:
     knowledge = repo.list_knowledge_entries(_TENANT_ID, limit=10)
     assert any(item.category == "pain_point" for item in knowledge)
     assert any("安全性" in item.content for item in knowledge)
+
+
+def test_unknown_user_is_not_auto_bound_as_owner_and_routes_to_customer_flow() -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    with Session(engine) as session:
+        session.add(TenantTable(id=_TENANT_ID, name="測試店", industry_type="保健食品"))
+        session.add(OnboardingStateTable(tenant_id=_TENANT_ID, step="completed"))
+        session.add(_valid_config())
+        session.commit()
+
+    app = FastAPI()
+    app.state.repository = repo
+    app.state.settings = Settings()
+    app.include_router(router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    body = _make_body(
+        [
+            {
+                "type": "message",
+                "timestamp": 1714895904000,
+                "source": {"type": "user", "userId": "U-customer-unknown"},
+                "message": {
+                    "id": "mid-customer-unknown-1",
+                    "type": "text",
+                    "text": "請問你們今天有營業嗎？",
+                },
+            }
+        ]
+    )
+    sig = _make_signature(body, _CHANNEL_SECRET)
+
+    with patch("kachu_plus.line.webhook.run_line_faq_flow", new=AsyncMock(return_value={"action": "answered"})) as mock_faq:
+        response = client.post(
+            f"/webhooks/line/{_TENANT_ID}",
+            content=body,
+            headers={"X-Line-Signature": sig, "Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    assert repo.list_active_memberships(_TENANT_ID) == []
+    mock_faq.assert_awaited_once()
+
+
+def test_unknown_user_does_not_trigger_owner_onboarding() -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    repo = KachuPlusRepository(engine)
+    with Session(engine) as session:
+        session.add(TenantTable(id=_TENANT_ID, name="測試店"))
+        session.add(OnboardingStateTable(tenant_id=_TENANT_ID, step="asking_name"))
+        session.add(_valid_config())
+        session.commit()
+
+    app = FastAPI()
+    app.state.repository = repo
+    app.state.settings = Settings()
+    app.include_router(router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    body = _make_body(
+        [
+            {
+                "type": "message",
+                "timestamp": 1714895904000,
+                "source": {"type": "user", "userId": "U-external-1"},
+                "message": {"id": "mid-external-1", "type": "text", "text": "你好"},
+            }
+        ]
+    )
+    sig = _make_signature(body, _CHANNEL_SECRET)
+
+    with patch("kachu_plus.line.webhook.push_line_messages", new=AsyncMock()) as mock_push:
+        response = client.post(
+            f"/webhooks/line/{_TENANT_ID}",
+            content=body,
+            headers={"X-Line-Signature": sig, "Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    assert repo.list_active_memberships(_TENANT_ID) == []
+    conversations = repo.list_recent_conversations(_TENANT_ID, limit=10, line_user_id="U-external-1")
+    assert all(row.conversation_kind != "onboarding" for row in conversations)
+    mock_push.assert_not_awaited()
 
 
 @pytest.mark.asyncio
